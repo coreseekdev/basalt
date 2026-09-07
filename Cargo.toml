@@ -1,0 +1,34 @@
+[workspace]
+resolver = "2"
+members = [
+    "protocol",
+    "record",
+    "storage",
+    "metadata",
+    "coordinator",
+    "testing",
+    "server",
+    "xtask",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+license = "Apache-2.0"
+authors = ["The Basalt Authors"]
+
+# 按需引入，M0 骨架保持零依赖以保证离线可构建；
+# 计划中的公共依赖集中在这里管理（见 TASK.md T0.2）：
+# tokio, bytes, tracing, thiserror, crc32c, memmap2, io-uring, openraft, object_store
+[workspace.dependencies]
+
+[workspace.lints.rust]
+unsafe_code = "deny"
+
+[workspace.lints.clippy]
+unwrap_used = "warn"
+expect_used = "warn"
+
+[profile.release]
+# 保留符号，方便 perf/flamegraph 剖析
+debug = true

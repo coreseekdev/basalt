@@ -1,0 +1,11 @@
+[package]
+name = "basalt-record"
+description = "Kafka RecordBatch v2 encoding/decoding, compression, CRC"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+publish = false
+
+[lints]
+workspace = true

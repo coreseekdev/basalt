@@ -1,0 +1,11 @@
+[package]
+name = "basalt-testing"
+description = "Simulation shims, cluster harness, invariant verifiers, compatibility harness"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+publish = false
+
+[lints]
+workspace = true

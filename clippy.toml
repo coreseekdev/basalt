@@ -1,0 +1,7 @@
+# 性能纪律：生产代码禁用共享可变所有权与引用计数（见根 Cargo.toml 说明）
+disallowed-types = [
+    "std::rc::Rc",
+    "std::cell::RefCell",
+    "std::cell::Cell",
+    "std::sync::Arc",
+]

@@ -1,20 +1,28 @@
 //! Basalt Kafka 协议层（sans-I/O）。
 //!
-//! 职责（TASK.md T-0.3 / T-M0.2）：
-//! - `build.rs` 读取 `definition/` 下 Kafka 官方协议 JSON，生成全部
-//!   request/response 类型与编解码（含版本协商与 tagged fields）；
-//! - 类型只做 `&[u8]` in/out，不做任何 IO，供 server 与未来 SDK 共用。
+//! 路线（ADR-1 修订）：上游 203 个官方协议 JSON 构建期内嵌，
+//! 启动时一次性解析并编译为「编解码计划」，运行期按计划树做
+//! 数据驱动的编解码——记录体（records）以 `bytes::Bytes` 零拷贝透传，
+//! 仅元数据字段分配。
 //!
-//! 路线依据：Nisshi（官方 185 个 JSON + 代码生成）、Kafka 自身的
-//! `clients/src/main/resources/common/message/*.json`；反例：手写解析。
+//! 层级：
+//! - [`api`]：API key 与错误码常量
+//! - [`value`]：协议数据通用树（编解码产物/原料）
+//! - [`schema`]：JSON 定义解析（容忍 // 注释）
+//! - [`plan`]：编译后的字段计划树（版本门控 + tagged fields）
+//! - [`codec`]：计划驱动的 encode/decode（sans-I/O：`Bytes` in/out）
+//! - [`frame`]：请求/响应头规则（KIP-511）
+//! - [`registry`]：内嵌定义 → 全量计划表（OnceLock 全局只读）
 
-/// 协议 JSON 定义的落地目录（T-0.3 供应商化后填充）。
+pub mod api;
+pub mod codec;
+pub mod error;
+pub mod frame;
+pub mod plan;
+pub mod primitives;
+pub mod registry;
+pub mod schema;
+pub mod value;
+
+/// 协议 JSON 定义的落地目录（构建期内嵌，目录保留供 xtask diff 上游）。
 pub const DEFINITION_DIR: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/definition");
-
-#[cfg(test)]
-mod tests {
-    #[test]
-    fn definition_dir_exists() {
-        assert!(std::path::Path::new(super::DEFINITION_DIR).is_dir());
-    }
-}

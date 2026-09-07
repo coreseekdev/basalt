@@ -17,10 +17,24 @@ edition = "2024"
 license = "Apache-2.0"
 authors = ["The Basalt Authors"]
 
-# 按需引入，M0 骨架保持零依赖以保证离线可构建；
-# 计划中的公共依赖集中在这里管理（见 TASK.md T0.2）：
-# tokio, bytes, tracing, thiserror, crc32c, memmap2, io-uring, openraft, object_store
+# 性能纪律（用户约束 + ADR-13）：
+# - 生产代码禁用 Rc/RefCell/Arc（clippy.toml disallowed-types 强制）：
+#   所有权经 channel 转移（partition actor 模型），共享只读态经 watch 广播的 owned 快照。
+# - tokio::sync::mpsc / bytes::Bytes 内部的引用计数属于生态原语实现细节，不受此限；
+#   本约束约束的是 basalt 自身的所有权图。
+# - 热路径缓冲复用：per-connection BytesMut + storage::pool 尺寸类内存池。
 [workspace.dependencies]
+tokio = { version = "1", features = ["rt-multi-thread", "net", "time", "sync", "io-util", "macros", "signal"] }
+bytes = "1"
+thiserror = "2"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+crc32c = "0.6"
+lz4_flex = "0.11"
+zstd = "0.13"
+flate2 = "1"
+serde_json = "1"
+rand = "0.9"
 
 [workspace.lints.rust]
 unsafe_code = "deny"
@@ -31,4 +45,9 @@ expect_used = "warn"
 
 [profile.release]
 # 保留符号，方便 perf/flamegraph 剖析
+debug = true
+lto = "thin"
+codegen-units = 1
+
+[profile.bench]
 debug = true

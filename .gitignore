@@ -1,9 +1,36 @@
+# Rust / Cargo
 /target
 **/*.rs.bk
 Cargo.lock.bak
+cargo-timing*.html
+
+# 协议 JSON 上游指纹（xtask protocol-check 产物）
+protocol/definition/.upstream-*
+
+# 本地运行时数据（broker 数据目录、日志、coredump）
+/data
+/var
+*.log
+*.core
+core
+
+# 测试与混沌工具产物
+testing/results/
+testing/seeds/failing/
+
+# IDE / 编辑器
 .idea/
 .vscode/
 *.swp
+*.swo
 .DS_Store
 # 本地覆盖配置（不入库）
 .cargo/config.local.toml
+
+# 环境与密钥（TLS/SASL 凭据永不入库）
+.env
+.env.*
+*.pem
+*.key
+*.crt
+*.p12

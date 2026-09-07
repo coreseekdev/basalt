@@ -38,6 +38,15 @@ impl RoutingTable {
     pub fn find_by_id(&self, id: u128, partition: i32) -> Option<&Route> {
         self.by_id.get(&(id, partition))
     }
+
+    pub fn iter_all_topics(&self) -> Vec<String> {
+        self.by_name
+            .keys()
+            .map(|(n, _)| n.clone())
+            .collect::<std::collections::BTreeSet<_>>()
+            .into_iter()
+            .collect()
+    }
 }
 
 pub enum MetaCmd {

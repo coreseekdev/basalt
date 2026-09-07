@@ -168,7 +168,14 @@ impl PartitionActor {
         while i < self.pending.len() {
             if self.pending[i].deadline <= now {
                 let p = self.pending.remove(i);
-                let _ = p.reply.send(FetchOutcome { result: None });
+                // 长轮询超时 = 正常空回（带当前 HW），绝不能映射为 OffsetOutOfRange——
+                // 否则客户端会重置到 earliest 无限重读
+                let out = self.log.read(p.offset, usize::MAX, &self.pool);
+                let result = match out {
+                    Ok(r) => Some(r),
+                    Err(_) => None, // 仅真正的越界错误才让上层映射 OffsetOutOfRange
+                };
+                let _ = p.reply.send(FetchOutcome { result });
             } else {
                 i += 1;
             }

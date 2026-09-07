@@ -21,6 +21,7 @@ basalt-protocol = { path = "../protocol" }
 basalt-record = { path = "../record" }
 basalt-storage = { path = "../storage" }
 basalt-metadata = { path = "../metadata" }
+basalt-coordinator = { path = "../coordinator" }
 
 [lints]
 workspace = true

@@ -3,6 +3,7 @@
 //! 每连接独占读/写缓冲（BytesMut 复用 = 连接级内存池）。
 
 use crate::handlers::{self, Ctx, FetchTarget, ProduceTarget};
+use crate::handlers_groups;
 use basalt_protocol::api::key;
 use basalt_protocol::codec;
 use basalt_protocol::error::ProtocolError;
@@ -176,6 +177,15 @@ async fn dispatch(frame_bytes: Bytes, ctx: &Ctx) -> Result<Option<Vec<u8>>, Disp
         key::PRODUCE => handle_produce(&req, api_version, ctx).await?,
         key::FETCH => (handlers::fetch(parse_fetch(&req, api_version)?, ctx).await, false),
         key::LIST_OFFSETS => (handlers::list_offsets(&req, ctx).await, false),
+        key::FIND_COORDINATOR => (handlers_groups::find_coordinator(api_version, &req, ctx).await, false),
+        key::JOIN_GROUP => (handlers_groups::join_group(&req, api_version, ctx).await, false),
+        key::SYNC_GROUP => (handlers_groups::sync_group(&req, ctx).await, false),
+        key::HEARTBEAT => (handlers_groups::heartbeat(&req, ctx).await, false),
+        key::LEAVE_GROUP => (handlers_groups::leave_group(&req, ctx).await, false),
+        key::OFFSET_COMMIT => (handlers_groups::offset_commit(&req, ctx).await, false),
+        key::OFFSET_FETCH => (handlers_groups::offset_fetch(&req, ctx).await, false),
+        key::CREATE_TOPICS => (handlers_groups::create_topics(&req, ctx).await, false),
+        key::DELETE_TOPICS => (handlers_groups::delete_topics(&req, ctx).await, false),
         _ => {
             return Err(DispatchError::UnsupportedVersion(api_key, api_version));
         }

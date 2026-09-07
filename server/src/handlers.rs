@@ -9,6 +9,7 @@ use basalt_protocol::api::ErrorCode;
 use basalt_protocol::registry::Registry;
 use basalt_protocol::value::{s, Value};
 use bytes::Bytes;
+use basalt_coordinator::GroupCmd;
 use tokio::sync::{mpsc, oneshot};
 
 use crate::meta::MetaCmd;
@@ -18,6 +19,7 @@ pub struct Ctx {
     pub host: String,
     pub port: u16,
     pub meta_tx: mpsc::Sender<MetaCmd>,
+    pub group_tx: tokio::sync::mpsc::Sender<GroupCmd>,
     pub routes_rx: tokio::sync::watch::Receiver<crate::meta::RoutingTable>,
 }
 
@@ -66,6 +68,7 @@ pub fn api_versions(req: &basalt_protocol::value::Struct, version: i16) -> Value
 
 pub async fn metadata(req: &basalt_protocol::value::Struct, version: i16, ctx: &Ctx) -> Value {
     // Topics: v1+ nullable（null = 全量）
+    // Kafka 语义：null（v1+）或空数组（v0 无 null 表达）→ 返回全部 topic
     let names: Option<Vec<String>> = match req.get("Topics") {
         Some(Value::Null) | None => None,
         Some(Value::Array(a)) => {
@@ -78,7 +81,7 @@ pub async fn metadata(req: &basalt_protocol::value::Struct, version: i16, ctx: &
                     _ => continue,
                 }
             }
-            Some(v)
+            if v.is_empty() { None } else { Some(v) }
         }
         _ => None,
     };

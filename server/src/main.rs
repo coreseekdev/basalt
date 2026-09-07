@@ -3,6 +3,7 @@
 mod config;
 mod conn;
 mod handlers;
+mod handlers_groups;
 mod meta;
 mod partition;
 
@@ -29,6 +30,7 @@ async fn async_main(cfg: Config) {
     tracing::info!(node_id = cfg.node_id, port = cfg.port, data = %cfg.data_dir, "basalt starting");
 
     let (meta_tx, routes_rx) = meta::MetaService::spawn(cfg.clone());
+    let group_tx = basalt_coordinator::GroupManager::spawn(std::path::Path::new(&cfg.data_dir));
 
     // 恢复既有 topic：目录先于元数据存在 → 用恢复通道逐个注册
     recover_existing(&cfg, &meta_tx).await;
@@ -38,6 +40,7 @@ async fn async_main(cfg: Config) {
         host: cfg.host.clone(),
         port: cfg.port,
         meta_tx,
+        group_tx: group_tx.clone(),
         routes_rx,
     };
     CTX.set(ctx).ok();
@@ -54,6 +57,7 @@ async fn async_main(cfg: Config) {
                     host: ctx_ref.host.clone(),
                     port: ctx_ref.port,
                     meta_tx: ctx_ref.meta_tx.clone(),
+                    group_tx: ctx_ref.group_tx.clone(),
                     routes_rx: ctx_ref.routes_rx.clone(),
                 };
                 tokio::spawn(conn::serve_connection(sock, peer, ctx));

@@ -7,5 +7,20 @@ license.workspace = true
 authors.workspace = true
 publish = false
 
+[[bin]]
+name = "basalt-server"
+path = "src/main.rs"
+
+[dependencies]
+tokio = { workspace = true }
+bytes = { workspace = true }
+thiserror = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+basalt-protocol = { path = "../protocol" }
+basalt-record = { path = "../record" }
+basalt-storage = { path = "../storage" }
+basalt-metadata = { path = "../metadata" }
+
 [lints]
 workspace = true

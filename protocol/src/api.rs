@@ -93,6 +93,7 @@ pub enum ErrorCode {
     IneligibleReplica = 71,
     NewLeaderElected = 72,
     OffsetMovedToTieredStorage = 73,
+    UnknownServer = 83,
 }
 
 impl From<ErrorCode> for i16 {

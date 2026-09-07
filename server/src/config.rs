@@ -40,6 +40,7 @@ impl Config {
         format!("0.0.0.0:{}", self.port)
     }
 
+    #[allow(dead_code)]
     pub fn broker_ids(&self) -> Vec<i32> {
         if self.nodes.is_empty() {
             vec![self.node_id]

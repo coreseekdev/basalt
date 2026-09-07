@@ -160,7 +160,7 @@ pub async fn leave_group(req: &basalt_protocol::value::Struct, ctx: &Ctx) -> Val
         .send(GroupCmd::LeaveGroup { group, member_id: member.unwrap_or_default(), reply: tx })
         .await
         .ok();
-    let e = rx.await.unwrap_or(CoordError::GroupCoordinatorNotAvailable);
+    let e: CoordError = rx.await.unwrap_or(CoordError::GroupCoordinatorNotAvailable);
     s([
         ("ThrottleTimeMs", Value::I32(0)),
         ("ErrorCode", coord_err(e)),
@@ -207,7 +207,7 @@ pub async fn offset_commit(req: &basalt_protocol::value::Struct, ctx: &Ctx) -> V
         .send(GroupCmd::CommitOffsets { group, generation, member_id, offsets, reply: tx })
         .await
         .ok();
-    let e = rx.await.unwrap_or(CoordError::GroupCoordinatorNotAvailable);
+    let _e = rx.await.unwrap_or(CoordError::GroupCoordinatorNotAvailable);
     let responses: Vec<Value> = topic_results
         .into_iter()
         .map(|(name, parts)| s([("Name", Value::str(name)), ("Partitions", Value::Array(parts))]))
@@ -265,7 +265,7 @@ pub async fn create_topics(req: &basalt_protocol::value::Struct, ctx: &Ctx) -> V
             let rf = ts.get("ReplicationFactor").map(|v| v.as_i32()).unwrap_or(1);
             let (reply_tx, reply_rx) = oneshot::channel();
             let _ = ctx.meta_tx.send(MetaCmd::Lookup { names: Some(vec![name.clone()]), allow_create: true, reply: reply_tx }).await;
-            let found = reply_rx.await.unwrap_or_default();
+            let (found, _brokers) = reply_rx.await.unwrap_or_default();
             let (err, msg) = if found.iter().any(|t| t.name == name) {
                 (ErrorCode::None, None)
             } else {
@@ -296,7 +296,7 @@ pub async fn delete_topics(req: &basalt_protocol::value::Struct, ctx: &Ctx) -> V
             let name = ts.get("Name").map(|v| v.as_str().to_string()).unwrap_or_default();
             let (reply_tx, reply_rx) = oneshot::channel();
             let _ = ctx.meta_tx.send(MetaCmd::Lookup { names: Some(vec![name.clone()]), allow_create: false, reply: reply_tx }).await;
-            let found = reply_rx.await.unwrap_or_default();
+            let (found, _brokers) = reply_rx.await.unwrap_or_default();
             let err = if found.is_empty() {
                 ErrorCode::UnknownTopicOrPartition
             } else {

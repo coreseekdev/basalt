@@ -75,7 +75,14 @@ enum FramedError {
 
 async fn read_frame_len(sock: &mut tokio::net::TcpStream, buf: &mut BytesMut) -> Result<i32, FramedError> {
     while buf.len() < 4 {
-        sock.read_buf(buf).await.map_err(FramedError::Io)?;
+        let n = sock.read_buf(buf).await.map_err(FramedError::Io)?;
+        if n == 0 {
+            // EOF：连接已关闭——必须退出，否则空转烧满一个核
+            return Err(FramedError::Io(std::io::Error::new(
+                std::io::ErrorKind::UnexpectedEof,
+                "connection closed",
+            )));
+        }
     }
     let len = i32::from_be_bytes([buf[0], buf[1], buf[2], buf[3]]);
     buf.advance(4);

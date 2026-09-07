@@ -6,6 +6,8 @@
 
 use std::collections::HashMap;
 
+pub mod cluster;
+
 pub const TOPIC_ID_UNSET: u128 = 0;
 
 #[derive(Debug, Clone, PartialEq)]

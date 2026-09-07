@@ -16,21 +16,45 @@ use crate::meta::MetaCmd;
 
 pub struct Ctx {
     pub node_id: i32,
+    #[allow(dead_code)]
+    pub all_brokers: Vec<(i32, String, u16)>,
     pub host: String,
     pub port: u16,
     pub meta_tx: mpsc::Sender<MetaCmd>,
     pub group_tx: tokio::sync::mpsc::Sender<GroupCmd>,
     pub routes_rx: tokio::sync::watch::Receiver<crate::meta::RoutingTable>,
+    pub brokers_cache: std::sync::Mutex<Option<Vec<basalt_metadata::cluster::BrokerInfo>>>,
 }
 
 impl Ctx {
+    /// metadata 响应携带的 broker 全集（后续响应复用；单节点为空）
+    pub fn set_brokers(&self, brokers: Vec<basalt_metadata::cluster::BrokerInfo>) {
+        self.brokers_cache.lock().unwrap().replace(brokers);
+    }
+
     pub fn broker_array(&self) -> Value {
-        Value::Array(vec![s([
-            ("NodeId", Value::I32(self.node_id)),
-            ("Host", Value::str(self.host.clone())),
-            ("Port", Value::I32(self.port as i32)),
-            ("Rack", Value::Null),
-        ])])
+        let cached = self.brokers_cache.lock().unwrap().clone().unwrap_or_default();
+        let mut brokers: Vec<(i32, String, u16)> = cached
+            .into_iter()
+            .map(|b| (b.node_id, b.host, b.port))
+            .collect();
+        if brokers.is_empty() {
+            brokers = vec![(self.node_id, self.host.clone(), self.port)];
+        }
+        brokers.sort_unstable();
+        Value::Array(
+            brokers
+                .into_iter()
+                .map(|(id, host, port)| {
+                    s([
+                        ("NodeId", Value::I32(id)),
+                        ("Host", Value::str(host)),
+                        ("Port", Value::I32(port as i32)),
+                        ("Rack", Value::Null),
+                    ])
+                })
+                .collect(),
+        )
     }
 
     pub fn routes(&self) -> tokio::sync::watch::Ref<'_, RoutingTable> {
@@ -98,7 +122,8 @@ pub async fn metadata(req: &basalt_protocol::value::Struct, version: i16, ctx: &
         .meta_tx
         .send(MetaCmd::Lookup { names: names.clone(), allow_create, reply: reply_tx })
         .await;
-    let topics = reply_rx.await.unwrap_or_default();
+    let (topics, brokers) = reply_rx.await.unwrap_or_default();
+    ctx.set_brokers(brokers);
 
     // 请求了具体 topic 但元数据没有 → UNKNOWN_TOPIC_OR_PARTITION 条目
     let mut topic_vals = Vec::new();
@@ -217,6 +242,7 @@ pub async fn produce(version: i16, acks: i16, targets: Vec<ProduceTarget>, ctx: 
                 .send(PartitionCmd::Produce {
                     batches: t.batches.clone(),
                     policy: basalt_storage::log::AssignPolicy::Assign,
+                    acks,
                     reply: txr,
                 })
                 .await

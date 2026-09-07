@@ -129,6 +129,15 @@ Basalt：Rust 版 Kafka 兼容消息流平台
 - **已完成**：T-0.1（仓库与 workspace 初始化，2026-09-07）
 - **下一步建议**：T-0.2（依赖血液）与 T-0.3（协议 JSON 供应商化）可并行，随后 T-M0.1 / T-M0.6 并行开工（功能线与测试线同时起跑）。
 - **2026-09-08**：定位与架构决策定稿（生产级开源替代 + 商业雏形；ADR-8~13）；v1 范围 = M0–M2 + T-M3.1。
+- **2026-09-08（实施）**：T-0.2/0.3、M0 全部、M1 主体、M2 POC 完成——
+  - ✅ 单机：kafka-python 真实客户端 e2e PASS（produce/fetch/listoffsets/自动建题，不丢不重）
+  - ✅ 消费组：Classic 协议 + offset 持久化（append-only 重放）+ 确定性两段式 e2e PASS
+  - ✅ 多节点 POC：控制器（record 日志 + failover watch）+ 内部 RPC + follower-pull 复制 +
+    HW 停等 acks=all；kill -9 leader 实测 FAILOVER 迁移、已确认数据完好
+  - ⏳ 已知问题：pod 重建竞态下的客户端重试风暴、CreateTopic 在 broker 注册完成前建题会钳制 RF、
+    failover 自动化 e2e 的 read 窗口需放宽（机制已实测，脚本待硬化）
+  - 📁 k8s：deploy/k8s（3 节点 Deployment + headless service + hostPath；hostpath provisioner
+    镜像受限时用静态 PV）+ gen.sh；microk8s 实测 Running
 
 ## 关键决策记录（ADR 索引）
 

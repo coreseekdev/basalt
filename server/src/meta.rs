@@ -186,31 +186,20 @@ impl MetaService {
     }
 
     async fn create_via_controller(&mut self, name: &str, partitions: i32, rf: i32) -> bool {
-        let before = self.cluster.version;
-        // 本机是控制器 → 直调；否则 RPC 转发
-        if let Some(tx) = &self.controller_tx {
-            let (txr, rxr) = oneshot::channel();
-            let _ = tx
-                .send(crate::internal::ControllerCmd::CreateTopic {
-                    name: name.to_string(),
-                    partitions,
-                    rf,
-                    reply: txr,
-                })
-                .await;
-            let _ = rxr.await;
-        } else {
-            // 非控制器：由 main 的 sync 任务桥接（POC：经 meta_cmd 通道回环给 sync 任务）
-            let Some(ctrl_addr) = self.controller_addr.clone() else { return false };
-            let client = crate::internal::InternalClient::new(ctrl_addr);
-            if client.create_topic(name, partitions, rf).await.is_err() {
-                return false;
-            }
+        // 统一走控制器 RPC（控制器节点对自己的内部端口回环亦可），
+        // 创建后立即拉最新快照内联应用——绝不能在本 actor 内等待自己的 ApplyCluster（自死锁）
+        let Some(addr) = self.controller_addr.clone() else { return false };
+        let client = crate::internal::InternalClient::new(addr);
+        if client.create_topic(name, partitions, rf).await.is_err() {
+            return false;
         }
-        // 等待快照推进（sync 任务轮询；这里限时等待）
-        let deadline = std::time::Instant::now() + Duration_secs(5);
-        while self.cluster.version == before && std::time::Instant::now() < deadline {
-            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        match client.meta_sync(self.cluster.version).await {
+            Ok(resp) if resp.len() >= 1 && resp[0] == 1 => {
+                if let Some(state) = ClusterState::decode(&resp[1..]) {
+                    self.apply_cluster(Box::new(state)).await;
+                }
+            }
+            _ => {}
         }
         topic_meta_from_cluster(&self.cluster, name).is_some()
     }

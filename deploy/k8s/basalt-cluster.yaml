@@ -1,0 +1,2 @@
+# Basalt 3-broker 集群（微环境 POC：独立 Deployment + hostPath）
+# 生成器：deploy/k8s/gen.sh（生产形态请改 StatefulSet + 动态 PV + pod FQDN）

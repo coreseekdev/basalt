@@ -1,0 +1,200 @@
+apiVersion: v1
+kind: Service
+metadata:
+  name: basalt-svc-0
+  labels:
+    app: basalt
+    node: "basalt-0"
+spec:
+  type: ClusterIP
+  selector:
+    app: basalt
+    node: "basalt-0"
+  ports:
+    - name: client
+      port: 9092
+      targetPort: 9092
+    - name: internal
+      port: 9093
+      targetPort: 9093
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: basalt-0
+spec:
+  replicas: 1
+  strategy: { type: Recreate }
+  selector:
+    matchLabels:
+      app: basalt
+      node: "basalt-0"
+  template:
+    metadata:
+      labels:
+        app: basalt
+        node: "basalt-0"
+    spec:
+      terminationGracePeriodSeconds: 0
+      containers:
+        - name: basalt
+          image: basalt-server:dev
+          imagePullPolicy: IfNotPresent
+          ports:
+            - containerPort: 9092
+            - containerPort: 9093
+          env:
+            - name: BASALT_NODE_ID
+              value: "0"
+            - name: BASALT_HOST
+              value: "basalt-0.basalt-headless.default.svc.cluster.local"
+            - name: BASALT_NODES
+              value: "0=basalt-0.basalt-headless.default.svc.cluster.local:9092,1=basalt-1.basalt-headless.default.svc.cluster.local:9092,2=basalt-2.basalt-headless.default.svc.cluster.local:9092"
+            - name: BASALT_RF
+              value: "3"
+            - name: BASALT_NUM_PARTITIONS
+              value: "2"
+            - name: BASALT_DATA_DIR
+              value: /data
+          volumeMounts:
+            - name: data
+              mountPath: /data
+      volumes:
+        - name: data
+          hostPath:
+            path: /var/basalt-k8s-data-0
+            type: DirectoryOrCreate
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: basalt-svc-1
+  labels:
+    app: basalt
+    node: "basalt-1"
+spec:
+  type: ClusterIP
+  selector:
+    app: basalt
+    node: "basalt-1"
+  ports:
+    - name: client
+      port: 9092
+      targetPort: 9092
+    - name: internal
+      port: 9093
+      targetPort: 9093
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: basalt-1
+spec:
+  replicas: 1
+  strategy: { type: Recreate }
+  selector:
+    matchLabels:
+      app: basalt
+      node: "basalt-1"
+  template:
+    metadata:
+      labels:
+        app: basalt
+        node: "basalt-1"
+    spec:
+      terminationGracePeriodSeconds: 0
+      containers:
+        - name: basalt
+          image: basalt-server:dev
+          imagePullPolicy: IfNotPresent
+          ports:
+            - containerPort: 9092
+            - containerPort: 9093
+          env:
+            - name: BASALT_NODE_ID
+              value: "1"
+            - name: BASALT_HOST
+              value: "basalt-1.basalt-headless.default.svc.cluster.local"
+            - name: BASALT_NODES
+              value: "0=basalt-0.basalt-headless.default.svc.cluster.local:9092,1=basalt-1.basalt-headless.default.svc.cluster.local:9092,2=basalt-2.basalt-headless.default.svc.cluster.local:9092"
+            - name: BASALT_RF
+              value: "3"
+            - name: BASALT_NUM_PARTITIONS
+              value: "2"
+            - name: BASALT_DATA_DIR
+              value: /data
+          volumeMounts:
+            - name: data
+              mountPath: /data
+      volumes:
+        - name: data
+          hostPath:
+            path: /var/basalt-k8s-data-1
+            type: DirectoryOrCreate
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: basalt-svc-2
+  labels:
+    app: basalt
+    node: "basalt-2"
+spec:
+  type: ClusterIP
+  selector:
+    app: basalt
+    node: "basalt-2"
+  ports:
+    - name: client
+      port: 9092
+      targetPort: 9092
+    - name: internal
+      port: 9093
+      targetPort: 9093
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: basalt-2
+spec:
+  replicas: 1
+  strategy: { type: Recreate }
+  selector:
+    matchLabels:
+      app: basalt
+      node: "basalt-2"
+  template:
+    metadata:
+      labels:
+        app: basalt
+        node: "basalt-2"
+    spec:
+      terminationGracePeriodSeconds: 0
+      containers:
+        - name: basalt
+          image: basalt-server:dev
+          imagePullPolicy: IfNotPresent
+          ports:
+            - containerPort: 9092
+            - containerPort: 9093
+          env:
+            - name: BASALT_NODE_ID
+              value: "2"
+            - name: BASALT_HOST
+              value: "basalt-2.basalt-headless.default.svc.cluster.local"
+            - name: BASALT_NODES
+              value: "0=basalt-0.basalt-headless.default.svc.cluster.local:9092,1=basalt-1.basalt-headless.default.svc.cluster.local:9092,2=basalt-2.basalt-headless.default.svc.cluster.local:9092"
+            - name: BASALT_RF
+              value: "3"
+            - name: BASALT_NUM_PARTITIONS
+              value: "2"
+            - name: BASALT_DATA_DIR
+              value: /data
+          volumeMounts:
+            - name: data
+              mountPath: /data
+      volumes:
+        - name: data
+          hostPath:
+            path: /var/basalt-k8s-data-2
+            type: DirectoryOrCreate

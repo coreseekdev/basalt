@@ -1,0 +1,33 @@
+# 静态 hostPath PV（微环境无 provisioner 镜像时的替代；生产用动态供给）
+apiVersion: v1
+kind: PersistentVolume
+metadata:
+  name: basalt-data-0
+  labels: { app: basalt, idx: "0" }
+spec:
+  capacity: { storage: 1Gi }
+  accessModes: ["ReadWriteOnce"]
+  storageClassName: ""
+  hostPath: { path: /var/basalt-k8s-data-0 }
+---
+apiVersion: v1
+kind: PersistentVolume
+metadata:
+  name: basalt-data-1
+  labels: { app: basalt, idx: "1" }
+spec:
+  capacity: { storage: 1Gi }
+  accessModes: ["ReadWriteOnce"]
+  storageClassName: ""
+  hostPath: { path: /var/basalt-k8s-data-1 }
+---
+apiVersion: v1
+kind: PersistentVolume
+metadata:
+  name: basalt-data-2
+  labels: { app: basalt, idx: "2" }
+spec:
+  capacity: { storage: 1Gi }
+  accessModes: ["ReadWriteOnce"]
+  storageClassName: ""
+  hostPath: { path: /var/basalt-k8s-data-2 }

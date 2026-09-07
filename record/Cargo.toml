@@ -7,5 +7,15 @@ license.workspace = true
 authors.workspace = true
 publish = false
 
+[dependencies]
+bytes = { workspace = true }
+crc32c = { workspace = true }
+lz4_flex = { workspace = true }
+zstd = { workspace = true }
+flate2 = { workspace = true }
+
+[dev-dependencies]
+proptest = "1"
+
 [lints]
 workspace = true

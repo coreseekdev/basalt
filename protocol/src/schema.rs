@@ -33,10 +33,6 @@ impl Range {
     }
 }
 
-fn bad(src: &str) -> impl Fn(serde_json::Error) -> ProtocolError + '_ {
-    move |e| ProtocolError::Schema(format!("range `{src}`: {e}"))
-}
-
 /// 解析 "N" 形式版本号为 i16，统一错误面。
 fn parse_i16(src: &str, s: &str) -> Result<i16> {
     s.parse::<i16>()

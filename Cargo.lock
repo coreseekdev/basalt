@@ -51,6 +51,13 @@ version = "0.1.0"
 [[package]]
 name = "basalt-storage"
 version = "0.1.0"
+dependencies = [
+ "basalt-record",
+ "bytes",
+ "crc32c",
+ "thiserror",
+ "tracing",
+]
 
 [[package]]
 name = "basalt-testing"

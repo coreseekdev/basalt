@@ -7,5 +7,12 @@ license.workspace = true
 authors.workspace = true
 publish = false
 
+[dependencies]
+bytes = { workspace = true }
+thiserror = { workspace = true }
+crc32c = { workspace = true }
+tracing = { workspace = true }
+basalt-record = { path = "../record" }
+
 [lints]
 workspace = true

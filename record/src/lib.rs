@@ -19,8 +19,8 @@ pub const MAGIC_V2: i8 = 2;
 
 /// 批头（到 recordsCount 为止）的固定长度。
 pub const RECORD_BATCH_HEADER_LEN: usize = 61;
-/// CRC 覆盖起点相对批头的偏移（attributes 起）。
-pub const CRC_PAYLOAD_OFFSET: usize = 17;
+/// CRC 覆盖起点相对批头的偏移（attributes 起，= magic 16 + crc 4 + 1）。
+pub const CRC_PAYLOAD_OFFSET: usize = 21;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[repr(i16)]
@@ -74,13 +74,19 @@ impl BatchHeader {
             return None;
         }
         let g64 = |off: usize| -> i64 {
-            i64::from_be_bytes(buf[off..off + 8].try_into().ok()?)
+            let mut b = [0u8; 8];
+            b.copy_from_slice(&buf[off..off + 8]);
+            i64::from_be_bytes(b)
         };
         let g32 = |off: usize| -> i32 {
-            i32::from_be_bytes(buf[off..off + 4].try_into().ok()?)
+            let mut b = [0u8; 4];
+            b.copy_from_slice(&buf[off..off + 4]);
+            i32::from_be_bytes(b)
         };
         let g16 = |off: usize| -> i16 {
-            i16::from_be_bytes(buf[off..off + 2].try_into().ok()?)
+            let mut b = [0u8; 2];
+            b.copy_from_slice(&buf[off..off + 2]);
+            i16::from_be_bytes(b)
         };
         Some(BatchHeader {
             base_offset: g64(0),

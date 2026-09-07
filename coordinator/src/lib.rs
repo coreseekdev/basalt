@@ -354,9 +354,13 @@ impl GroupManager {
             }
         }
 
-        let was_stable = g.state == GroupState::Stable || g.state == GroupState::Empty;
-        if g.state == GroupState::Empty || (was_stable && g.state != GroupState::PreparingRebalance) {
+        let need_rebalance =
+            g.state == GroupState::Empty || g.state == GroupState::Stable || g.state == GroupState::CompletingSync;
+        if need_rebalance {
+            // CompletingSync 期间新成员加入：立即进入下一轮 rebalance
+            // （否则新成员的 JoinGroup 在 pending_joins 里无人应答直至客户端超时）
             g.state = GroupState::PreparingRebalance;
+            g.rebalance_deadline = None;
             if g.leader.is_none() {
                 g.leader = Some(member_id.clone());
             }

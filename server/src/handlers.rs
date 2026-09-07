@@ -28,6 +28,28 @@ pub struct Ctx {
 }
 
 impl Ctx {
+    /// 为每请求任务克隆上下文（brokers_cache 取当前快照）。
+    pub fn clone_for_request(&self) -> Ctx {
+        Ctx {
+            node_id: self.node_id,
+            host: self.host.clone(),
+            port: self.port,
+            all_brokers: self.all_brokers.clone(),
+            meta_tx: self.meta_tx.clone(),
+            group_tx: self.group_tx.clone(),
+            routes_rx: self.routes_rx.clone(),
+            brokers_cache: std::sync::Mutex::new(self.brokers_cache.lock().unwrap().clone()),
+        }
+    }
+}
+
+impl Clone for Ctx {
+    fn clone(&self) -> Self {
+        self.clone_for_request()
+    }
+}
+
+impl Ctx {
     /// metadata 响应携带的 broker 全集（后续响应复用；单节点为空）
     pub fn set_brokers(&self, brokers: Vec<basalt_metadata::cluster::BrokerInfo>) {
         self.brokers_cache.lock().unwrap().replace(brokers);

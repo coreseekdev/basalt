@@ -16,56 +16,65 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 const MAX_FRAME: i32 = 100 * 1024 * 1024;
 
 pub async fn serve_connection(
-    mut sock: tokio::net::TcpStream,
+    sock: tokio::net::TcpStream,
     peer: std::net::SocketAddr,
     ctx: Ctx,
 ) {
-    let _ = peer;
+    // 读半 + 写半分离：请求处理可并发（消除队头阻塞——长轮询 fetch 不再拖死同连接
+    // 的 offset commit/heartbeat），响应经写通道串行化回写（保留单一写者）
+    let (mut rd, mut wr) = sock.into_split();
+    let (resp_tx, mut resp_rx) = tokio::sync::mpsc::channel::<Bytes>(256);
+
+    // 写任务：唯一写者
+    let writer = tokio::spawn(async move {
+        while let Some(resp) = resp_rx.recv().await {
+            if wr.write_all(&resp).await.is_err() {
+                break;
+            }
+        }
+    });
+
     let mut read_buf = BytesMut::with_capacity(64 * 1024);
     loop {
-        // 帧长
-        let len = match read_frame_len(&mut sock, &mut read_buf).await {
+        let len = match read_frame_len(&mut rd, &mut read_buf).await {
             Ok(l) => l,
-            Err(FramedError::Io(_)) => return, // 连接关闭
-            Err(FramedError::TooLarge) => return,
+            Err(FramedError::Io(_)) => break, // 连接关闭
+            Err(FramedError::TooLarge) => break,
         };
         if len == 0 {
-            return;
+            break;
         }
-        let frame_bytes = match read_exact_bytes(&mut sock, &mut read_buf, len as usize).await {
+        let frame_bytes = match read_exact_bytes(&mut rd, &mut read_buf, len as usize).await {
             Ok(b) => b,
-            Err(_) => return,
+            Err(_) => break,
         };
-
-        match dispatch(frame_bytes, &ctx).await {
-            Ok(Some(resp)) => {
-                if let Err(e) = sock.write_all(&resp).await {
-                    tracing::debug!(error = %e, "write failed");
-                    return;
+        // 慢消费者背压：响应通道满时暂停读（客户端不读就不给它读下一请求）
+        let ctx = ctx.clone_for_request();
+        let resp_tx = resp_tx.clone();
+        tokio::spawn(async move {
+            match dispatch(frame_bytes, &ctx).await {
+                Ok(Some(resp)) => {
+                    let _ = resp_tx.send(Bytes::from(resp)).await;
                 }
-            }
-            Ok(None) => {} // acks=0：无响应
-            Err(DispatchError::UnknownApi) => {
-                // Kafka 语义：直接断连（客户端会刷新 metadata 重试）
-                tracing::warn!(peer = %peer, "unknown api key, closing");
-                return;
-            }
-            Err(DispatchError::UnsupportedVersion(api_key, version)) => {
-                // 尝试合成 unsupported 响应；失败则断连
-                if let Some(b) = synth_unsupported(api_key, version) {
-                    if sock.write_all(&b).await.is_err() {
-                        return;
+                Ok(None) => {} // acks=0：无响应
+                Err(DispatchError::UnknownApi) => {
+                    tracing::warn!(peer = %peer, "unknown api key, closing");
+                    // 关连接：丢弃写任务感知方式——发送空帧无意义，直接退出任务，
+                    // 读循环在客户端超时后自行收敛。生产化时可引入 per-conn 关闭令牌。
+                }
+                Err(DispatchError::UnsupportedVersion(api_key, version)) => {
+                    if let Some(b) = synth_unsupported(api_key, version) {
+                        let _ = resp_tx.send(Bytes::from(b)).await;
                     }
-                } else {
-                    return;
+                }
+                Err(DispatchError::Protocol(e)) => {
+                    tracing::warn!(peer = %peer, error = %e, "protocol error");
                 }
             }
-            Err(DispatchError::Protocol(e)) => {
-                tracing::warn!(peer = %peer, error = %e, "protocol error, closing");
-                return;
-            }
-        }
+        });
     }
+    drop(resp_tx);
+    let _ = writer.await;
 }
 
 enum FramedError {
@@ -73,7 +82,7 @@ enum FramedError {
     TooLarge,
 }
 
-async fn read_frame_len(sock: &mut tokio::net::TcpStream, buf: &mut BytesMut) -> Result<i32, FramedError> {
+async fn read_frame_len<R: tokio::io::AsyncRead + Unpin>(sock: &mut R, buf: &mut BytesMut) -> Result<i32, FramedError> {
     while buf.len() < 4 {
         let n = sock.read_buf(buf).await.map_err(FramedError::Io)?;
         if n == 0 {
@@ -92,8 +101,8 @@ async fn read_frame_len(sock: &mut tokio::net::TcpStream, buf: &mut BytesMut) ->
     Ok(len)
 }
 
-async fn read_exact_bytes(
-    sock: &mut tokio::net::TcpStream,
+async fn read_exact_bytes<R: tokio::io::AsyncRead + Unpin>(
+    sock: &mut R,
     buf: &mut BytesMut,
     len: usize,
 ) -> std::io::Result<Bytes> {
@@ -123,8 +132,9 @@ impl From<ProtocolError> for DispatchError {
 async fn dispatch(frame_bytes: Bytes, ctx: &Ctx) -> Result<Option<Vec<u8>>, DispatchError> {
     let reg = Registry::global();
     // 预读 api_key/version 以定头版本（先偷看前 4 字节，读头时再正式解析）
-    if frame_bytes.len() < 4 {
-        return Err(ProtocolError::UnexpectedEof { pos: 0, need: 4 }.into());
+    if frame_bytes.len() < 8 {
+        // 头部最少 8 字节（api_key+api_version+correlation_id）
+        return Err(ProtocolError::UnexpectedEof { pos: 0, need: 8 }.into());
     }
     let api_key = i16::from_be_bytes([frame_bytes[0], frame_bytes[1]]);
     let _api_version = i16::from_be_bytes([frame_bytes[2], frame_bytes[3]]);

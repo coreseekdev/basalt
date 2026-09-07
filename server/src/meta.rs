@@ -191,22 +191,55 @@ impl MetaService {
     }
 
     async fn create_via_controller(&mut self, name: &str, partitions: i32, rf: i32) -> bool {
-        // 统一走控制器 RPC（控制器节点对自己的内部端口回环亦可），
-        // 创建后立即拉最新快照内联应用——绝不能在本 actor 内等待自己的 ApplyCluster（自死锁）
-        let Some(addr) = self.controller_addr.clone() else { return false };
-        let client = crate::internal::InternalClient::new(addr);
-        if client.create_topic(name, partitions, rf).await.is_err() {
-            return false;
+        // 创建：本机持有控制器 actor → 直调；否则 RPC 到控制器内部端口
+        if let Some(tx) = &self.controller_tx {
+            let (txr, rxr) = oneshot::channel();
+            let _ = tx
+                .send(crate::internal::ControllerCmd::CreateTopic {
+                    name: name.to_string(),
+                    partitions,
+                    rf,
+                    reply: txr,
+                })
+                .await;
+            if rxr.await.is_err() {
+                return false;
+            }
+        } else {
+            let Some(addr) = self.controller_addr.clone() else { return false };
+            let client = crate::internal::InternalClient::new(addr);
+            if client.create_topic(name, partitions, rf).await.is_err() {
+                return false;
+            }
         }
-        match client.meta_sync(self.cluster.version).await {
-            Ok(resp) if resp.len() >= 1 && resp[0] == 1 => {
+        // 创建后立即拉最新快照内联应用——绝不能在本 actor 内等待自己的 ApplyCluster（自死锁）
+        self.refresh_cluster_snapshot().await;
+        topic_meta_from_cluster(&self.cluster, name).is_some()
+    }
+
+    /// 从控制器拉取最新快照并应用（控制器节点走 controller_tx， follower 走 RPC）。
+    async fn refresh_cluster_snapshot(&mut self) {
+        if let Some(tx) = &self.controller_tx {
+            let (txr, rxr) = oneshot::channel();
+            let _ = tx
+                .send(crate::internal::ControllerCmd::Sync { version: 0, reply: txr })
+                .await;
+            if let Ok(Some(snap)) = rxr.await {
+                if let Some(state) = ClusterState::decode(&snap) {
+                    self.apply_cluster(Box::new(state)).await;
+                }
+            }
+            return;
+        }
+        let Some(addr) = self.controller_addr.clone() else { return };
+        let client = crate::internal::InternalClient::new(addr);
+        if let Ok(resp) = client.meta_sync(0).await {
+            if resp.len() >= 1 && resp[0] == 1 {
                 if let Some(state) = ClusterState::decode(&resp[1..]) {
                     self.apply_cluster(Box::new(state)).await;
                 }
             }
-            _ => {}
         }
-        topic_meta_from_cluster(&self.cluster, name).is_some()
     }
 
     async fn apply_cluster(&mut self, state: Box<ClusterState>) {
@@ -371,9 +404,11 @@ impl FollowerPull {
         let client = crate::internal::InternalClient::new(self.leader_addr.clone());
         // 启动 LEO：从本地 actor 查询真实日志末尾（重启/带数据重启场景不能从 0 开始）
         let Some(mut next_offset) = self.local_leo().await else {
+            tracing::error!(topic=%self.topic, "follower pull: local_leo failed");
             return;
         };
         tracing::info!(topic=%self.topic, partition=self.partition, leader=self.leader, start=next_offset, "follower pull started");
+        eprintln!("PULL-START t={} p={} addr={}", self.topic, self.partition, self.leader_addr);
         loop {
             if self.stop_requested() {
                 tracing::info!(topic=%self.topic, partition=self.partition, "follower pull stopped");
@@ -401,6 +436,7 @@ impl FollowerPull {
                         next_offset = res.leader_next_offset;
                         continue;
                     }
+                    eprintln!("PULL t={} p={} off={} got={}B hw={} lnext={}", self.topic, self.partition, next_offset, res.data.len(), res.high_watermark, res.leader_next_offset);
                     if !res.data.is_empty() {
                         let (tx, rx) = oneshot::channel();
                         if self
@@ -418,6 +454,7 @@ impl FollowerPull {
                         }
                         match rx.await {
                             Ok(out) => {
+                                eprintln!("PULL-ACK t={} p={} err={:?} last={}", self.topic, self.partition, out.error.is_some(), out.last_offset);
                                 if out.error.is_none() {
                                     next_offset = out.last_offset + 1;
                                 } else if let Some(basalt_storage::error::StorageError::Other(m)) = &out.error {
@@ -435,6 +472,7 @@ impl FollowerPull {
                     }
                 }
                 Err(e) => {
+                    eprintln!("PULL-ERR t={} p={} {}", self.topic, self.partition, e);
                     tracing::debug!(topic=%self.topic, error=%e, "pull failed, retrying");
                     tokio::time::sleep(std::time::Duration::from_millis(500)).await;
                 }

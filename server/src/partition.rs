@@ -259,12 +259,14 @@ impl PartitionActor {
                     self.role = new_role;
                     self.epoch = epoch;
                     self.replicas = replicas.clone();
-                    self.log.set_replicated(multi);
+                    self.log.replicated = multi;
                     if leader {
-                        // 新 leader：HW 从 0 起由 follower 上报驱动；单副本立即=LLEO
-                        if !multi {
-                            self.log.high_watermark = self.log.next_offset;
-                        }
+                        // 新 leader：以本地数据为准对外服务（HW=LEO）。
+                        // 后续 follower 上报驱动 HW 前向推进；已确认数据不会少于此处。
+                        self.log.high_watermark = self.log.next_offset;
+                    } else {
+                        // 新 follower：HW 归零，等从新 leader 拉齐后由上报驱动
+                        self.log.high_watermark = 0;
                     }
                 }
                 PartitionCmd::Produce { batches, policy, acks, reply } => {

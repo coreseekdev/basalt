@@ -43,10 +43,10 @@ pub fn read_request_header(src: &Bytes, api_flexible_from: Option<i16>) -> Resul
         }
     };
 
-    // client_id：legacy string（i32 len），v2 头仍是 legacy 编码（头的 flexible 只体现在 tag section）
+    // client_id：nullable string（int16 长度；头永不使用 compact 编码）
     let mut client_id = None;
     if header_version >= 1 {
-        let len = r.i32()?;
+        let len = r.i16()?;
         if len >= 0 {
             let s = r.take(len as usize)?;
             client_id = Some(String::from_utf8_lossy(s).into());

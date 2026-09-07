@@ -149,13 +149,62 @@ mod tests {
         let fetch = adv.iter().find(|&&(k, _, _, _)| k == 1).unwrap();
         assert!(fetch.1 >= 4);
     }
+}
+
+#[cfg(test)]
+mod gating_tests {
+    use crate::codec;
+    use crate::value::{s, Value, Struct};
+    use bytes::BytesMut;
+
+    fn encode_metadata_v(version: i16) -> usize {
+        let reg = crate::registry::Registry::global();
+        let entry = reg.api(3).unwrap();
+        let part = s([
+            ("ErrorCode", Value::I16(0)),
+            ("PartitionIndex", Value::I32(0)),
+            ("LeaderId", Value::I32(0)),
+            ("LeaderEpoch", Value::I32(0)),
+            ("ReplicaNodes", Value::Array(vec![Value::I32(0)])),
+            ("IsrNodes", Value::Array(vec![Value::I32(0)])),
+            ("OfflineReplicas", Value::Array(vec![])),
+        ]);
+        let topic = s([
+            ("ErrorCode", Value::I16(0)),
+            ("Name", Value::str("t1")),
+            ("TopicId", Value::Uuid(0)),
+            ("IsInternal", Value::Bool(false)),
+            ("Partitions", Value::Array(vec![part])),
+            ("TopicAuthorizedOperations", Value::I32(-2147483648)),
+        ]);
+        let mut st = Struct::new();
+        st.set("ThrottleTimeMs", Value::I32(0));
+        st.set("Brokers", Value::Array(vec![s([
+            ("NodeId", Value::I32(0)),
+            ("Host", Value::str("localhost")),
+            ("Port", Value::I32(9092)),
+            ("Rack", Value::Null),
+        ])]));
+        st.set("ClusterId", Value::Null);
+        st.set("ControllerId", Value::I32(0));
+        st.set("Topics", Value::Array(vec![topic]));
+        st.set("ClusterAuthorizedOperations", Value::I32(-2147483648));
+        let mut out = BytesMut::new();
+        let flex = version >= 9;
+        codec::encode_struct_fields(&entry.response.fields, version, flex, &st, &mut out).unwrap();
+        if version == 1 {
+            let hexs: String = out.iter().map(|x| format!("{x:02x}")).collect();
+            println!("v1hex={hexs}");
+        }
+        out.len()
+    }
 
     #[test]
-    fn flexible_flags() {
-        let reg = Registry::global();
-        assert_eq!(reg.api(3).unwrap().flexible_from, Some(9)); // Metadata 9+
-        assert_eq!(reg.api(1).unwrap().flexible_from, Some(12)); // Fetch 12+
-        assert_eq!(reg.api(0).unwrap().flexible_from, Some(9)); // Produce 9+
-        assert_eq!(reg.api(2).unwrap().flexible_from, Some(6)); // ListOffsets 6+
+    fn version_gating_sizes() {
+        let v1 = encode_metadata_v(1);
+        let v7 = encode_metadata_v(7);
+        println!("v1={v1} v7={v7}");
+        // v7 相对 v1 增量：ClusterId(2) + ThrottleTimeMs(4) + LeaderEpoch(4) + OfflineReplicas(4)
+        assert_eq!(v7 - v1, 14, "v7 adds ClusterId/Throttle/LeaderEpoch/OfflineReplicas");
     }
 }

@@ -85,7 +85,7 @@ fn decode_value(
         Ty::F64 => Value::F64(r.f64()?),
         Ty::Bool => Value::Bool(r.i8()? != 0),
         Ty::Str => {
-            let bytes = take_str_bytes(r, flexible)?;
+            let bytes = take_str(r, flexible)?;
             match bytes {
                 None => {
                     if nullable {
@@ -165,12 +165,21 @@ fn elem_of(node: &Node) -> &Node {
         .expect("array node must carry element node")
 }
 
-/// string：legacy i32（-1 null）/ compact uvarint(len+1)。
-fn take_str_bytes<'a>(r: &mut Reader<'a>, flexible: bool) -> Result<Option<&'a [u8]>> {
-    take_len_bytes(r, flexible)
+/// string：legacy i16 长度（-1 null）/ compact uvarint(len+1)。
+/// 注意：非 flexible 的 string 是 int16 前缀，bytes/records 才是 int32。
+fn take_str<'a>(r: &mut Reader<'a>, flexible: bool) -> Result<Option<&'a [u8]>> {
+    if flexible {
+        take_len_bytes(r, true)
+    } else {
+        let n = r.i16()?;
+        if n < 0 {
+            return Ok(None);
+        }
+        Ok(Some(r.take(n as usize)?))
+    }
 }
 
-/// bytes/records 同型：legacy i32 长度（-1 null，-2..-5 保留值忽略）、compact varint。
+/// bytes/records：legacy i32 长度（-1 null）/ compact varint。
 fn take_len_bytes<'a>(r: &mut Reader<'a>, flexible: bool) -> Result<Option<&'a [u8]>> {
     let len: i64 = if flexible {
         let n = r.uvarint()?;
@@ -245,7 +254,7 @@ fn encode_value(node: &Node, version: i16, flexible: bool, v: &Value, out: &mut 
                 if flexible {
                     put_compact_len(out, None);
                 } else {
-                    out.put_i32(-1);
+                    out.put_i16(-1); // legacy null string = int16 -1
                 }
             }
             Value::Str(s) => {
@@ -263,7 +272,12 @@ fn encode_value(node: &Node, version: i16, flexible: bool, v: &Value, out: &mut 
                 }
             }
             Value::Bytes(b) => {
-                put_str_len(out, b.len(), flexible);
+                // bytes/records：legacy 用 int32 长度（string 才是 int16）
+                if flexible {
+                    put_compact_len(out, Some(b.len()));
+                } else {
+                    out.put_i32(b.len() as i32);
+                }
                 out.extend_from_slice(b);
             }
             _ => return Err(bad_val(node, v)),
@@ -325,7 +339,7 @@ fn put_str_len(out: &mut BytesMut, len: usize, flexible: bool) {
     if flexible {
         put_compact_len(out, Some(len));
     } else {
-        out.put_i32(len as i32);
+        out.put_i16(len as i16); // legacy string = int16 长度
     }
 }
 
@@ -361,7 +375,7 @@ mod tests {
         { "name": "Acks", "type": "int16", "versions": "0+" },
         { "name": "Names", "type": "[]string", "versions": "0+" },
         { "name": "Payload", "type": "records", "versions": "0+", "nullableVersions": "0+" },
-        { "name": "Note", "type": "string", "versions": "2+", "taggedVersions": "3+", "tag": 0,
+        { "name": "Note", "type": "string", "versions": "3+", "taggedVersions": "3+", "tag": 0,
           "fields": [] }
       ]
     }"#;
@@ -417,6 +431,22 @@ mod tests {
             let back = decode(&p.fields, v, flex, &src).unwrap();
             assert!(matches!(back.req("Payload"), Value::Null));
         }
+    }
+
+    #[test]
+    fn legacy_string_is_i16_prefixed() {
+        // Kafka 非 flexible string = int16 长度（真实客户端对拍抓出的 bug 回归）
+        let p = plan();
+        let mut st = Struct::new();
+        st.set("Acks", Value::I16(1))
+            .set("Names", Value::Array(vec![Value::str("tp")]))
+            .set("Payload", Value::Null);
+        let mut buf = BytesMut::new();
+        encode(&p, 2, false, &st, &mut buf).unwrap();
+        // Acks(2) + array len i32(4) + str len i16(2) + "tp"
+        assert_eq!(&buf[2..6], &1i32.to_be_bytes(), "array count");
+        assert_eq!(&buf[6..8], &2i16.to_be_bytes(), "string length MUST be i16");
+        assert_eq!(&buf[8..10], b"tp");
     }
 
     #[test]

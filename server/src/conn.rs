@@ -124,8 +124,17 @@ async fn dispatch(frame_bytes: Bytes, ctx: &Ctx) -> Result<Option<Vec<u8>>, Disp
     let Some(entry) = reg.api(api_key) else {
         return Err(DispatchError::UnknownApi);
     };
-    let (head, body_start) =
-        frame::read_request_header(&frame_bytes, entry.flexible_from).map_err(DispatchError::from)?;
+    let (head, body_start) = match frame::read_request_header(&frame_bytes, entry.flexible_from) {
+        Ok(x) => x,
+        Err(e) => {
+            // KIP-511 探测语义：协商前的 ApiVersions 可能用旧头/无 tag section，
+            // 解析失败也要以 v0 语义回 UNSUPPORTED_VERSION（corr 在固定偏移 4..8）
+            if api_key == key::API_VERSIONS {
+                return Ok(Some(synth_apiversions_unsupported(&frame_bytes)));
+            }
+            return Err(DispatchError::Protocol(e));
+        }
+    };
     let (api_key, api_version) = (head.api_key, head.api_version);
 
     let flexible = frame::is_flexible(api_version, entry.flexible_from);
@@ -140,8 +149,21 @@ async fn dispatch(frame_bytes: Bytes, ctx: &Ctx) -> Result<Option<Vec<u8>>, Disp
         return Err(DispatchError::UnsupportedVersion(api_key, api_version));
     }
 
-    let body = frame::split_body(&frame_bytes, body_start)?;
-    let req = codec::decode(&entry.request.fields, api_version, flexible, &body)?;
+    let body = match frame::split_body(&frame_bytes, body_start) {
+        Ok(b) => b,
+        Err(e) => return Err(DispatchError::Protocol(e)),
+    };
+    let req = match codec::decode(&entry.request.fields, api_version, flexible, &body) {
+        Ok(r) => r,
+        Err(e) => {
+            // KIP-511：客户端在版本协商前可能用旧头发 ApiVersions 探测。
+            // Kafka broker 语义：该请求解析失败 → 以 v0 格式回 UNSUPPORTED_VERSION，连接保活。
+            if api_key == key::API_VERSIONS {
+                return Ok(Some(synth_apiversions_unsupported(&frame_bytes)));
+            }
+            return Err(DispatchError::Protocol(e));
+        }
+    };
 
     tracing::trace!(api = api_key, version = api_version, corr = head.correlation_id, "request");
 
@@ -150,7 +172,7 @@ async fn dispatch(frame_bytes: Bytes, ctx: &Ctx) -> Result<Option<Vec<u8>>, Disp
             let v = handlers::api_versions(&req, api_version);
             (v, false)
         }
-        key::METADATA => (handlers::metadata(&req, ctx).await, false),
+        key::METADATA => (handlers::metadata(&req, api_version, ctx).await, false),
         key::PRODUCE => handle_produce(&req, api_version, ctx).await?,
         key::FETCH => (handlers::fetch(parse_fetch(&req, api_version)?, ctx).await, false),
         key::LIST_OFFSETS => (handlers::list_offsets(&req, ctx).await, false),
@@ -268,4 +290,18 @@ fn synth_unsupported(api_key: i16, version: i16) -> Option<Vec<u8>> {
     framed.extend_from_slice(&total.to_be_bytes());
     framed.extend_from_slice(&out);
     Some(framed.to_vec())
+}
+
+/// ApiVersions 协商失败的固定应答：v0 格式 UNSUPPORTED_VERSION（KIP-511）。
+fn synth_apiversions_unsupported(frame_bytes: &Bytes) -> Vec<u8> {
+    let corr = i32::from_be_bytes([frame_bytes[4], frame_bytes[5], frame_bytes[6], frame_bytes[7]]);
+    let mut out = BytesMut::new();
+    frame::write_response_header(&mut out, corr, 0);
+    out.extend_from_slice(&(basalt_protocol::api::ErrorCode::UnsupportedVersion as i16).to_be_bytes());
+    out.extend_from_slice(&0i32.to_be_bytes()); // 空 ApiKeys
+    let total = out.len() as i32;
+    let mut framed = BytesMut::with_capacity(out.len() + 4);
+    framed.extend_from_slice(&total.to_be_bytes());
+    framed.extend_from_slice(&out);
+    framed.to_vec()
 }

@@ -64,7 +64,7 @@ pub fn api_versions(req: &basalt_protocol::value::Struct, version: i16) -> Value
 
 // ---------- Metadata ----------
 
-pub async fn metadata(req: &basalt_protocol::value::Struct, ctx: &Ctx) -> Value {
+pub async fn metadata(req: &basalt_protocol::value::Struct, version: i16, ctx: &Ctx) -> Value {
     // Topics: v1+ nullable（null = 全量）
     let names: Option<Vec<String>> = match req.get("Topics") {
         Some(Value::Null) | None => None,
@@ -82,7 +82,13 @@ pub async fn metadata(req: &basalt_protocol::value::Struct, ctx: &Ctx) -> Value 
         }
         _ => None,
     };
-    let allow_create = req.get("AllowAutoTopicCreation").map(|v| v.as_bool()).unwrap_or(false);
+    // Kafka 语义：AllowAutoTopicCreation 自 v4 才引入（客户端用来退出自动建题）；
+    // v1-v3 的 metadata 请求按 broker 配置默认允许自动建题。
+    let allow_create = if version < 4 {
+        true
+    } else {
+        req.get("AllowAutoTopicCreation").map(|v| v.as_bool()).unwrap_or(false)
+    };
 
     let (reply_tx, reply_rx) = oneshot::channel();
     let _ = ctx

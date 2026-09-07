@@ -21,6 +21,9 @@ pub const MAGIC_V2: i8 = 2;
 pub const RECORD_BATCH_HEADER_LEN: usize = 61;
 /// CRC 覆盖起点相对批头的偏移（attributes 起，= magic 16 + crc 4 + 1）。
 pub const CRC_PAYLOAD_OFFSET: usize = 21;
+/// batchLength 的度量起点：Kafka 语义 total = LOG_OVERHEAD(12) + batchLength
+/// （即 batchLength 含 partitionLeaderEpoch..records，不含 baseOffset 与自身）。
+pub const BATCH_LENGTH_OFFSET: usize = 12;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[repr(i16)]
@@ -118,7 +121,7 @@ impl BatchHeader {
     }
 
     pub fn total_len(&self) -> usize {
-        RECORD_BATCH_HEADER_LEN + self.batch_length.max(0) as usize
+        BATCH_LENGTH_OFFSET + self.batch_length.max(0) as usize
     }
 
     /// 改写 base_offset（CRC 不覆盖该字段，无需重算）。
@@ -211,7 +214,8 @@ pub fn encode_batch(
         body.extend_from_slice(&entry);
     }
 
-    let batch_length = body.len() as i32;
+    // batchLength 从偏移 12 起度量（含 leaderEpoch/magic/crc/头其余与记录区）
+    let batch_length = (RECORD_BATCH_HEADER_LEN - BATCH_LENGTH_OFFSET + body.len()) as i32;
     out.reserve(RECORD_BATCH_HEADER_LEN + body.len());
 
     // CRC 覆盖自 attributes 起 —— 先拼出 CRC 覆盖区再算
@@ -374,6 +378,8 @@ mod tests {
         let l1 = batch_len_at(&buf).unwrap();
         let h1 = BatchHeader::parse(&buf).unwrap();
         assert_eq!(l1, h1.total_len());
+        // Kafka 语义：total = 12 + batchLength（batchLength 从偏移 12 度量）
+        assert_eq!(l1, BATCH_LENGTH_OFFSET + h1.batch_length as usize);
         let h2 = BatchHeader::parse(&buf[l1..]).unwrap();
         assert_eq!(h2.base_offset, 2);
     }

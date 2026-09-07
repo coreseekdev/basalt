@@ -1,4 +1,12 @@
 //! 日志 = 段集合（sealed 升序 + active），单写者语义由持有者保证。
+//!
+//! 写路径两阶段（P0 修复）：先对整段 raw 做全量校验（magic/CRC/连续性），
+//! 再构建 staging 并一次性落盘；任何错误在触碰内存状态前返回，
+//! 落盘阶段的失败经 checkpoint 回滚内存并截断文件——杜绝"已分配但不存在"的空洞。
+//!
+//! HW 纪律（P0 修复）：`replicated == true` 时 HW 的唯一推进入口是
+//! 复制层（follower LEO 上报 → min(LEO, ISR LEO)）；append 绝不自抬 HW。
+//! 单副本（replicas==1）分区由调用方置 replicated=false，append 后 HW=LEO。
 
 use crate::disk::DiskIo;
 use crate::error::{Result, StorageError};
@@ -55,6 +63,14 @@ pub enum AssignPolicy {
     Absolute,
 }
 
+/// 读封顶：consumer 读不得越过 HW（未提交数据不可见）；
+/// 复制拉取读到 LEO（这正是复制的意义）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ReadCap {
+    HighWatermark,
+    LogEnd,
+}
+
 pub struct Log<D: DiskIo> {
     disk: D,
     dir: std::path::PathBuf,
@@ -63,8 +79,10 @@ pub struct Log<D: DiskIo> {
     active: Segment,
     pub log_start_offset: i64,
     pub next_offset: i64,
-    /// 复制层维护；单机 = next_offset。
+    /// 复制层维护；单副本分区（replicated=false）append 后 HW=LEO。
     pub high_watermark: i64,
+    /// true = 多副本分区：HW 只由复制层推进。
+    pub replicated: bool,
 }
 
 impl<D: DiskIo> Log<D> {
@@ -84,13 +102,22 @@ impl<D: DiskIo> Log<D> {
             s.load_indexes(&disk);
         }
 
-        // 逐段扫描校验/重建：坏尾截断（torn write 防线）
+        // 逐段扫描校验/重建：坏尾截断（torn write 防线）+ 段间连续性校验
         let mut next_offset: i64 = segs.first().map(|s| s.base_offset).unwrap_or(0);
         let mut sealed: Vec<Segment> = Vec::new();
         for seg in &mut segs {
             scan_and_truncate(&disk, seg, next_offset)?;
             if seg.next_rel == 0 && seg.bytes == 0 && !sealed.is_empty() {
                 continue; // 空段且有前驱：保留文件但不入列表
+            }
+            if !sealed.is_empty() && seg.base_offset != next_offset {
+                tracing::error!(
+                    path = %seg.path.display(),
+                    expect = next_offset,
+                    got = seg.base_offset,
+                    "segment gap detected: skipping orphan segment"
+                );
+                continue; // 段间空洞：拒绝（复制路径以此为真相源）
             }
             next_offset = seg.base_offset + seg.next_rel;
             sealed.push(seg.clone());
@@ -107,6 +134,7 @@ impl<D: DiskIo> Log<D> {
             log_start_offset,
             next_offset,
             high_watermark: next_offset,
+            replicated: false,
         };
         tracing::info!(
             dir = %log.dir.display(),
@@ -121,93 +149,153 @@ impl<D: DiskIo> Log<D> {
         &self.dir
     }
 
+    /// 复制模式开关：开启后 HW 只由复制层推进（append 不自抬）。
+    pub fn set_replicated(&mut self, replicated: bool) {
+        self.replicated = replicated;
+        if !replicated {
+            // 单副本：全部本地数据视为已提交
+            if self.high_watermark < self.next_offset {
+                self.high_watermark = self.next_offset;
+            }
+        } else {
+            // 转入复制模式：HW 归零，等 follower 上报驱动（failover 后由复制层快速恢复）
+            self.high_watermark = 0;
+        }
+    }
+
     // ---------- 写路径 ----------
 
     /// 追加一批（可含多个连续 RecordBatch）。
+    ///
+    /// 两阶段：先全量校验并计算分配（不触碰内存状态），再落盘 + 应用内存。
+    /// 落盘失败时按 checkpoint 回滚内存并截断 active 文件。
     pub fn append(&mut self, raw: &Bytes, policy: AssignPolicy, now_ms: i64) -> Result<AppendResult> {
-        let log_append_time = now_ms;
-        let mut staging = BytesMut::new();
-        let mut base_assigned: Option<i64> = None;
-        let mut last_offset = self.next_offset - 1;
-        let mut pos = 0usize;
+        if raw.is_empty() {
+            return Err(StorageError::Other("empty record set".into()));
+        }
 
+        // ---- 阶段 1：全量校验 + offset 分配（零内存变更） ----
+        struct Pending {
+            assigned: i64,
+            total: usize,
+            count: i64,
+            max_ts: i64,
+            src: (usize, usize), // raw 中的 [start, end)
+        }
+        let mut pendings: Vec<Pending> = Vec::with_capacity(4);
+        let mut next = self.next_offset;
+        let mut pos = 0usize;
         while pos < raw.len() {
             let rest = &raw[pos..];
+            let err = |reason: String| StorageError::CorruptBatch {
+                path: self.active.path.display().to_string(),
+                pos: pos as u64,
+                reason,
+            };
             let Some(h) = BatchHeader::parse(rest) else {
-                return Err(StorageError::CorruptBatch {
-                    path: self.active.path.display().to_string(),
-                    pos: pos as u64,
-                    reason: "header too short".into(),
-                });
+                return Err(err("header too short".into()));
             };
             let total = h.total_len();
             if rest.len() < total {
-                return Err(StorageError::CorruptBatch {
-                    path: self.active.path.display().to_string(),
-                    pos: pos as u64,
-                    reason: "truncated batch".into(),
-                });
+                return Err(err("truncated batch".into()));
             }
             if h.magic != crate::MAGIC_V2 {
-                return Err(StorageError::CorruptBatch {
-                    path: self.active.path.display().to_string(),
-                    pos: pos as u64,
-                    reason: format!("magic {} unsupported (ADR-4: v2 only)", h.magic),
-                });
+                return Err(err(format!("magic {} unsupported (ADR-4: v2 only)", h.magic)));
             }
-            let payload = &rest[CRC_PAYLOAD_OFFSET..total];
-            if crc32c::crc32c(payload) != h.crc {
-                return Err(StorageError::CorruptBatch {
-                    path: self.active.path.display().to_string(),
-                    pos: pos as u64,
-                    reason: "crc mismatch".into(),
-                });
+            if crc32c::crc32c(&rest[CRC_PAYLOAD_OFFSET..total]) != h.crc {
+                return Err(err("crc mismatch".into()));
             }
-
+            let count = h.record_count as i64;
+            if count <= 0 {
+                return Err(err("zero/negative record count".into()));
+            }
             let assigned = match policy {
-                AssignPolicy::Assign => self.next_offset,
+                AssignPolicy::Assign => next,
                 AssignPolicy::Absolute => {
-                    if h.base_offset != self.next_offset {
+                    if h.base_offset != next {
                         return Err(StorageError::Other(format!(
                             "replica gap: batch base {} != log next {}",
-                            h.base_offset, self.next_offset
+                            h.base_offset, next
                         )));
                     }
                     h.base_offset
                 }
             };
-            if base_assigned.is_none() {
-                base_assigned = Some(assigned);
-            }
-
-            // 滚动判定必须在 staging 新批之前：staged 字节必须全部属于当前 active，
-            // 索引项才能与物理布局对齐（此前把 roll 放在 staging 之后是错位 bug）。
-            if self.active.next_rel > 0
-                && self.active.bytes + staging.len() as u64 + total as u64
-                    > self.opts.segment_max_bytes
-            {
-                self.commit_staged(&mut staging, log_append_time)?;
-                self.roll()?;
-            }
-
-            let count = h.record_count.max(0) as i64;
-            let mut batch = BytesMut::from(&rest[..total]);
-            h.write_base_offset(&mut batch, assigned);
-            staging.extend_from_slice(&batch);
-            self.active.push_batch(total, count, h.max_timestamp);
-            self.next_offset = assigned + count;
-            last_offset = assigned + count - 1;
+            pendings.push(Pending {
+                assigned,
+                total,
+                count,
+                max_ts: h.max_timestamp,
+                src: (pos, pos + total),
+            });
+            next = assigned + count;
             pos += total;
         }
+        if pendings.is_empty() {
+            return Err(StorageError::Other("no valid batches".into()));
+        }
 
-        if !staging.is_empty() {
-            self.commit_staged(&mut staging, log_append_time)?;
+        // ---- 阶段 2：落盘 + 内存应用（checkpoint 回滚保护） ----
+        let cp = Checkpoint {
+            next_offset: self.next_offset,
+            sealed_len: self.sealed.len(),
+            active: ActiveCheckpoint {
+                base: self.active.base_offset,
+                bytes: self.active.bytes,
+                next_rel: self.active.next_rel,
+                offset_ix_len: self.active.offset_index.entries.len(),
+                time_ix_len: self.active.time_index.entries.len(),
+                bytes_since_index: self.active.bytes_since_index_snapshot(),
+            },
+        };
+        let log_append_time = now_ms;
+        let mut staging = BytesMut::new();
+        let mut base_assigned: Option<i64> = None;
+        let mut last_offset = self.next_offset - 1;
+        let mut wrote_any = false;
+
+        let apply_result: Result<()> = (|| {
+            for pd in &pendings {
+                // 滚动判定必须在 staging 新批之前（staged 字节须全部属于当前 active）
+                if self.active.next_rel > 0
+                    && self.active.bytes + staging.len() as u64 + pd.total as u64
+                        > self.opts.segment_max_bytes
+                {
+                    self.commit_staged(&mut staging)?;
+                    self.roll()?;
+                }
+                let start = pd.src.0;
+                let end = pd.src.1;
+                staging.extend_from_slice(&raw[start..end]);
+                if policy == AssignPolicy::Assign {
+                    // 就地改写 base_offset（省一次整批拷贝）
+                    let tail_len = staging.len() - pd.total;
+                    let head: &mut [u8] = &mut staging[tail_len..tail_len + 8];
+                    head.copy_from_slice(&pd.assigned.to_be_bytes());
+                }
+                self.active.push_batch(pd.total, pd.count, pd.max_ts);
+                self.next_offset = pd.assigned + pd.count;
+                last_offset = pd.assigned + pd.count - 1;
+                if base_assigned.is_none() {
+                    base_assigned = Some(pd.assigned);
+                }
+            }
+            if !staging.is_empty() {
+                wrote_any = true;
+                self.commit_staged(&mut staging)?;
+            }
+            if self.opts.fsync == FsyncSchedule::SyncEach && wrote_any {
+                self.disk.sync_file(&self.active.path)?;
+            }
+            Ok(())
+        })();
+
+        if let Err(e) = apply_result {
+            self.rollback_to(&cp, wrote_any);
+            return Err(e);
         }
-        if self.opts.fsync == FsyncSchedule::SyncEach && pos > 0 {
-            self.disk.sync_file(&self.active.path)?;
-        }
-        if self.high_watermark < self.next_offset {
-            self.high_watermark = self.next_offset; // 单机语义：HW=LEO
+        if !self.replicated && self.high_watermark < self.next_offset {
+            self.high_watermark = self.next_offset;
         }
         Ok(AppendResult {
             base_offset: base_assigned.unwrap_or(self.next_offset),
@@ -216,7 +304,7 @@ impl<D: DiskIo> Log<D> {
         })
     }
 
-    fn commit_staged(&mut self, staging: &mut BytesMut, _now: i64) -> Result<()> {
+    fn commit_staged(&mut self, staging: &mut BytesMut) -> Result<()> {
         if staging.is_empty() {
             return Ok(());
         }
@@ -225,7 +313,7 @@ impl<D: DiskIo> Log<D> {
         Ok(())
     }
 
-    /// 滚动：持久化索引，active → sealed。
+    /// 滚动：持久化索引，active → sealed；新段目录项随数据 fsync（P2 修复）。
     pub fn roll(&mut self) -> Result<()> {
         if self.active.bytes == 0 && self.active.next_rel == 0 && !self.sealed.is_empty() {
             return Ok(());
@@ -234,6 +322,7 @@ impl<D: DiskIo> Log<D> {
         if self.opts.fsync != FsyncSchedule::Os {
             self.disk.sync_file(&self.active.path)?;
         }
+        self.disk.sync_dir(&self.active.path)?;
         let new_base = self.next_offset;
         let seg = std::mem::replace(&mut self.active, Segment::new(&self.dir, new_base));
         self.sealed.push(seg);
@@ -246,11 +335,22 @@ impl<D: DiskIo> Log<D> {
 
     // ---------- 读路径 ----------
 
-    pub fn read(&self, from_offset: i64, max_bytes: usize, pool: &crate::pool::BufferPool) -> Result<ReadResult> {
+    /// 读取；`cap` 决定上界（consumer=HW，复制拉取=LEO）。
+    pub fn read_ex(
+        &self,
+        from_offset: i64,
+        max_bytes: usize,
+        pool: &crate::pool::BufferPool,
+        cap: ReadCap,
+    ) -> Result<ReadResult> {
         if from_offset < self.log_start_offset {
             return Err(StorageError::OffsetOutOfRange(from_offset));
         }
-        if from_offset > self.high_watermark {
+        let upper = match cap {
+            ReadCap::HighWatermark => self.high_watermark,
+            ReadCap::LogEnd => self.next_offset,
+        };
+        if from_offset > upper {
             return Err(StorageError::OffsetOutOfRange(from_offset));
         }
         let seg = self.segment_for(from_offset);
@@ -272,6 +372,10 @@ impl<D: DiskIo> Log<D> {
             let Some(h) = BatchHeader::parse(&hdr) else { break };
             let total = h.total_len();
             if total == 0 || pos + total as u64 > seg.bytes {
+                break;
+            }
+            // 消费读不得越过 HW（未提交数据不可见）
+            if cap == ReadCap::HighWatermark && h.base_offset >= upper {
                 break;
             }
             // 整批粒度：预算不足但已读到数据 → 停；首批即便超预算也带上（Kafka 同义）
@@ -305,6 +409,11 @@ impl<D: DiskIo> Log<D> {
         })
     }
 
+    /// consumer 读取（封顶 HW）。
+    pub fn read(&self, from_offset: i64, max_bytes: usize, pool: &crate::pool::BufferPool) -> Result<ReadResult> {
+        self.read_ex(from_offset, max_bytes, pool, ReadCap::HighWatermark)
+    }
+
     fn segment_for(&self, offset: i64) -> &Segment {
         // sealed 中最后一个 base <= offset 的段；否则 active
         let idx = self
@@ -324,14 +433,12 @@ impl<D: DiskIo> Log<D> {
 
     /// ListOffsets 语义。
     pub fn list_offset(&self, timestamp: i64) -> Result<(i64, i64)> {
-        // 返回 (offset, timestamp)；timestamp=-1 latest、-2 earliest、其余按时间
         if timestamp == -1 {
             return Ok((self.high_watermark, -1));
         }
         if timestamp == -2 {
             return Ok((self.log_start_offset, -1));
         }
-        // 按时间：跨段时间索引（每段最后一项）
         for seg in self.sealed.iter().chain(std::iter::once(&self.active)) {
             let within = match seg.time_index.entries.last() {
                 Some(&(last_ts, _)) if last_ts >= timestamp => true,
@@ -341,8 +448,8 @@ impl<D: DiskIo> Log<D> {
             if !within {
                 continue;
             }
-            if let Some((_, rel)) = seg.time_index.lookup(timestamp) {
-                return Ok((seg.base_offset + rel as i64, timestamp));
+            if let Some((ts, rel)) = seg.time_index.lookup(timestamp) {
+                return Ok((seg.base_offset + rel as i64, ts));
             }
         }
         Ok((-1, -1)) // NOT_FOUND
@@ -351,6 +458,146 @@ impl<D: DiskIo> Log<D> {
     pub fn segment_count(&self) -> usize {
         self.sealed.len() + 1
     }
+
+    // ---------- 截断（failover 自愈） ----------
+
+    /// 截断到 `offset`（含）之前的数据：丢弃 >= offset 的所有批与后续段。
+    /// 用于 follower 分叉尾巴自愈与新 leader 清理未提交尾巴。
+    pub fn truncate_to(&mut self, offset: i64) -> Result<()> {
+        if offset >= self.next_offset {
+            return Ok(()); // 无需截断
+        }
+        if offset <= self.log_start_offset {
+            // 极端：截回起点——按空日志处理
+            self.truncate_all()?;
+            return Ok(());
+        }
+        // 1) 删除 base >= offset 的 sealed 段
+        let mut removed: Vec<Segment> = Vec::new();
+        self.sealed.retain(|s| {
+            if s.base_offset >= offset {
+                removed.push(s.clone());
+                false
+            } else {
+                true
+            }
+        });
+        for seg in &removed {
+            let _ = self.disk.remove(&seg.path);
+            let _ = self.disk.remove(&seg.index_path);
+            let _ = self.disk.remove(&seg.time_path);
+        }
+        // 2) active（或目标段）内截断
+        let target_seg = offset >= self.active.base_offset;
+        if target_seg {
+            let seg = &mut self.active;
+            let pos = seg.locate(offset);
+            // 精确对齐：从 pos 起扫批头找 base == offset 的批起点
+            let mut exact = pos;
+            let mut scan = pos;
+            loop {
+                if scan + RECORD_BATCH_HEADER_LEN as u64 > seg.bytes {
+                    break;
+                }
+                let mut hdr = [0u8; RECORD_BATCH_HEADER_LEN];
+                let n = self.disk.read_at(&seg.path, scan, &mut hdr)?;
+                if n < RECORD_BATCH_HEADER_LEN {
+                    break;
+                }
+                let Some(h) = BatchHeader::parse(&hdr) else { break };
+                if h.base_offset >= offset {
+                    exact = scan;
+                    break;
+                }
+                scan += h.total_len() as u64;
+            }
+            self.disk.truncate(&seg.path, exact)?;
+            self.disk.sync_file(&seg.path)?;
+            self.disk.sync_dir(&seg.path)?;
+            seg.bytes = exact;
+            // 重建内存索引（复用恢复扫描：文件已截断，扫描即重建）
+            crate::log::rescan_segment(&self.disk, seg);
+        } else {
+            // offset 落在 sealed 区：active 整段删除，sealed 收缩
+            let _ = self.disk.remove(&self.active.path);
+            let _ = self.disk.remove(&self.active.index_path);
+            let _ = self.disk.remove(&self.active.time_path);
+            self.active = Segment::new(&self.dir, offset);
+        }
+        self.next_offset = offset;
+        if self.high_watermark > offset {
+            self.high_watermark = offset;
+        }
+        tracing::warn!(offset, "log truncated (divergent tail healing)");
+        Ok(())
+    }
+
+    fn truncate_all(&mut self) -> Result<()> {
+        for seg in self.sealed.clone() {
+            let _ = self.disk.remove(&seg.path);
+            let _ = self.disk.remove(&seg.index_path);
+            let _ = self.disk.remove(&seg.time_path);
+        }
+        self.sealed.clear();
+        let _ = self.disk.remove(&self.active.path);
+        let _ = self.disk.remove(&self.active.index_path);
+        let _ = self.disk.remove(&self.active.time_path);
+        self.active = Segment::new(&self.dir, 0);
+        self.next_offset = 0;
+        self.high_watermark = 0;
+        self.log_start_offset = 0;
+        Ok(())
+    }
+}
+
+/// 截断后的段内索引重建（与恢复扫描共用语义）。
+fn rescan_segment<D: DiskIo>(disk: &D, seg: &mut Segment) {
+    let _ = crate::log::scan_and_rescan(disk, seg);
+}
+
+// checkpoint 回滚所需的最小内存快照
+struct Checkpoint {
+    next_offset: i64,
+    sealed_len: usize,
+    active: ActiveCheckpoint,
+}
+
+struct ActiveCheckpoint {
+    base: i64,
+    bytes: u64,
+    next_rel: i64,
+    offset_ix_len: usize,
+    time_ix_len: usize,
+    bytes_since_index: u64,
+}
+
+impl<D: DiskIo> Log<D> {
+    fn rollback_to(&mut self, cp: &Checkpoint, wrote_any: bool) {
+        // 内存状态回滚
+        self.next_offset = cp.next_offset;
+        while self.sealed.len() > cp.sealed_len {
+            self.sealed.pop();
+        }
+        // active 段可能因 roll 被换新：恢复为 checkpoint 时的段
+        if self.active.base_offset != cp.active.base {
+            self.active = Segment::new(&self.dir, cp.active.base);
+        }
+        self.active.bytes = cp.active.bytes;
+        self.active.next_rel = cp.active.next_rel;
+        self.active.offset_index.entries.truncate(cp.active.offset_ix_len);
+        self.active.time_index.entries.truncate(cp.active.time_ix_len);
+        self.active.restore_bytes_since_index(cp.active.bytes_since_index);
+        // 磁盘回滚：截掉 checkpoint 之后写入的字节
+        if wrote_any || self.active.bytes < cp.active.bytes {
+            let _ = self.disk.truncate(&self.active.path, cp.active.bytes);
+        }
+        tracing::error!(next_offset = cp.next_offset, "append failed: state rolled back");
+    }
+}
+
+/// 恢复/截断后重建段内索引。
+pub(crate) fn scan_and_rescan<D: DiskIo>(disk: &D, seg: &mut Segment) -> Result<()> {
+    scan_and_truncate(disk, seg, seg.base_offset)
 }
 
 /// 恢复扫描：CRC 校验走批，坏尾截断；重建段内索引。

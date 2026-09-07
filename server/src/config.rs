@@ -1,5 +1,12 @@
 //! 配置：env 优先（T-0.5 的最小先行版），类型化字段。
 
+/// 副本/ISR 配置（分区 actor 用）。
+#[derive(Debug, Clone)]
+pub struct ReplicaConfig {
+    pub min_insync: i32,
+    pub isr_lag: std::time::Duration,
+}
+
 #[derive(Debug, Clone)]
 pub struct Config {
     pub node_id: i32,
@@ -13,6 +20,17 @@ pub struct Config {
     pub log_level: String,
     /// 集群成员（多节点 POC）：`0=host:port,1=host:port`。
     pub nodes: Vec<(i32, String, u16)>,
+    pub min_isr: i32,
+    pub isr_lag_ms: u64,
+}
+
+impl Config {
+    pub fn replica_config(&self) -> ReplicaConfig {
+        ReplicaConfig {
+            min_insync: self.min_isr,
+            isr_lag: std::time::Duration::from_millis(self.isr_lag_ms),
+        }
+    }
 }
 
 impl Config {
@@ -33,6 +51,8 @@ impl Config {
                 .unwrap_or(1 << 30),
             log_level: env("BASALT_LOG_LEVEL", "info"),
             nodes,
+            min_isr: env("BASALT_MIN_ISR", "1").parse().unwrap_or(1),
+            isr_lag_ms: env("BASALT_ISR_LAG_MS", "10000").parse().unwrap_or(10000),
         }
     }
 

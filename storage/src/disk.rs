@@ -10,7 +10,7 @@
 
 use crate::error::Result;
 use std::collections::HashMap;
-use std::io::{Read, Seek, SeekFrom, Write};
+use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 
@@ -30,6 +30,8 @@ pub trait DiskIo: Send + Sync + 'static {
     fn read_at(&self, path: &Path, pos: u64, buf: &mut [u8]) -> Result<usize>;
     /// 整文件读（恢复扫描用）。
     fn read_all(&self, path: &Path) -> Result<Vec<u8>>;
+    /// fsync 目录项（段创建/截断/删除后的持久性）。
+    fn sync_dir(&self, path: &Path) -> Result<()>;
 }
 
 /// 生产实现：文件系统 + 句柄缓存。
@@ -128,18 +130,16 @@ impl DiskIo for StdDisk {
     fn append(&self, path: &Path, data: &[u8]) -> Result<u64> {
         let mut f = self.append_handle(path)?;
         f.write_all(data)?;
-        Ok(f.metadata()?.len())
+        // 尺寸由 Log 内存记账，避免每 append 一次 stat
+        Ok(0)
     }
 
     fn sync_file(&self, path: &Path) -> Result<()> {
-        let f = {
-            let hs = self.append_handles.lock().unwrap();
-            match hs.get(path) {
-                Some(f) => f.try_clone()?,
-                None => std::fs::OpenOptions::new().append(true).open(path)?,
-            }
-        };
-        f.sync_all()?;
+        let hs = self.append_handles.lock().unwrap();
+        match hs.get(path) {
+            Some(f) => f.sync_all()?,
+            None => std::fs::OpenOptions::new().append(true).open(path)?.sync_all()?,
+        }
         Ok(())
     }
 
@@ -155,11 +155,12 @@ impl DiskIo for StdDisk {
     }
 
     fn read_at(&self, path: &Path, pos: u64, buf: &mut [u8]) -> Result<usize> {
-        let mut f = self.read_handle(path)?;
-        f.seek(SeekFrom::Start(pos))?;
+        use std::os::unix::fs::FileExt;
+        let f = self.read_handle(path)?;
+        // pread：无 seek 竞态、免 lseek syscall
         let mut total = 0;
         while total < buf.len() {
-            match f.read(&mut buf[total..])? {
+            match f.read_at(&mut buf[total..], pos + total as u64)? {
                 0 => break,
                 n => total += n,
             }
@@ -169,6 +170,14 @@ impl DiskIo for StdDisk {
 
     fn read_all(&self, path: &Path) -> Result<Vec<u8>> {
         Ok(std::fs::read(path)?)
+    }
+
+    fn sync_dir(&self, path: &Path) -> Result<()> {
+        // fsync 目录项（Linux）；对父目录 open+sync_all
+        let dir = path.parent().unwrap_or(Path::new("."));
+        let f = std::fs::File::open(dir)?;
+        f.sync_all()?;
+        Ok(())
     }
 }
 

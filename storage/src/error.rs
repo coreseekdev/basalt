@@ -10,6 +10,10 @@ pub enum StorageError {
     CorruptBatch { path: String, pos: u64, reason: String },
     #[error("offset {0} out of range (log start..hw)")]
     OffsetOutOfRange(i64),
+    #[error("not leader for this partition")]
+    NotLeader,
+    #[error("not enough replicas (isr below min.insync)")]
+    NotEnoughReplicas,
     #[error("{0}")]
     Other(String),
 }

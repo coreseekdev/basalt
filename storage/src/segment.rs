@@ -47,6 +47,15 @@ impl Segment {
         }
     }
 
+    /// checkpoint 快照/恢复（append 回滚用）。
+    pub fn bytes_since_index_snapshot(&self) -> u64 {
+        self.bytes_since_index
+    }
+
+    pub fn restore_bytes_since_index(&mut self, v: u64) {
+        self.bytes_since_index = v;
+    }
+
     pub fn last_offset(&self) -> i64 {
         self.base_offset + self.next_rel - 1
     }

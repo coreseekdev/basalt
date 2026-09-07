@@ -55,6 +55,7 @@ async fn async_main(cfg: Config) {
     // 控制器 actor（仅控制器节点）
     let controller_tx = if is_controller {
         Some(internal::Controller::spawn(
+            cfg.node_id,
             std::path::Path::new(&cfg.data_dir).join("__controller.log"),
             std::time::Duration::from_millis(
                 std::env::var("BASALT_HEARTBEAT_TIMEOUT_MS").ok().and_then(|v| v.parse().ok()).unwrap_or(4000),

@@ -121,6 +121,8 @@ pub enum ControllerCmd {
 
 /// 控制器 actor（独占 ClusterState；最小 node id 的 broker 进程内运行）。
 pub struct Controller {
+    #[allow(dead_code)]
+    pub node_id: i32,
     pub state: ClusterState,
     pub log_path: PathBuf,
     pub last_heartbeat: HashMap<i32, Instant>,
@@ -129,9 +131,9 @@ pub struct Controller {
 }
 
 impl Controller {
-    pub fn spawn(log_path: PathBuf, heartbeat_timeout: Duration) -> mpsc::Sender<ControllerCmd> {
+    pub fn spawn(node_id: i32, log_path: PathBuf, heartbeat_timeout: Duration) -> mpsc::Sender<ControllerCmd> {
         let (tx, rx) = mpsc::channel(256);
-        let ctrl = Controller::open(log_path, heartbeat_timeout, rx);
+        let ctrl = Controller::open(node_id, log_path, heartbeat_timeout, rx);
         tokio::spawn(ctrl.run());
         tx
     }
@@ -153,15 +155,12 @@ impl Controller {
     fn handle(&mut self, cmd: ControllerCmd) {
         match cmd {
             ControllerCmd::Register { info, reply } => {
-                self.apply_and_persist(&ClusterRecord::RegisterBroker(info));
-                self.last_heartbeat.insert(
-                    self.state.brokers.keys().copied().max().unwrap_or(0),
-                    Instant::now(),
-                );
+                self.apply_and_persist(&ClusterRecord::RegisterBroker(info.clone()));
+                // 心跳键 = 本次注册的节点（而非"当前最大 id"——那会键错位）
+                self.last_heartbeat.insert(info.node_id, Instant::now());
                 let _ = reply.send(());
             }
             ControllerCmd::Heartbeat { node_id } => {
-                tracing::info!(node = node_id, "hb received");
                 self.last_heartbeat.insert(node_id, Instant::now());
             }
             ControllerCmd::Sync { version, reply } => {
@@ -241,7 +240,7 @@ impl Controller {
 }
 
 impl Controller {
-    pub fn open(log_path: PathBuf, heartbeat_timeout: Duration, rx: mpsc::Receiver<ControllerCmd>) -> Controller {
+    pub fn open(node_id: i32, log_path: PathBuf, heartbeat_timeout: Duration, rx: mpsc::Receiver<ControllerCmd>) -> Controller {
         // 恢复：重放 record 日志（自定义 record 编解码见 apply_and_persist）
         let mut state = ClusterState::default();
         if let Ok(data) = std::fs::read(&log_path) {
@@ -259,10 +258,14 @@ impl Controller {
             }
         }
         tracing::info!(version = state.version, brokers = state.brokers.len(), "controller recovered");
+        let mut last_heartbeat = HashMap::new();
+        // 控制器自身常驻存活（无独立心跳线程），failover 检查豁免自身
+        last_heartbeat.insert(node_id, Instant::now());
         Controller {
+            node_id,
             state,
             log_path,
-            last_heartbeat: HashMap::new(),
+            last_heartbeat,
             heartbeat_timeout,
             rx,
         }
@@ -396,7 +399,10 @@ async fn handle_internal_conn(
 
         let resp: Bytes = match msg_type {
             MSG_REGISTER => {
-                let (node_id, host, port) = parse_register(payload);
+                let Ok((node_id, host, port)) = parse_register(payload) else {
+                    sock.write_all(&short_frame()).await?;
+                    return Ok(());
+                };
                 if let Some(tx) = &ctx.controller_tx {
                     let (txr, rxr) = tokio::sync::oneshot::channel();
                     let _ = tx.send(ControllerCmd::Register {
@@ -408,6 +414,10 @@ async fn handle_internal_conn(
                 Bytes::new()
             }
             MSG_HEARTBEAT => {
+                if payload.len() < 4 {
+                    sock.write_all(&short_frame()).await?;
+                    return Ok(());
+                }
                 let node_id = i32::from_be_bytes(payload[0..4].try_into().unwrap());
                 if let Some(tx) = &ctx.controller_tx {
                     let _ = tx.send(ControllerCmd::Heartbeat { node_id }).await;
@@ -415,6 +425,10 @@ async fn handle_internal_conn(
                 Bytes::new()
             }
             MSG_META_SYNC => {
+                if payload.len() < 8 {
+                    sock.write_all(&short_frame()).await?;
+                    return Ok(());
+                }
                 let version = u64::from_be_bytes(payload[0..8].try_into().unwrap());
                 let mut out = Vec::new();
                 if let Some(tx) = &ctx.controller_tx {
@@ -430,7 +444,10 @@ async fn handle_internal_conn(
                 Bytes::from(out)
             }
             MSG_CREATE_TOPIC => {
-                let (name, partitions, rf) = parse_create(payload);
+                let Ok((name, partitions, rf)) = parse_create(payload) else {
+                    sock.write_all(&short_frame()).await?;
+                    return Ok(());
+                };
                 if let Some(tx) = &ctx.controller_tx {
                     let (txr, rxr) = tokio::sync::oneshot::channel();
                     let _ = tx.send(ControllerCmd::CreateTopic { name, partitions, rf, reply: txr }).await;
@@ -439,13 +456,17 @@ async fn handle_internal_conn(
                 Bytes::from(0i16.to_be_bytes().to_vec())
             }
             MSG_FETCH_SLICE => {
-                let (topic, partition, follower_id, from_offset, max_bytes) = parse_fetch_slice(payload);
+                let Ok((topic, partition, follower_id, from_offset, max_bytes)) = parse_fetch_slice(payload) else {
+                    sock.write_all(&short_frame()).await?;
+                    return Ok(());
+                };
                 let route = {
                     let routes = ctx.routes_rx.borrow();
                     routes.find(&topic, partition).cloned()
                 };
                 let resp = match route {
                     None => Bytes::from(error_slice(6)),
+                    Some(route) if route.leader != ctx.node_id => Bytes::from(error_slice(6)),
                     Some(route) => {
                 let (tx, rx) = tokio::sync::oneshot::channel();
                 if route
@@ -487,6 +508,22 @@ async fn handle_internal_conn(
     }
 }
 
+/// 短帧/坏帧的兜底应答（4B 长度 + 2B 错误码）。
+fn short_frame() -> Vec<u8> {
+    let body = 42i16.to_be_bytes();
+    let mut b = Vec::with_capacity(6);
+    b.extend_from_slice(&(body.len() as u32).to_be_bytes());
+    b.extend_from_slice(&body);
+    b
+}
+
+#[allow(dead_code)]
+fn short_payload() -> Vec<u8> {
+    let mut b = Vec::new();
+    b.extend_from_slice(&42i16.to_be_bytes()); // ILLEGAL_ARGUMENT 类
+    b
+}
+
 fn error_slice(code: i16) -> Vec<u8> {
     let mut b = Vec::new();
     b.extend_from_slice(&code.to_be_bytes());
@@ -496,24 +533,42 @@ fn error_slice(code: i16) -> Vec<u8> {
     b
 }
 
-fn parse_register(p: &[u8]) -> (i32, String, u16) {
+fn parse_register(p: &[u8]) -> std::io::Result<(i32, String, u16)> {
+    if p.len() < 8 {
+        return Err(std::io::Error::other("short register"));
+    }
     let node_id = i32::from_be_bytes(p[0..4].try_into().unwrap());
     let n = i16::from_be_bytes(p[4..6].try_into().unwrap()) as usize;
+    if p.len() < 6 + n + 4 {
+        return Err(std::io::Error::other("short register host"));
+    }
     let host = String::from_utf8_lossy(&p[6..6 + n]).into_owned();
     let port = i32::from_be_bytes(p[6 + n..10 + n].try_into().unwrap()) as u16;
-    (node_id, host, port)
+    Ok((node_id, host, port))
 }
 
-fn parse_create(p: &[u8]) -> (String, i32, i32) {
+fn parse_create(p: &[u8]) -> std::io::Result<(String, i32, i32)> {
+    if p.len() < 2 {
+        return Err(std::io::Error::other("short create"));
+    }
     let n = i16::from_be_bytes(p[0..2].try_into().unwrap()) as usize;
+    if p.len() < 2 + n + 8 {
+        return Err(std::io::Error::other("short create fields"));
+    }
     let name = String::from_utf8_lossy(&p[2..2 + n]).into_owned();
     let partitions = i32::from_be_bytes(p[2 + n..6 + n].try_into().unwrap());
     let rf = i32::from_be_bytes(p[6 + n..10 + n].try_into().unwrap());
-    (name, partitions, rf)
+    Ok((name, partitions, rf))
 }
 
-fn parse_fetch_slice(p: &[u8]) -> (String, i32, i32, i64, usize) {
+fn parse_fetch_slice(p: &[u8]) -> std::io::Result<(String, i32, i32, i64, usize)> {
+    if p.len() < 2 {
+        return Err(std::io::Error::other("short fetch slice"));
+    }
     let n = i16::from_be_bytes(p[0..2].try_into().unwrap()) as usize;
+    if p.len() < 2 + n + 20 {
+        return Err(std::io::Error::other("short fetch slice fields"));
+    }
     let topic = String::from_utf8_lossy(&p[2..2 + n]).into_owned();
     let mut o = 2 + n;
     let partition = i32::from_be_bytes(p[o..o + 4].try_into().unwrap());
@@ -523,7 +578,7 @@ fn parse_fetch_slice(p: &[u8]) -> (String, i32, i32, i64, usize) {
     let from = i64::from_be_bytes(p[o..o + 8].try_into().unwrap());
     o += 8;
     let max = u32::from_be_bytes(p[o..o + 4].try_into().unwrap()) as usize;
-    (topic, partition, follower, from, max)
+    Ok((topic, partition, follower, from, max))
 }
 
 #[cfg(test)]
@@ -537,7 +592,7 @@ mod failover_tests {
         let dir = std::env::temp_dir().join(format!("ctrl-test-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         let log = dir.join("ctrl.log");
-        let mut ctrl = Controller::open(log.clone(), Duration::from_millis(4000), rx);
+        let mut ctrl = Controller::open(0, log.clone(), Duration::from_millis(4000), rx);
         for i in 0..3 {
             ctrl.apply_and_persist(&ClusterRecord::RegisterBroker(BrokerInfo {
                 node_id: i, host: "h".into(), port: 9000 + i as u16,

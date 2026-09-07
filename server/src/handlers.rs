@@ -10,6 +10,7 @@ use basalt_protocol::registry::Registry;
 use basalt_protocol::value::{s, Value};
 use bytes::Bytes;
 use basalt_coordinator::GroupCmd;
+use basalt_storage::error::StorageError;
 use tokio::sync::{mpsc, oneshot};
 
 use crate::meta::MetaCmd;
@@ -257,6 +258,9 @@ pub async fn produce(version: i16, acks: i16, targets: Vec<ProduceTarget>, ctx: 
             };
             let err = match &out.error {
                 Some(basalt_storage::StorageError::CorruptBatch { .. }) => ErrorCode::CorruptMessage,
+                Some(StorageError::NotEnoughReplicas) => ErrorCode::NotEnoughReplicas,
+                Some(StorageError::NotLeader) => ErrorCode::NotLeaderOrFollower,
+                Some(StorageError::OffsetOutOfRange(_)) => ErrorCode::OffsetOutOfRange,
                 Some(_) => ErrorCode::UnknownServer,
                 None => ErrorCode::None,
             };
@@ -373,10 +377,21 @@ pub async fn fetch(targets: Vec<FetchTarget>, ctx: &Ctx) -> Value {
         let (err, data, hw, log_start) = match f.rx {
             None => (f.err, Bytes::new(), -1, -1),
             Some(rx) => match rx.await {
-                Ok(out) => match out.result {
-                    Some(r) => (ErrorCode::None, r.data, r.high_watermark, r.log_start_offset),
-                    None => (ErrorCode::OffsetOutOfRange, Bytes::new(), -1, -1),
-                },
+                Ok(out) => {
+                    if let Some(e) = &out.error {
+                        let code = match e {
+                            StorageError::NotLeader => ErrorCode::NotLeaderOrFollower,
+                            StorageError::OffsetOutOfRange(_) => ErrorCode::OffsetOutOfRange,
+                            _ => ErrorCode::UnknownServer,
+                        };
+                        (code, Bytes::new(), -1, -1)
+                    } else {
+                        match out.result {
+                            Some(r) => (ErrorCode::None, r.data, r.high_watermark, r.log_start_offset),
+                            None => (ErrorCode::OffsetOutOfRange, Bytes::new(), -1, -1),
+                        }
+                    }
+                }
                 Err(_) => (ErrorCode::BrokerNotAvailable, Bytes::new(), -1, -1),
             },
         };

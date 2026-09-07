@@ -74,11 +74,14 @@ pub struct MetaService {
     /// 已停掉拉取任务的分区（failover 成为 leader 后）
     #[allow(dead_code)]
     stop_pulls: HashSet<(String, i32)>,
+    /// 每分区当前拉取目标地址（leader 变更检测）
+    pull_addrs: HashMap<(String, i32), String>,
     /// topic name -> (topic_id, 本地已 spawn 的分区集合)
     local: HashMap<String, (u128, std::collections::HashSet<i32>)>,
     routes: RoutingTable,
     tx_watch: watch::Sender<RoutingTable>,
     rx: mpsc::Receiver<MetaCmd>,
+    #[allow(dead_code)]
     controller_tx: Option<mpsc::Sender<crate::internal::ControllerCmd>>,
 }
 
@@ -121,7 +124,8 @@ impl MetaService {
     pub fn spawn(
         cfg: Config,
         controller_addr: Option<String>,
-        controller_tx: Option<mpsc::Sender<crate::internal::ControllerCmd>>,
+        #[allow(dead_code)]
+    controller_tx: Option<mpsc::Sender<crate::internal::ControllerCmd>>,
     ) -> (mpsc::Sender<MetaCmd>, watch::Receiver<RoutingTable>) {
         let (tx, rx) = mpsc::channel(256);
         let (tw, tr) = watch::channel(RoutingTable::default());
@@ -130,6 +134,7 @@ impl MetaService {
             controller_addr,
             cluster: ClusterState::default(),
             stop_pulls: std::collections::HashSet::new(),
+            pull_addrs: HashMap::new(),
             local: HashMap::new(),
             routes: RoutingTable::default(),
             tx_watch: tw,
@@ -221,7 +226,7 @@ impl MetaService {
                     segment_max_bytes: self.cfg.segment_max_bytes,
                     fsync: FsyncSchedule::Os,
                 };
-                match PartitionActor::spawn(a.topic.clone(), a.partition, self.cfg.node_id, dir, opts) {
+                match PartitionActor::spawn(a.topic.clone(), a.partition, self.cfg.node_id, dir, opts, self.cfg.replica_config()) {
                     Ok(tx) => {
                         entry.1.insert(a.partition);
                         let route = Route { tx: tx.clone(), leader: a.leader, epoch: a.epoch };
@@ -234,10 +239,11 @@ impl MetaService {
                                 replicas: a.replicas.clone(),
                             })
                             .await;
-                        // follower：启动拉取任务（leader 变更时由 ApplyCluster 的 stop_pulls 停）
+                        // follower：启动拉取任务（leader 变更时由 ApplyCluster 停旧起新）
                         if a.leader != self.cfg.node_id {
                             if let Some(leader_info) = self.cluster.brokers.get(&a.leader) {
                                 let leader_addr = format!("{}:{}", leader_info.host, leader_info.port + 1);
+                                clear_pull_stop(&a.topic, a.partition);
                                 let pull = FollowerPull {
                                     topic: a.topic.clone(),
                                     partition: a.partition,
@@ -255,29 +261,62 @@ impl MetaService {
             } else if let Some(route) = self.routes.by_name.get_mut(&(a.topic.clone(), a.partition)) {
                 // 已有 actor：仅更新角色/路由
                 let was_leader = route.leader == self.cfg.node_id;
+                let is_leader = a.leader == self.cfg.node_id;
                 route.leader = a.leader;
                 route.epoch = a.epoch;
                 let _ = route
                     .tx
                     .send(PartitionCmd::SetRole {
-                        leader: a.leader == self.cfg.node_id,
+                        leader: is_leader,
                         epoch: a.epoch,
                         replicas: a.replicas.clone(),
                     })
                     .await;
-                // failover：本副本从 follower 变为 leader → 停掉拉取任务
-                if a.leader == self.cfg.node_id && !was_leader {
+                if is_leader && !was_leader {
+                    // failover：本副本从 follower 变为 leader → 停掉拉取任务
                     set_pull_stop(&a.topic, a.partition);
+                } else if !is_leader && was_leader {
+                    // 原 leader 失去 leadership → 必须起新拉取任务（指向新 leader）
+                    if let Some(leader_info) = self.cluster.brokers.get(&a.leader) {
+                        let leader_addr = format!("{}:{}", leader_info.host, leader_info.port + 1);
+                        clear_pull_stop(&a.topic, a.partition);
+                        let pull = FollowerPull {
+                            topic: a.topic.clone(),
+                            partition: a.partition,
+                            node_id: self.cfg.node_id,
+                            leader: a.leader,
+                            leader_addr,
+                            local_tx: route.tx.clone(),
+                        };
+                        tokio::spawn(pull.run());
+                    }
+                } else if !is_leader {
+                    // follower 不变但 leader 换了人 → 停旧起新（指向新 leader 地址）
+                    if let Some(leader_info) = self.cluster.brokers.get(&a.leader) {
+                        let new_addr = format!("{}:{}", leader_info.host, leader_info.port + 1);
+                        if self.pull_addrs.get(&(a.topic.clone(), a.partition)).map(|old| old != &new_addr).unwrap_or(true) {
+                            set_pull_stop(&a.topic, a.partition);
+                            clear_pull_stop(&a.topic, a.partition);
+                            let pull = FollowerPull {
+                                topic: a.topic.clone(),
+                                partition: a.partition,
+                                node_id: self.cfg.node_id,
+                                leader: a.leader,
+                                leader_addr: new_addr.clone(),
+                                local_tx: route.tx.clone(),
+                            };
+                            tokio::spawn(pull.run());
+                        }
+                    }
                 }
+                self.pull_addrs.insert((a.topic.clone(), a.partition), format!("{}:{}", {
+                    let info = self.cluster.brokers.get(&a.leader);
+                    match info { Some(b) => format!("{}:{}", b.host, b.port), None => String::new() }
+                }, a.leader));
             }
         }
         let _ = self.tx_watch.send(self.routes.clone());
     }
-}
-
-#[allow(non_snake_case)]
-fn Duration_secs(s: u64) -> std::time::Duration {
-    std::time::Duration::from_secs(s)
 }
 
 // follower 拉取任务的停止标志（failover 时由 MetaService 置位）
@@ -288,6 +327,10 @@ fn pull_stops() -> &'static Mutex<HashSet<(String, i32)>> {
 
 pub fn set_pull_stop(topic: &str, partition: i32) {
     pull_stops().lock().unwrap().insert((topic.to_string(), partition));
+}
+
+pub fn clear_pull_stop(topic: &str, partition: i32) {
+    pull_stops().lock().unwrap().remove(&(topic.to_string(), partition));
 }
 
 pub fn pull_stop_requested(topic: &str, partition: i32) -> bool {
@@ -326,11 +369,14 @@ struct FollowerPull {
 impl FollowerPull {
     async fn run(self) {
         let client = crate::internal::InternalClient::new(self.leader_addr.clone());
-        let mut next_offset = 0i64;
-        tracing::info!(topic=%self.topic, partition=self.partition, leader=self.leader, "follower pull started");
+        // 启动 LEO：从本地 actor 查询真实日志末尾（重启/带数据重启场景不能从 0 开始）
+        let Some(mut next_offset) = self.local_leo().await else {
+            return;
+        };
+        tracing::info!(topic=%self.topic, partition=self.partition, leader=self.leader, start=next_offset, "follower pull started");
         loop {
             if self.stop_requested() {
-                tracing::info!(topic=%self.topic, partition=self.partition, "follower pull stopped (became leader)");
+                tracing::info!(topic=%self.topic, partition=self.partition, "follower pull stopped");
                 return;
             }
             match client
@@ -340,6 +386,19 @@ impl FollowerPull {
                 Ok(res) => {
                     if res.error != 0 {
                         tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+                        continue;
+                    }
+                    if res.leader_next_offset < next_offset {
+                        // leader 数据短于本地：分叉尾巴 → 截断到 leader 末尾后重拉
+                        tracing::warn!(
+                            topic=%self.topic, partition=self.partition,
+                            leader_next=res.leader_next_offset, local=next_offset,
+                            "divergent tail: truncating to leader"
+                        );
+                        if self.truncate_to(res.leader_next_offset).await.is_none() {
+                            return;
+                        }
+                        next_offset = res.leader_next_offset;
                         continue;
                     }
                     if !res.data.is_empty() {
@@ -361,6 +420,11 @@ impl FollowerPull {
                             Ok(out) => {
                                 if out.error.is_none() {
                                     next_offset = out.last_offset + 1;
+                                } else if let Some(basalt_storage::error::StorageError::Other(m)) = &out.error {
+                                    if m.contains("replica gap") {
+                                        // gap：本地 LEO 与 leader 错位——以本地真实 LEO 重试
+                                        next_offset = self.local_leo().await.unwrap_or(next_offset);
+                                    }
                                 }
                             }
                             Err(_) => {}
@@ -376,6 +440,18 @@ impl FollowerPull {
                 }
             }
         }
+    }
+
+    async fn local_leo(&self) -> Option<i64> {
+        let (tx, rx) = oneshot::channel();
+        self.local_tx.send(PartitionCmd::LocalLeo { reply: tx }).await.ok()?;
+        rx.await.ok()
+    }
+
+    async fn truncate_to(&self, offset: i64) -> Option<()> {
+        let (tx, rx) = oneshot::channel();
+        self.local_tx.send(PartitionCmd::TruncateTo { offset, reply: tx }).await.ok()?;
+        rx.await.ok().map(|_| ())
     }
 
     fn stop_requested(&self) -> bool {

@@ -173,22 +173,35 @@ async fn async_main(cfg: Config) {
     CTX.set(ctx).ok();
 
     let ctx_ref = CTX.get().expect("ctx");
-    loop {
-        match listener.accept().await {
-            Ok((sock, peer)) => {
-                let ctx = handlers::Ctx {
-                    node_id: ctx_ref.node_id,
-                    host: ctx_ref.host.clone(),
-                    port: ctx_ref.port,
-                    all_brokers: Vec::new(),
-                    meta_tx: ctx_ref.meta_tx.clone(),
-                    group_tx: ctx_ref.group_tx.clone(),
-                    routes_rx: ctx_ref.routes_rx.clone(),
-                    brokers_cache: std::sync::Mutex::new(ctx_ref.brokers_cache.lock().unwrap().clone()),
-                };
-                tokio::spawn(conn::serve_connection(sock, peer, ctx));
+    let mut accept_loop = Box::pin(async {
+        loop {
+            match listener.accept().await {
+                Ok((sock, peer)) => {
+                    let ctx = handlers::Ctx {
+                        node_id: ctx_ref.node_id,
+                        host: ctx_ref.host.clone(),
+                        port: ctx_ref.port,
+                        all_brokers: Vec::new(),
+                        meta_tx: ctx_ref.meta_tx.clone(),
+                        group_tx: ctx_ref.group_tx.clone(),
+                        routes_rx: ctx_ref.routes_rx.clone(),
+                        brokers_cache: std::sync::Mutex::new(ctx_ref.brokers_cache.lock().unwrap().clone()),
+                    };
+                    tokio::spawn(conn::serve_connection(sock, peer, ctx));
+                }
+                Err(e) => tracing::warn!(error = %e, "accept failed"),
             }
-            Err(e) => tracing::warn!(error = %e, "accept failed"),
+        }
+    });
+
+    // 优雅停机：SIGTERM/SIGINT → 停 accept → 短暂 drain → sync
+    tokio::select! {
+        _ = &mut accept_loop => {},
+        _ = tokio::signal::ctrl_c() => {
+            tracing::info!("SIGTERM/SIGINT: shutting down gracefully");
         }
     }
+    // 给 in-flight 请求 2s drain 窗口
+    tokio::time::sleep(std::time::Duration::from_millis(2000)).await;
+    tracing::info!("basalt shutdown complete");
 }

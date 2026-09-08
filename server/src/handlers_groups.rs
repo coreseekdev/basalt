@@ -369,3 +369,9 @@ pub async fn init_producer_id(_req: &basalt_protocol::value::Struct, _ctx: &Ctx)
         ("ProducerEpoch", Value::I16(0)),
     ])
 }
+
+
+/// DeleteRecords (key 21) handler（委托到 handlers.rs）。
+pub async fn delete_records_handler(req: &basalt_protocol::value::Struct, ctx: &Ctx) -> Value {
+    crate::handlers::delete_records(req, ctx).await
+}

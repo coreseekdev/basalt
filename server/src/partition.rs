@@ -89,6 +89,11 @@ pub enum PartitionCmd {
     Retention {
         reply: oneshot::Sender<usize>,
     },
+    /// DeleteRecords：设置 log_start_offset，删除之前的段。
+    DeleteRecords {
+        offset: i64,
+        reply: oneshot::Sender<Result<i64, StorageError>>,
+    },
 }
 
 struct PendingFetch {
@@ -395,6 +400,9 @@ impl PartitionActor {
                 }
                 PartitionCmd::TruncateTo { offset, reply } => {
                     let _ = reply.send(self.log.truncate_to(offset));
+                }
+                PartitionCmd::DeleteRecords { offset, reply } => {
+                    let _ = reply.send(self.log.delete_records(offset));
                 }
                 PartitionCmd::EndOffsetForEpoch { epoch, reply } => {
                     let _ = reply.send(self.log.end_offset_for_epoch(epoch));

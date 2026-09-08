@@ -203,6 +203,7 @@ async fn dispatch(frame_bytes: Bytes, ctx: &Ctx) -> Result<Option<Vec<u8>>, Disp
         key::OFFSET_FETCH => (handlers_groups::offset_fetch(&req, ctx).await, false),
         key::CREATE_TOPICS => (handlers_groups::create_topics(&req, ctx).await, false),
         key::DELETE_TOPICS => (handlers_groups::delete_topics(&req, ctx).await, false),
+        key::DELETE_RECORDS => (handlers_groups::delete_records_handler(&req, ctx).await, false),
         key::INIT_PRODUCER_ID => (handlers_groups::init_producer_id(&req, ctx).await, false),
         key::OFFSET_FOR_LEADER_EPOCH => (handlers::offset_for_leader_epoch(&req, ctx).await, false),
         key::DESCRIBE_GROUPS => (handlers_groups::describe_groups(&req, ctx).await, false),

@@ -486,6 +486,79 @@ impl<D: DiskIo> Log<D> {
         self.sealed.len() + 1
     }
 
+    /// DeleteRecords：设置新的 log_start_offset，删除之前的段。
+    pub fn delete_records(&mut self, offset: i64) -> Result<i64> {
+        if offset <= self.log_start_offset {
+            return Ok(self.log_start_offset);
+        }
+        if offset > self.high_watermark {
+            return Err(StorageError::OffsetOutOfRange(offset));
+        }
+        self.truncate_to_front(offset)?;
+        Ok(self.log_start_offset)
+    }
+
+    /// 截断 front：删除 < offset 的段，保留 >= offset 的数据。
+    fn truncate_to_front(&mut self, offset: i64) -> Result<()> {
+        let mut removed = 0usize;
+        while let Some(seg) = self.sealed.first() {
+            if seg.base_offset + seg.next_rel <= offset {
+                let seg = self.sealed.remove(0);
+                let _ = self.disk.remove(&seg.path);
+                let _ = self.disk.remove(&seg.index_path);
+                let _ = self.disk.remove(&seg.time_path);
+                removed += 1;
+            } else {
+                break;
+            }
+        }
+        if let Some(seg) = self.sealed.first_mut() {
+            if seg.base_offset < offset && seg.base_offset + seg.next_rel > offset {
+                let rel = (offset - seg.base_offset) as i64;
+                let data = self.disk.read_all(&seg.path)?;
+                let mut p = 0usize;
+                let mut rel_cur: i64 = 0;
+                while p + RECORD_BATCH_HEADER_LEN <= data.len() {
+                    if let Some(h) = BatchHeader::parse(&data[p..]) {
+                        let total = h.total_len();
+                        if total == 0 || p + total > data.len() { break; }
+                        if rel_cur >= rel { break; }
+                        rel_cur += h.record_count.max(0) as i64;
+                        p += total;
+                    } else { break; }
+                }
+                if p > 0 {
+                    self.disk.truncate(&seg.path, p as u64)?;
+                    seg.bytes = p as u64;
+                }
+            }
+        }
+        if offset > self.active.base_offset {
+            let rel = (offset - self.active.base_offset) as i64;
+            if rel > 0 && self.active.bytes > 0 {
+                let data = self.disk.read_all(&self.active.path)?;
+                let mut p = 0usize;
+                let mut rel_cur: i64 = 0;
+                while p + RECORD_BATCH_HEADER_LEN <= data.len() {
+                    if let Some(h) = BatchHeader::parse(&data[p..]) {
+                        let total = h.total_len();
+                        if total == 0 || p + total > data.len() { break; }
+                        if rel_cur >= rel { break; }
+                        rel_cur += h.record_count.max(0) as i64;
+                        p += total;
+                    } else { break; }
+                }
+                if p > 0 {
+                    self.disk.truncate(&self.active.path, p as u64)?;
+                    self.active.bytes = p as u64;
+                }
+            }
+        }
+        self.log_start_offset = offset;
+        tracing::info!(offset, removed_segments = removed, "delete_records");
+        Ok(())
+    }
+
     /// 记录 epoch 变更（leader 变更时由 actor 调用）。
     pub fn record_epoch(&mut self, epoch: i32) {
         let last = self.epoch_history.last().map(|&(e, _)| e);

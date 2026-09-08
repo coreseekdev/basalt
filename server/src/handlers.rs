@@ -516,6 +516,7 @@ pub async fn list_offsets(req: &basalt_protocol::value::Struct, ctx: &Ctx) -> Va
 pub async fn offset_for_leader_epoch(req: &basalt_protocol::value::Struct, ctx: &Ctx) -> Value {
     // 阶段 1：快照路由（borrow 不跨 await）
     #[allow(dead_code)]
+    #[allow(dead_code)]
     struct Pending {
         index: i32,
         rx: Option<oneshot::Receiver<(i32, i64)>>,
@@ -584,6 +585,71 @@ pub async fn offset_for_leader_epoch(req: &basalt_protocol::value::Struct, ctx: 
                 ("PartitionIndex", Value::I32(p.index)),
                 ("LeaderEpoch", Value::I32(leader_epoch)),
                 ("EndOffset", Value::I64(end)),
+            ]));
+        }
+        responses.push(s([("Name", Value::str(name)), ("Partitions", Value::Array(pvals))]));
+    }
+    s([("ThrottleTimeMs", Value::I32(0)), ("Topics", Value::Array(responses))])
+}
+
+
+/// DeleteRecords (key 21)：设置 log_start_offset，删除之前的段。
+pub async fn delete_records(req: &basalt_protocol::value::Struct, ctx: &Ctx) -> Value {
+    struct Pending {
+        name: String,
+        index: i32,
+        offset: i64,
+        rx: Option<oneshot::Receiver<Result<i64, StorageError>>>,
+    }
+    let mut resolved: Vec<(String, Vec<ResolvedDR>)> = Vec::new();
+    struct ResolvedDR {
+        index: i32,
+        offset: i64,
+        tx: Option<mpsc::Sender<PartitionCmd>>,
+    }
+    {
+        let routes = ctx.routes();
+        if let Some(Value::Array(topics)) = req.get("Topics") {
+            for t in topics {
+                let Value::Struct(ts) = t else { continue };
+                let name = ts.get("Name").map(|x| x.as_str().to_string()).unwrap_or_default();
+                let mut parts = Vec::new();
+                if let Some(Value::Array(parr)) = ts.get("Partitions") {
+                    for pd in parr {
+                        let Value::Struct(ps) = pd else { continue };
+                        let index = ps.get("PartitionIndex").map(|v| v.as_i32()).unwrap_or(0);
+                        let offset = ps.get("Offset").map(|v| v.as_i64()).unwrap_or(-1);
+                        let tx = routes.find(&name, index).map(|r| r.tx.clone());
+                        parts.push(ResolvedDR { index, offset, tx });
+                    }
+                }
+                resolved.push((name, parts));
+            }
+        }
+    }
+    let mut responses = Vec::new();
+    for (name, parts) in resolved {
+        let mut pvals = Vec::new();
+        for r in parts {
+            let (err, low_watermark) = match &r.tx {
+                Some(actor_tx) => {
+                    let (tx, rx) = oneshot::channel();
+                    match actor_tx.send(PartitionCmd::DeleteRecords { offset: r.offset, reply: tx }).await {
+                        Ok(()) => match rx.await {
+                            Ok(Ok(lw)) => (0i16, lw),
+                            Ok(Err(StorageError::OffsetOutOfRange(_))) => (1i16, -1),
+                            Ok(Err(_)) => (2i16, -1),
+                            Err(_) => (8i16, -1),
+                        },
+                        Err(_) => (8i16, -1),
+                    }
+                }
+                None => (3i16, -1),
+            };
+            pvals.push(s([
+                ("PartitionIndex", Value::I32(r.index)),
+                ("LowWatermark", Value::I64(low_watermark)),
+                ("ErrorCode", Value::I16(err)),
             ]));
         }
         responses.push(s([("Name", Value::str(name)), ("Partitions", Value::Array(pvals))]));

@@ -515,6 +515,7 @@ pub async fn list_offsets(req: &basalt_protocol::value::Struct, ctx: &Ctx) -> Va
 /// OffsetForLeaderEpoch（key 23）：返回指定 epoch 的 end offset。
 pub async fn offset_for_leader_epoch(req: &basalt_protocol::value::Struct, ctx: &Ctx) -> Value {
     // 阶段 1：快照路由（borrow 不跨 await）
+    #[allow(dead_code)]
     struct Pending {
         index: i32,
         rx: Option<oneshot::Receiver<(i32, i64)>>,

@@ -15,6 +15,7 @@ pub mod index;
 pub mod log;
 pub mod pool;
 pub mod segment;
+pub mod sim_disk;
 
 pub use error::{StorageError, Result};
 pub use log::{Log, LogOptions, AppendResult, ReadResult, FsyncSchedule};

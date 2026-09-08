@@ -12,11 +12,11 @@
 ### 吞吐（kafka-python 流水线模式）
 | 指标 | 值 |
 |---|---|
-| Produce 吞吐 | 111,568 msg/s (109.0 MB/s) |
-| Consume 吞吐 | 160,018 msg/s (156.3 MB/s) |
+| Produce 吞吐 | 120-145K msg/s (116-142 MB/s) |
+| Consume 吞吐 | 152-160K msg/s (148-156 MB/s) |
 | Produce 延迟 p50 | 0.1ms |
 | Produce 延迟 p90 | 0.2ms |
-| Produce 延迟 p99 | 0.4ms |
+| Produce 延迟 p99 | 0.3-0.4ms |
 
 ### 逐条 RTT 延迟（acks=all）
 | 百分位 | 延迟 |
@@ -45,7 +45,7 @@
 |---|---|---|---|
 | Produce (acks=all, 1KB) | 100K-200K msg/s | 300K-600K msg/s | 111K msg/s |
 | Consume | 200K-400K msg/s | 500K-800K msg/s | 160K msg/s |
-| 延迟 p99 (acks=all) | 5-15ms | 1-5ms | **0.4ms** |
+| 延迟 p99 (acks=all) | 5-15ms | 1-5ms | **0.3-0.4ms** |
 | End-to-end 压缩 | ✅ 4 codec | ✅ 4 codec | ✅ 4 codec |
 
 ### 差距分析
@@ -60,7 +60,7 @@
 | 协议编解码 | 预编译 Java 类 | Value 树逐字段名查找 | 位置索引可优化 |
 
 ### Basalt 的性能优势
-- **延迟**：p99=0.4ms 优于 Kafka (5-15ms)——受益于 Rust 无 GC 和 actor 无锁模型
+- **延迟**：p99=0.3-0.4ms 优于 Kafka (5-15ms)——受益于 Rust 无 GC 和 actor 无锁模型
 - **代码量**：8K 行 Rust vs Kafka ~500K 行 Java——维护成本数量级降低
 - **压缩透传**：broker 零 CPU 开销（Kafka Java 需要 ~10% CPU 解压再压缩）
 

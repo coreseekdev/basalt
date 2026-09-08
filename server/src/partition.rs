@@ -180,7 +180,7 @@ impl PartitionActor {
             // IO 批量合并：同轮 drain 的多个 produce 累积到 batch_staging，一次 write
             self.log.batch_io = true;
             self.process(group);
-            self.log.flush_batch();
+            let _ = self.log.flush_batch();
             self.log.batch_io = false;
             self.on_deadline();
             self.serve_pending();
@@ -202,7 +202,7 @@ impl PartitionActor {
                             }
                             self.log.batch_io = true;
                             self.process(group);
-                            self.log.flush_batch();
+                            let _ = self.log.flush_batch();
                             self.log.batch_io = false;
                             self.on_deadline();
                             self.serve_pending();

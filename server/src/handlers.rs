@@ -251,13 +251,21 @@ pub async fn produce(version: i16, acks: i16, targets: Vec<ProduceTarget>, ctx: 
             replies.push((t, Value::I16(ErrorCode::InvalidRequiredAcks as i16), -1, -1, 0, 0));
         }
     } else {
+        // Phase 1: 并行 send 到不同分区 actor + 收集 receiver（不 await 每个）
+        struct InFlight<'a> {
+            target: &'a ProduceTarget,
+            rx: Option<oneshot::Receiver<ProduceOutcome>>,
+            pre_err: Option<Value>,
+            leader: i32,
+        }
+        let mut in_flight: Vec<InFlight> = Vec::new();
         for (t, r) in targets.iter().zip(&resolved) {
             if let Some(err) = r.err {
-                replies.push((t, Value::I16(err as i16), -1, -1, -1, r.leader));
+                in_flight.push(InFlight { target: t, rx: None, pre_err: Some(Value::I16(err as i16)), leader: r.leader });
                 continue;
             }
             let Some(tx) = &r.tx else {
-                replies.push((t, Value::I16(ErrorCode::UnknownTopicOrPartition as i16), -1, -1, -1, -1));
+                in_flight.push(InFlight { target: t, rx: None, pre_err: Some(Value::I16(ErrorCode::UnknownTopicOrPartition as i16)), leader: -1 });
                 continue;
             };
             let (txr, rx) = oneshot::channel();
@@ -271,22 +279,33 @@ pub async fn produce(version: i16, acks: i16, targets: Vec<ProduceTarget>, ctx: 
                 .await
                 .is_err()
             {
-                replies.push((t, Value::I16(ErrorCode::BrokerNotAvailable as i16), -1, -1, -1, -1));
+                in_flight.push(InFlight { target: t, rx: None, pre_err: Some(Value::I16(ErrorCode::BrokerNotAvailable as i16)), leader: -1 });
                 continue;
             }
-            let out = match rx.await {
-                Ok(o) => o,
-                Err(_) => ProduceOutcome { base_offset: -1, last_offset: -1, log_append_time: now_ms(), error: None },
+            in_flight.push(InFlight { target: t, rx: Some(rx), pre_err: None, leader: -1 });
+        }
+
+        // Phase 2: 统一 await（不同分区 actor 已并行处理）
+        for f in in_flight {
+            let (err, base, last, lat) = match f.rx {
+                None => (f.pre_err.unwrap_or(Value::I16(0)), -1i64, -1i64, -1i64),
+                Some(rx) => {
+                    let out = match rx.await {
+                        Ok(o) => o,
+                        Err(_) => ProduceOutcome { base_offset: -1, last_offset: -1, log_append_time: now_ms(), error: None },
+                    };
+                    let err = match &out.error {
+                        Some(basalt_storage::StorageError::CorruptBatch { .. }) => ErrorCode::CorruptMessage,
+                        Some(StorageError::NotEnoughReplicas) => ErrorCode::NotEnoughReplicas,
+                        Some(StorageError::NotLeader) => ErrorCode::NotLeaderOrFollower,
+                        Some(StorageError::OffsetOutOfRange(_)) => ErrorCode::OffsetOutOfRange,
+                        Some(_) => ErrorCode::UnknownServer,
+                        None => ErrorCode::None,
+                    };
+                    (Value::I16(err as i16), out.base_offset, out.last_offset, out.log_append_time)
+                }
             };
-            let err = match &out.error {
-                Some(basalt_storage::StorageError::CorruptBatch { .. }) => ErrorCode::CorruptMessage,
-                Some(StorageError::NotEnoughReplicas) => ErrorCode::NotEnoughReplicas,
-                Some(StorageError::NotLeader) => ErrorCode::NotLeaderOrFollower,
-                Some(StorageError::OffsetOutOfRange(_)) => ErrorCode::OffsetOutOfRange,
-                Some(_) => ErrorCode::UnknownServer,
-                None => ErrorCode::None,
-            };
-            replies.push((t, Value::I16(err as i16), out.base_offset, out.last_offset, out.log_append_time, -1));
+            replies.push((f.target, err, base, last, lat, f.leader));
         }
     }
 
@@ -517,6 +536,7 @@ pub async fn offset_for_leader_epoch(req: &basalt_protocol::value::Struct, ctx: 
     // 阶段 1：快照路由（borrow 不跨 await）
     #[allow(dead_code)]
     #[allow(dead_code)]
+    #[allow(dead_code)]
     struct Pending {
         index: i32,
         rx: Option<oneshot::Receiver<(i32, i64)>>,
@@ -595,6 +615,7 @@ pub async fn offset_for_leader_epoch(req: &basalt_protocol::value::Struct, ctx: 
 
 /// DeleteRecords (key 21)：设置 log_start_offset，删除之前的段。
 pub async fn delete_records(req: &basalt_protocol::value::Struct, ctx: &Ctx) -> Value {
+    #[allow(dead_code)]
     struct Pending {
         name: String,
         index: i32,

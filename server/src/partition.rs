@@ -359,6 +359,7 @@ impl PartitionActor {
                     }
                 }
                 PartitionCmd::FetchSlice { follower, offset, max_bytes, reply } => {
+                    crate::partition::metrics().fetch_requests.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                     // fencing：仅 leader 服务复制拉取
                     if self.role != Role::Leader {
                         let _ = reply.send(SliceOutcome {
@@ -483,6 +484,8 @@ pub struct Metrics {
     pub produce_errors: AtomicU64,
     pub fetch_requests: AtomicU64,
     pub produce_requests: AtomicU64,
+    #[allow(dead_code)]
+    pub compressed_batches: AtomicU64,
 }
 
 static METRICS: std::sync::OnceLock<Metrics> = std::sync::OnceLock::new();

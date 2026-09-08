@@ -118,8 +118,9 @@ async fn async_main(cfg: Config) {
                 let errors = m.produce_errors.load(std::sync::atomic::Ordering::Relaxed);
                 let fetches = m.fetch_requests.load(std::sync::atomic::Ordering::Relaxed);
                 let produces = m.produce_requests.load(std::sync::atomic::Ordering::Relaxed);
+                let compressed = m.compressed_batches.load(std::sync::atomic::Ordering::Relaxed);
                 let body = format!(
-                    "# TYPE basalt_messages_produced_total counter\nbasalt_messages_produced_total {produced}\n# TYPE basalt_bytes_produced_total counter\nbasalt_bytes_produced_total {bytes_p}\n# TYPE basalt_messages_consumed_total counter\nbasalt_messages_consumed_total {consumed}\n# TYPE basalt_produce_errors_total counter\nbasalt_produce_errors_total {errors}\n# TYPE basalt_fetch_requests_total counter\nbasalt_fetch_requests_total {fetches}\n# TYPE basalt_produce_requests_total counter\nbasalt_produce_requests_total {produces}\n"
+                    "# TYPE basalt_messages_produced_total counter\nbasalt_messages_produced_total {produced}\n# TYPE basalt_bytes_produced_total counter\nbasalt_bytes_produced_total {bytes_p}\n# TYPE basalt_messages_consumed_total counter\nbasalt_messages_consumed_total {consumed}\n# TYPE basalt_produce_errors_total counter\nbasalt_produce_errors_total {errors}\n# TYPE basalt_fetch_requests_total counter\nbasalt_fetch_requests_total {fetches}\n# TYPE basalt_produce_requests_total counter\nbasalt_produce_requests_total {produces}\n# TYPE basalt_compressed_batches_total counter\nbasalt_compressed_batches_total {compressed}\n"
                 );
                 let resp = format!(
                     "HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",

@@ -39,7 +39,7 @@ fn decode_struct_fields(
     }
     if flexible {
         // tag section：u8 数量，每项 uvarint tag + uvarint size + 数据
-        let count = r.u8()? as usize;
+        let count = r.uvarint()? as usize;
         for _ in 0..count {
             let tag = r.uvarint()? as i32;
             let size = r.uvarint()? as usize;
@@ -101,20 +101,14 @@ fn decode_value(
             let b = take_len_bytes(r, flexible)?;
             match b {
                 None => Value::Null,
-                Some(slice) => {
-                    let start = slice.as_ptr() as usize - src.as_ptr() as usize;
-                    Value::Bytes(src.slice(start..start + slice.len()))
-                }
+                Some(slice) => Value::Bytes(src.slice_ref(slice))
             }
         }
         Ty::Records => {
             let b = take_len_bytes(r, flexible)?;
             match b {
                 None => Value::Null,
-                Some(slice) => {
-                    let start = slice.as_ptr() as usize - src.as_ptr() as usize;
-                    Value::Bytes(src.slice(start..start + slice.len()))
-                }
+                Some(slice) => Value::Bytes(src.slice_ref(slice))
             }
         }
         Ty::Uuid => {
@@ -223,7 +217,7 @@ pub fn encode_struct_fields(
     if flexible {
         // tag section：u8 数量，每项 uvarint tag + uvarint size + 数据。
         // 只编解码 handler 显式给出的 tags；未知 tag 解码端跳过（前向兼容）。
-        out.put_u8(st.tags.len() as u8);
+        put_uvarint(out, st.tags.len() as u32);
         for (tag, v) in &st.tags {
             let node = fields
                 .iter()
@@ -258,7 +252,7 @@ fn encode_value(node: &Node, version: i16, flexible: bool, v: &Value, out: &mut 
                 }
             }
             Value::Str(s) => {
-                put_str_len(out, s.len(), flexible);
+                put_str_len(out, s.len(), flexible)?;
                 out.extend_from_slice(s.as_bytes());
             }
             _ => return Err(bad_val(node, v)),
@@ -272,7 +266,11 @@ fn encode_value(node: &Node, version: i16, flexible: bool, v: &Value, out: &mut 
                 }
             }
             Value::Bytes(b) => {
-                // bytes/records：legacy 用 int32 长度（string 才是 int16）
+                if b.len() > i32::MAX as usize {
+                    return Err(ProtocolError::BadData(format!(
+                        "bytes length {} exceeds i32::MAX", b.len()
+                    )));
+                }
                 if flexible {
                     put_compact_len(out, Some(b.len()));
                 } else {
@@ -335,12 +333,18 @@ fn as_f64(v: &Value) -> f64 {
     }
 }
 
-fn put_str_len(out: &mut BytesMut, len: usize, flexible: bool) {
+fn put_str_len(out: &mut BytesMut, len: usize, flexible: bool) -> Result<()> {
     if flexible {
         put_compact_len(out, Some(len));
     } else {
-        out.put_i16(len as i16); // legacy string = int16 长度
+        if len > i16::MAX as usize {
+            return Err(ProtocolError::BadData(format!(
+                "string length {} exceeds i16::MAX", len
+            )));
+        }
+        out.put_i16(len as i16);
     }
+    Ok(())
 }
 
 fn put_array_len(out: &mut BytesMut, len: usize, flexible: bool) {

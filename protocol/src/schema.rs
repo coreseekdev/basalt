@@ -167,16 +167,18 @@ fn strip_comments(src: &str) -> String {
     while i < b.len() {
         let c = b[i];
         if in_str {
-            out.push(c as char);
             if c == b'\\' && i + 1 < b.len() {
-                out.push(b[i + 1] as char);
-                i += 2;
+                let esc_len = utf8_len(b[i + 1]);
+                out.push_str(&src[i..i + 1 + esc_len]);
+                i += 1 + esc_len;
                 continue;
             }
+            let ch_len = utf8_len(c);
+            out.push_str(&src[i..i + ch_len]);
+            i += ch_len;
             if c == b'"' {
                 in_str = false;
             }
-            i += 1;
             continue;
         }
         match c {

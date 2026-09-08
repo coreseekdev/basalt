@@ -91,11 +91,14 @@ impl BatchHeader {
             b.copy_from_slice(&buf[off..off + 2]);
             i16::from_be_bytes(b)
         };
+        if buf[16] as i8 != MAGIC_V2 {
+            return None;
+        }
         Some(BatchHeader {
             base_offset: g64(0),
             batch_length: g32(8),
             leader_epoch: g32(12),
-            magic: buf[16] as i8,
+            magic: MAGIC_V2,
             crc: u32::from_be_bytes([buf[17], buf[18], buf[19], buf[20]]),
             attributes: g16(21),
             last_offset_delta: g32(23),

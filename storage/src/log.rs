@@ -252,47 +252,57 @@ impl<D: DiskIo> Log<D> {
         let mut staging = BytesMut::new();
         let mut base_assigned: Option<i64> = None;
         let mut last_offset = self.next_offset - 1;
-        let mut wrote_any = false;
+        let mut last_err: Option<StorageError> = None;
 
-        let apply_result: Result<()> = (|| {
-            for pd in &pendings {
-                // 滚动判定必须在 staging 新批之前（staged 字节须全部属于当前 active）
-                if self.active.next_rel > 0
-                    && self.active.bytes + staging.len() as u64 + pd.total as u64
-                        > self.opts.segment_max_bytes
-                {
-                    self.commit_staged(&mut staging)?;
-                    self.roll()?;
+        let mut rollback = false;
+        'append: for pd in &pendings {
+            // 滚动判定必须在 staging 新批之前（staged 字节须全部属于当前 active）
+            if self.active.next_rel > 0
+                && self.active.bytes + staging.len() as u64 + pd.total as u64
+                    > self.opts.segment_max_bytes
+            {
+                if let Err(e) = self.commit_staged(&mut staging) {
+                    rollback = true;
+                    last_err = Some(e);
+                    break 'append;
                 }
-                let start = pd.src.0;
-                let end = pd.src.1;
-                staging.extend_from_slice(&raw[start..end]);
-                if policy == AssignPolicy::Assign {
-                    // 就地改写 base_offset（省一次整批拷贝）
-                    let tail_len = staging.len() - pd.total;
-                    let head: &mut [u8] = &mut staging[tail_len..tail_len + 8];
-                    head.copy_from_slice(&pd.assigned.to_be_bytes());
-                }
-                self.active.push_batch(pd.total, pd.count, pd.max_ts);
-                self.next_offset = pd.assigned + pd.count;
-                last_offset = pd.assigned + pd.count - 1;
-                if base_assigned.is_none() {
-                    base_assigned = Some(pd.assigned);
+                if let Err(e) = self.roll() {
+                    rollback = true;
+                    last_err = Some(e);
+                    break 'append;
                 }
             }
-            if !staging.is_empty() {
-                wrote_any = true;
-                self.commit_staged(&mut staging)?;
+            let start = pd.src.0;
+            let end = pd.src.1;
+            staging.extend_from_slice(&raw[start..end]);
+            if policy == AssignPolicy::Assign {
+                // 就地改写 base_offset（省一次整批拷贝）
+                let tail_len = staging.len() - pd.total;
+                staging[tail_len..tail_len + 8].copy_from_slice(&pd.assigned.to_be_bytes());
             }
-            if self.opts.fsync == FsyncSchedule::SyncEach && wrote_any {
-                self.disk.sync_file(&self.active.path)?;
+            self.active.push_batch(pd.total, pd.count, pd.max_ts);
+            self.next_offset = pd.assigned + pd.count;
+            last_offset = pd.assigned + pd.count - 1;
+            if base_assigned.is_none() {
+                base_assigned = Some(pd.assigned);
             }
-            Ok(())
-        })();
-
-        if let Err(e) = apply_result {
-            self.rollback_to(&cp, wrote_any);
-            return Err(e);
+        }
+        // 剩余 staging 落盘
+        if !rollback && !staging.is_empty() {
+            if let Err(e) = self.commit_staged(&mut staging) {
+                rollback = true;
+                last_err = Some(e);
+            }
+        }
+        if !rollback && self.opts.fsync == FsyncSchedule::SyncEach {
+            if let Err(e) = self.disk.sync_file(&self.active.path) {
+                rollback = true;
+                last_err = Some(e);
+            }
+        }
+        if rollback {
+            self.rollback_to(&cp, true);
+            return Err(last_err.unwrap_or(StorageError::Other("append failed".into())));
         }
         if !self.replicated && self.high_watermark < self.next_offset {
             self.high_watermark = self.next_offset;

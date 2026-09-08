@@ -148,7 +148,7 @@ impl DiskIo for StdDisk {
     }
 
     fn truncate(&self, path: &Path, size: u64) -> Result<()> {
-        let mut f = std::fs::OpenOptions::new().write(true).open(path)?;
+        let mut f = std::fs::OpenOptions::new().write(true).create(true).open(path)?;
         f.set_len(size)?;
         f.flush()?;
         Ok(())

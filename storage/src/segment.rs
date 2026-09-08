@@ -69,8 +69,8 @@ impl Segment {
         let pos = self.bytes as u32;
         if self.bytes_since_index == 0 {
             self.offset_index.push(self.next_rel as u32, pos);
+            self.time_index.push(max_ts, self.next_rel as u32);
         }
-        self.time_index.push(max_ts, self.next_rel as u32);
         self.next_rel += count;
         self.bytes += total as u64;
         self.bytes_since_index += total as u64;
@@ -86,7 +86,9 @@ impl Segment {
     }
 
     pub fn persist_indexes(&self, disk: &dyn crate::disk::DiskIo) -> crate::error::Result<()> {
+        disk.truncate(&self.index_path, 0)?;
         disk.append(&self.index_path, &self.offset_index.encode())?;
+        disk.truncate(&self.time_path, 0)?;
         disk.append(&self.time_path, &self.time_index.encode())?;
         disk.sync_file(&self.index_path)?;
         disk.sync_file(&self.time_path)?;

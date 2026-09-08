@@ -100,7 +100,6 @@ impl<D: DiskIo> Log<D> {
     /// 打开/恢复一个分区日志目录。
     pub fn open(disk: D, dir: std::path::PathBuf, opts: LogOptions) -> Result<Log<D>> {
         disk.create_dir_all(&dir)?;
-        let checkpoint = read_recovery_checkpoint(&dir);
         let mut segs: Vec<Segment> = Vec::new();
         for name in disk.list(&dir)? {
             if let Some(base) = base_of_filename(&name) {
@@ -118,17 +117,6 @@ impl<D: DiskIo> Log<D> {
         let mut next_offset: i64 = segs.first().map(|s| s.base_offset).unwrap_or(0);
         let mut sealed: Vec<Segment> = Vec::new();
         for seg in &mut segs {
-            // checkpoint 匹配（大小未变的 sealed 段）→ 跳过全量扫描
-            let cp_matched = checkpoint.as_ref()
-                .and_then(|cp| cp.get(&seg.base_offset))
-                .map(|&sz| sz == seg.bytes && seg.bytes > 0)
-                .unwrap_or(false);
-            if cp_matched && seg.base_offset < next_offset.max(segs.first().map(|s| s.base_offset).unwrap_or(0)) {
-                // sealed 段未变化 → 跳过扫描，直接信任 checkpoint
-                next_offset = seg.base_offset + seg.next_rel;
-                sealed.push(seg.clone());
-                continue;
-            }
             scan_and_truncate(&disk, seg, next_offset)?;
             if seg.next_rel == 0 && seg.bytes == 0 && !sealed.is_empty() {
                 continue; // 空段且有前驱：保留文件但不入列表
@@ -160,7 +148,6 @@ impl<D: DiskIo> Log<D> {
             replicated: false,
             epoch_history: vec![(0, next_offset)],
         };
-        write_recovery_checkpoint(&dir, &log.sealed, &log.active);
         tracing::info!(
             dir = %log.dir.display(),
             segments = log.sealed.len() + 1,
@@ -817,29 +804,4 @@ fn scan_and_truncate<D: DiskIo>(disk: &D, seg: &mut Segment, expect_base: i64) -
     seg.offset_index = offset_ix;
     seg.time_index = time_ix;
     Ok(())
-}
-
-
-/// 恢复 checkpoint：{base_offset → bytes}（文本格式，简单可调试）。
-fn read_recovery_checkpoint(dir: &std::path::Path) -> Option<std::collections::HashMap<i64, u64>> {
-    let data = std::fs::read_to_string(dir.join("recovery.checkpoint")).ok()?;
-    let mut map = std::collections::HashMap::new();
-    for line in data.lines() {
-        let mut parts = line.split(':');
-        if let (Some(base), Some(sz)) = (parts.next(), parts.next()) {
-            if let (Ok(b), Ok(sz)) = (base.trim().parse(), sz.trim().parse()) {
-                map.insert(b, sz);
-            }
-        }
-    }
-    Some(map)
-}
-
-fn write_recovery_checkpoint(dir: &std::path::Path, sealed: &[Segment], active: &Segment) {
-    let mut content = String::new();
-    for seg in sealed {
-        content.push_str(&format!("{}:{}\n", seg.base_offset, seg.bytes));
-    }
-    content.push_str(&format!("{}:{}\n", active.base_offset, active.bytes));
-    let _ = std::fs::write(dir.join("recovery.checkpoint"), &content);
 }

@@ -92,6 +92,9 @@ pub struct Log<D: DiskIo> {
     pub high_watermark: i64,
     /// true = 多副本分区：HW 只由复制层推进。
     pub replicated: bool,
+    /// IO 批量合并：true 时 append() 只累积到 staging 不写盘，flush_batch() 统一落盘。
+    pub batch_io: bool,
+    batch_staging: BytesMut,
     /// leader epoch 历史：(epoch, start_offset)。追加式，用于 OffsetForLeaderEpoch。
     pub epoch_history: Vec<(i32, i64)>,
 }
@@ -183,6 +186,8 @@ impl<D: DiskIo> Log<D> {
             next_offset,
             high_watermark: next_offset,
             replicated: false,
+            batch_io: false,
+            batch_staging: BytesMut::new(),
             epoch_history: vec![(0, next_offset)],
         };
         // 写恢复 checkpoint（下次启动跳过 CRC 全扫）
@@ -375,9 +380,12 @@ impl<D: DiskIo> Log<D> {
                 base_assigned = Some(pd.assigned);
             }
         }
-        // 剩余 staging 落盘
+        // 剩余 staging 落盘或累积（batch_io 模式下延迟写盘）
         if !rollback && !staging.is_empty() {
-            if let Err(e) = self.commit_staged(&mut staging) {
+            if self.batch_io {
+                self.batch_staging.extend_from_slice(&staging);
+                staging.clear();
+            } else if let Err(e) = self.commit_staged(&mut staging) {
                 rollback = true;
                 last_err = Some(e);
             }
@@ -425,6 +433,21 @@ impl<D: DiskIo> Log<D> {
         let seg = std::mem::replace(&mut self.active, Segment::new(&self.dir, new_base));
         self.sealed.push(seg);
         Ok(())
+    }
+
+    /// IO 批量合并：将 batch_io 模式下累积的数据一次性写入磁盘。
+    pub fn flush_batch(&mut self) -> Result<()> {
+        if self.batch_staging.is_empty() {
+            return Ok(());
+        }
+        self.disk.append(&self.active.path, &self.batch_staging)?;
+        self.batch_staging.clear();
+        Ok(())
+    }
+
+    /// 回滚时清空累积的 batch_staging。
+    pub fn clear_batch(&mut self) {
+        self.batch_staging.clear();
     }
 
     pub fn sync(&self) -> Result<()> {

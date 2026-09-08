@@ -177,7 +177,11 @@ impl PartitionActor {
             while let Ok(cmd) = self.rx.try_recv() {
                 group.push(cmd);
             }
+            // IO 批量合并：同轮 drain 的多个 produce 累积到 batch_staging，一次 write
+            self.log.batch_io = true;
             self.process(group);
+            self.log.flush_batch();
+            self.log.batch_io = false;
             self.on_deadline();
             self.serve_pending();
             // 唤醒时机：fetch 截止 / ack 停等超时，二者取最近
@@ -196,7 +200,10 @@ impl PartitionActor {
                             while let Ok(c) = self.rx.try_recv() {
                                 group.push(c);
                             }
+                            self.log.batch_io = true;
                             self.process(group);
+                            self.log.flush_batch();
+                            self.log.batch_io = false;
                             self.on_deadline();
                             self.serve_pending();
                         }

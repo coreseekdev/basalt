@@ -100,6 +100,14 @@ impl<D: DiskIo> Log<D> {
     /// 打开/恢复一个分区日志目录。
     pub fn open(disk: D, dir: std::path::PathBuf, opts: LogOptions) -> Result<Log<D>> {
         disk.create_dir_all(&dir)?;
+        // 恢复 checkpoint：{base:file_size} 匹配则跳过 CRC 全扫
+        let cp: std::collections::HashMap<i64, u64> = std::fs::read_to_string(dir.join("recovery.checkpoint"))
+            .ok()
+            .map(|data| data.lines().filter_map(|l| {
+                let mut it = l.split(':');
+                Some((it.next()?.parse().ok()?, it.next()?.parse().ok()?))
+            }).collect())
+            .unwrap_or_default();
         let mut segs: Vec<Segment> = Vec::new();
         for name in disk.list(&dir)? {
             if let Some(base) = base_of_filename(&name) {
@@ -116,7 +124,35 @@ impl<D: DiskIo> Log<D> {
         // 逐段扫描校验/重建：坏尾截断（torn write 防线）+ 段间连续性校验
         let mut next_offset: i64 = segs.first().map(|s| s.base_offset).unwrap_or(0);
         let mut sealed: Vec<Segment> = Vec::new();
+        let active_base = segs.last().map(|s| s.base_offset).unwrap_or(-1);
         for seg in &mut segs {
+            // checkpoint 匹配（sealed 段大小未变）→ 跳过 CRC 全扫
+            if seg.base_offset != active_base && seg.bytes > 0 {
+                if cp.get(&seg.base_offset).map(|&sz| sz == seg.bytes).unwrap_or(false) {
+                    // 轻量校验首 61B + 信任 checkpoint
+                    let mut hdr = [0u8; RECORD_BATCH_HEADER_LEN];
+                    if disk.read_at(&seg.path, 0, &mut hdr).unwrap_or(0) == RECORD_BATCH_HEADER_LEN {
+                        if BatchHeader::parse(&hdr).map(|h| h.magic == crate::MAGIC_V2).unwrap_or(false) {
+                            let next_rel: i64 = {
+                                // 批头扫描计数（不读全文件，只读 61B 头，快 10x）
+                                let mut nr = 0i64; let mut pp = 0u64;
+                                while pp + RECORD_BATCH_HEADER_LEN as u64 <= seg.bytes {
+                                    let mut tmp = [0u8; RECORD_BATCH_HEADER_LEN];
+                                    if disk.read_at(&seg.path, pp, &mut tmp).unwrap_or(0) < RECORD_BATCH_HEADER_LEN { break; }
+                                    if let Some(hh) = BatchHeader::parse(&tmp) {
+                                        nr += hh.record_count.max(0) as i64;
+                                        pp += hh.total_len() as u64;
+                                    } else { break; }
+                                }
+                                nr
+                            };
+                            next_offset = seg.base_offset + seg.next_rel;
+                            sealed.push(seg.clone());
+                            continue;
+                        }
+                    }
+                }
+            }
             scan_and_truncate(&disk, seg, next_offset)?;
             if seg.next_rel == 0 && seg.bytes == 0 && !sealed.is_empty() {
                 continue; // 空段且有前驱：保留文件但不入列表
@@ -148,6 +184,13 @@ impl<D: DiskIo> Log<D> {
             replicated: false,
             epoch_history: vec![(0, next_offset)],
         };
+        // 写恢复 checkpoint（下次启动跳过 CRC 全扫）
+        let mut cp_content = String::new();
+        for seg in &log.sealed {
+            cp_content.push_str(&format!("{}:{}\n", seg.base_offset, seg.bytes));
+        }
+        let _ = std::fs::write(log.dir.join("recovery.checkpoint"), &cp_content);
+
         tracing::info!(
             dir = %log.dir.display(),
             segments = log.sealed.len() + 1,

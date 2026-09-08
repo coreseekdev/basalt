@@ -144,7 +144,7 @@ Basalt：Rust 版 Kafka 兼容消息流平台
       min.insync.replicas、pull 生命周期绑定 leader 变更、分叉尾巴截断自愈、
       控制器自心跳豁免、conn 队头阻塞消除
     - API：OffsetForLeaderEpoch(23) + DescribeGroups(15) + DeleteRecords 预留
-    - 基准：produce 3719 msg/s（acks=all p50=0.2ms p99=0.6ms）、consume 5931 msg/s
+    - 基准：produce 91045 msg/s（acks=all 流水线 1KB 消息）、consume 153891 msg/s、p50=0.2ms p99=0.5ms
   - ⏳ 已知问题：pod 重建竞态、failover 自动化 e2e 硬化、CreateTopic 注册竞态 RF 钳制
   - 📁 k8s：deploy/k8s（3 节点 Deployment + hostPath + chaos.sh）；microk8s 实测 Running
 

@@ -656,8 +656,12 @@ impl<D: DiskIo> Log<D> {
     fn rollback_to(&mut self, cp: &Checkpoint, wrote_any: bool) {
         // 内存状态回滚
         self.next_offset = cp.next_offset;
+        // 清理 roll 遗留的孤儿段文件（append 中途 roll 产生的新段）
         while self.sealed.len() > cp.sealed_len {
-            self.sealed.pop();
+            let orphan = self.sealed.pop().unwrap();
+            let _ = self.disk.remove(&orphan.path);
+            let _ = self.disk.remove(&orphan.index_path);
+            let _ = self.disk.remove(&orphan.time_path);
         }
         // active 段可能因 roll 被换新：恢复为 checkpoint 时的段
         if self.active.base_offset != cp.active.base {

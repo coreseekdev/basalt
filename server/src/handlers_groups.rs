@@ -207,7 +207,7 @@ pub async fn offset_commit(req: &basalt_protocol::value::Struct, ctx: &Ctx) -> V
         .send(GroupCmd::CommitOffsets { group, generation, member_id, offsets, reply: tx })
         .await
         .ok();
-    let _e = rx.await.unwrap_or(CoordError::GroupCoordinatorNotAvailable);
+    let _e: CoordError = rx.await.unwrap_or(CoordError::GroupCoordinatorNotAvailable);
     let responses: Vec<Value> = topic_results
         .into_iter()
         .map(|(name, parts)| s([("Name", Value::str(name)), ("Partitions", Value::Array(parts))]))
@@ -311,4 +311,45 @@ pub async fn delete_topics(req: &basalt_protocol::value::Struct, ctx: &Ctx) -> V
         }
     }
     s([("ThrottleTimeMs", Value::I32(0)), ("Responses", Value::Array(results))])
+}
+
+
+// ---------- DescribeGroups / ListGroups ----------
+
+pub async fn describe_groups(req: &basalt_protocol::value::Struct, _ctx: &Ctx) -> Value {
+    // GroupId 数组
+    let mut group_ids = Vec::new();
+    if let Some(Value::Array(gs)) = req.get("GroupIds") {
+        for g in gs {
+            if let Value::Struct(gs2) = g {
+                group_ids.push(gs2.get("GroupId").map(|v| v.as_str().to_string()).unwrap_or_default());
+            }
+        }
+    }
+
+    // GroupManager 没有直接暴露"列出所有组"——由 handler 层向协调器查询
+    // POC：返回空组描述（组存在但无活跃成员时返回 Dead 状态）
+    let responses: Vec<Value> = group_ids
+        .into_iter()
+        .map(|gid| {
+            s([
+                ("ErrorCode", Value::I16(ErrorCode::None as i16)),
+                ("GroupId", Value::str(gid)),
+                ("State", Value::str("Stable")),
+                ("ProtocolType", Value::str("consumer")),
+                ("Protocol", Value::str("range")),
+                ("Members", Value::Array(vec![])),
+                ("AuthorizedOperations", Value::I32(-2147483648)),
+            ])
+        })
+        .collect();
+    s([("ThrottleTimeMs", Value::I32(0)), ("Groups", Value::Array(responses))])
+}
+
+pub async fn list_groups(_req: &basalt_protocol::value::Struct, _ctx: &Ctx) -> Value {
+    // POC：返回空组列表（组发现需要协调器全局视角——M1 补全）
+    s([
+        ("ThrottleTimeMs", Value::I32(0)),
+        ("Groups", Value::Array(vec![])),
+    ])
 }

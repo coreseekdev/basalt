@@ -449,8 +449,16 @@ impl GroupManager {
             let _ = reply.send(SyncResult { error: CoordError::IllegalGeneration, protocol_type: g.protocol_type.clone(), protocol: g.protocol.clone(), assignment: vec![] });
             return;
         }
-        if g.state == GroupState::PreparingRebalance {
+        if g.state == GroupState::PreparingRebalance || g.state == GroupState::Empty {
             let _ = reply.send(SyncResult { error: CoordError::RebalanceInProgress, protocol_type: g.protocol_type.clone(), protocol: g.protocol.clone(), assignment: vec![] });
+            return;
+        }
+        // 非 leader 且尚无 assignments：挂入 pending_syncs（等 leader 分配后统一应答）
+        if spec.assignments.is_empty() && g.state == GroupState::CompletingSync {
+            self.pending_syncs.entry(spec.group.clone()).or_default().push(PendingSync {
+                member_id: spec.member_id.clone(),
+                reply,
+            });
             return;
         }
         // leader：登记 assignments

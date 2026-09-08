@@ -209,5 +209,7 @@ async fn async_main(cfg: Config) {
     }
     // 给 in-flight 请求 2s drain 窗口
     tokio::time::sleep(std::time::Duration::from_millis(2000)).await;
+    // 数据在 OS page cache（默认 FsyncSchedule::Os 不主动 fsync）：
+    // 进程退出不丢（page cache 由内核刷盘），无需显式 sync
     tracing::info!("basalt shutdown complete");
 }

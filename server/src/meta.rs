@@ -258,6 +258,8 @@ impl MetaService {
                 let opts = LogOptions {
                     segment_max_bytes: self.cfg.segment_max_bytes,
                     fsync: FsyncSchedule::Os,
+                    retention_ms: 7 * 24 * 3600 * 1000,
+                    retention_max_bytes: 0,
                 };
                 match PartitionActor::spawn(a.topic.clone(), a.partition, self.cfg.node_id, dir, opts, self.cfg.replica_config()) {
                     Ok(tx) => {

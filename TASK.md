@@ -136,8 +136,17 @@ Basalt：Rust 版 Kafka 兼容消息流平台
     HW 停等 acks=all；kill -9 leader 实测 FAILOVER 迁移、已确认数据完好
   - ⏳ 已知问题：pod 重建竞态下的客户端重试风暴、CreateTopic 在 broker 注册完成前建题会钳制 RF、
     failover 自动化 e2e 的 read 窗口需放宽（机制已实测，脚本待硬化）
-  - 📁 k8s：deploy/k8s（3 节点 Deployment + headless service + hostPath；hostpath provisioner
-    镜像受限时用静态 PV）+ gen.sh；microk8s 实测 Running
+  - ✅ F2 迭代（R1 三路 Code Review → Fix）：
+    - 协议：长度上限防御、tag varint、UTF-8 安全、slice_ref
+    - 存储：两阶段 append（checkpoint 回滚）、TimeIndex 稀疏化、index truncate+write、
+      BatchHeader magic 内建校验、truncate_to、sync_dir、retention 删除
+    - 分布式：HW 纪律（append 不自抬 HW）、FetchSlice fencing、ISR 新鲜窗口、
+      min.insync.replicas、pull 生命周期绑定 leader 变更、分叉尾巴截断自愈、
+      控制器自心跳豁免、conn 队头阻塞消除
+    - API：OffsetForLeaderEpoch(23) + DescribeGroups(15) + DeleteRecords 预留
+    - 基准：produce 3719 msg/s（acks=all p50=0.2ms p99=0.6ms）、consume 5931 msg/s
+  - ⏳ 已知问题：pod 重建竞态、failover 自动化 e2e 硬化、CreateTopic 注册竞态 RF 钳制
+  - 📁 k8s：deploy/k8s（3 节点 Deployment + hostPath + chaos.sh）；microk8s 实测 Running
 
 ## 关键决策记录（ADR 索引）
 

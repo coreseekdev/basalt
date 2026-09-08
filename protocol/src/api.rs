@@ -120,5 +120,6 @@ pub fn supported_versions() -> &'static [(i16, i16, i16)] {
         (key::API_VERSIONS, 0, 5),
         (key::CREATE_TOPICS, 0, 7),
         (key::DELETE_TOPICS, 0, 6),
+        (key::OFFSET_FOR_LEADER_EPOCH, 0, 5),
     ]
 }

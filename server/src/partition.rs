@@ -79,6 +79,16 @@ pub enum PartitionCmd {
         offset: i64,
         reply: oneshot::Sender<Result<(), StorageError>>,
     },
+    /// OffsetForLeaderEpoch 语义：查指定 epoch 的 end offset。
+    EndOffsetForEpoch {
+        epoch: i32,
+        reply: oneshot::Sender<(i32, i64)>,
+    },
+    /// 周期 retention 清理。
+    #[allow(dead_code)]
+    Retention {
+        reply: oneshot::Sender<usize>,
+    },
 }
 
 struct PendingFetch {
@@ -259,7 +269,8 @@ impl PartitionActor {
                     self.role = new_role;
                     self.epoch = epoch;
                     self.replicas = replicas.clone();
-                    self.log.replicated = multi;
+                    self.log.set_replicated_internal(multi);
+                    self.log.record_epoch(epoch);
                     if leader {
                         // 新 leader：以本地数据为准对外服务（HW=LEO）。
                         // 后续 follower 上报驱动 HW 前向推进；已确认数据不会少于此处。
@@ -376,6 +387,13 @@ impl PartitionActor {
                 }
                 PartitionCmd::TruncateTo { offset, reply } => {
                     let _ = reply.send(self.log.truncate_to(offset));
+                }
+                PartitionCmd::EndOffsetForEpoch { epoch, reply } => {
+                    let _ = reply.send(self.log.end_offset_for_epoch(epoch));
+                }
+                PartitionCmd::Retention { reply } => {
+                    let n = self.log.delete_old_segments();
+                    let _ = reply.send(n);
                 }
             }
         }

@@ -31,11 +31,20 @@ pub enum FsyncSchedule {
 pub struct LogOptions {
     pub segment_max_bytes: u64,
     pub fsync: FsyncSchedule,
+    /// retention：段最大保留时间（0 = 不过期）
+    pub retention_ms: u64,
+    /// retention：日志最大保留字节（0 = 无限制）
+    pub retention_max_bytes: u64,
 }
 
 impl Default for LogOptions {
     fn default() -> Self {
-        LogOptions { segment_max_bytes: 1024 * 1024 * 1024, fsync: FsyncSchedule::Os }
+        LogOptions {
+            segment_max_bytes: 1024 * 1024 * 1024,
+            fsync: FsyncSchedule::Os,
+            retention_ms: 7 * 24 * 3600 * 1000, // 7 天
+            retention_max_bytes: 0,              // 默认不限
+        }
     }
 }
 
@@ -83,6 +92,8 @@ pub struct Log<D: DiskIo> {
     pub high_watermark: i64,
     /// true = 多副本分区：HW 只由复制层推进。
     pub replicated: bool,
+    /// leader epoch 历史：(epoch, start_offset)。追加式，用于 OffsetForLeaderEpoch。
+    pub epoch_history: Vec<(i32, i64)>,
 }
 
 impl<D: DiskIo> Log<D> {
@@ -135,6 +146,7 @@ impl<D: DiskIo> Log<D> {
             next_offset,
             high_watermark: next_offset,
             replicated: false,
+            epoch_history: vec![(0, next_offset)],
         };
         tracing::info!(
             dir = %log.dir.display(),
@@ -147,6 +159,11 @@ impl<D: DiskIo> Log<D> {
 
     pub fn dir(&self) -> &std::path::Path {
         &self.dir
+    }
+
+    /// 内部版本（actor 直接调；不重置 HW）。
+    pub fn set_replicated_internal(&mut self, replicated: bool) {
+        self.replicated = replicated;
     }
 
     /// 复制模式开关：开启后 HW 只由复制层推进（append 不自抬）。
@@ -467,6 +484,59 @@ impl<D: DiskIo> Log<D> {
 
     pub fn segment_count(&self) -> usize {
         self.sealed.len() + 1
+    }
+
+    /// 记录 epoch 变更（leader 变更时由 actor 调用）。
+    pub fn record_epoch(&mut self, epoch: i32) {
+        let last = self.epoch_history.last().map(|&(e, _)| e);
+        if last != Some(epoch) {
+            self.epoch_history.push((epoch, self.next_offset));
+            if self.epoch_history.len() > 1000 {
+                self.epoch_history.drain(..500);
+            }
+        }
+    }
+
+    /// OffsetForLeaderEpoch 语义：返回 (epoch, end_offset)。
+    pub fn end_offset_for_epoch(&self, epoch: i32) -> (i32, i64) {
+        if self.epoch_history.is_empty() {
+            return (0, self.next_offset);
+        }
+        let mut result_epoch = self.epoch_history[0].0;
+        for &(e, _) in self.epoch_history.iter().rev() {
+            if e <= epoch {
+                result_epoch = e;
+                break;
+            }
+        }
+        let next_start = self.epoch_history.iter()
+            .find(|&&(e, _)| e > result_epoch)
+            .map(|&(_, start)| start)
+            .unwrap_or(self.next_offset);
+        (result_epoch, next_start.saturating_sub(1))
+    }
+
+    /// Retention：按大小删除最老的 sealed 段。
+    pub fn delete_old_segments(&mut self) -> usize {
+        let mut deleted = 0usize;
+        if self.opts.retention_max_bytes == 0 {
+            return 0;
+        }
+        let total: u64 = self.sealed.iter().map(|s| s.bytes).sum::<u64>() + self.active.bytes;
+        while total > self.opts.retention_max_bytes && self.sealed.len() > 1 {
+            let seg = self.sealed.remove(0);
+            let _ = self.disk.remove(&seg.path);
+            let _ = self.disk.remove(&seg.index_path);
+            let _ = self.disk.remove(&seg.time_path);
+            deleted += 1;
+        }
+        if deleted > 0 {
+            self.log_start_offset = self.sealed.first()
+                .map(|s| s.base_offset)
+                .unwrap_or(self.active.base_offset);
+            tracing::info!(deleted, log_start = self.log_start_offset, "retention deleted segments");
+        }
+        deleted
     }
 
     // ---------- 截断（failover 自愈） ----------

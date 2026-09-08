@@ -1,7 +1,7 @@
 //! Log 级集成测试：append → read → roll → recover 往返。
 
 use basalt_record::{encode_batch, Rec};
-use basalt_storage::disk::{DiskIo, StdDisk};
+use basalt_storage::disk::StdDisk;
 use basalt_storage::log::{AssignPolicy, FsyncSchedule, Log, LogOptions};
 use basalt_storage::pool::BufferPool;
 use bytes::{Bytes, BytesMut};
@@ -33,7 +33,7 @@ fn append_read_roll_recover() {
     let mut log = Log::open(
         disk,
         dir.clone(),
-        LogOptions { segment_max_bytes: 512, fsync: FsyncSchedule::OnRoll },
+        LogOptions { segment_max_bytes: 512, fsync: FsyncSchedule::OnRoll, retention_ms: 0, retention_max_bytes: 0 },
     )
     .unwrap();
     let pool = BufferPool::new();

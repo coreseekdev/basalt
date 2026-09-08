@@ -510,3 +510,82 @@ pub async fn list_offsets(req: &basalt_protocol::value::Struct, ctx: &Ctx) -> Va
     }
     s([("ThrottleTimeMs", Value::I32(0)), ("Topics", Value::Array(responses))])
 }
+
+
+/// OffsetForLeaderEpoch（key 23）：返回指定 epoch 的 end offset。
+pub async fn offset_for_leader_epoch(req: &basalt_protocol::value::Struct, ctx: &Ctx) -> Value {
+    // 阶段 1：快照路由（borrow 不跨 await）
+    struct Pending {
+        index: i32,
+        rx: Option<oneshot::Receiver<(i32, i64)>>,
+    }
+    // 步骤 A：resolve（borrow 内无 await）
+    struct Resolved {
+        #[allow(dead_code)]
+        name: String,
+        index: i32,
+        epoch: i32,
+        tx: Option<mpsc::Sender<PartitionCmd>>,
+    }
+    let resolved: Vec<(String, Vec<Resolved>)> = {
+        let routes = ctx.routes();
+        let mut out = Vec::new();
+        if let Some(Value::Array(topics)) = req.get("Topics") {
+            for t in topics {
+                let Value::Struct(ts) = t else { continue };
+                let name = ts.get("Name").map(|x| x.as_str().to_string()).unwrap_or_default();
+                let mut parts = Vec::new();
+                if let Some(Value::Array(parr)) = ts.get("Partitions") {
+                    for pd in parr {
+                        let Value::Struct(ps) = pd else { continue };
+                        let index = ps.get("PartitionIndex").map(|v| v.as_i32()).unwrap_or(0);
+                        let req_epoch = ps.get("CurrentLeaderEpoch").map(|v| v.as_i32()).unwrap_or(-1);
+                        let tx = routes.find(&name, index).map(|r| r.tx.clone());
+                        parts.push(Resolved { name: name.clone(), index, epoch: req_epoch, tx });
+                    }
+                }
+                out.push((name, parts));
+            }
+        }
+        out
+    };
+    // 步骤 B：send（无 borrow）
+    let mut pendings: Vec<(String, Vec<Pending>)> = Vec::new();
+    for (name, parts) in resolved {
+        let mut pending_parts = Vec::new();
+        for r in parts {
+            let (reply_tx, reply_rx) = oneshot::channel();
+            let sent = match &r.tx {
+                Some(actor_tx) => actor_tx
+                    .send(PartitionCmd::EndOffsetForEpoch { epoch: r.epoch, reply: reply_tx })
+                    .await
+                    .is_ok(),
+                None => false,
+            };
+            pending_parts.push(Pending { index: r.index, rx: sent.then_some(reply_rx) });
+        }
+        pendings.push((name, pending_parts));
+    }
+    // 阶段 2：收集
+    let mut responses = Vec::new();
+    for (name, parts) in pendings {
+        let mut pvals = Vec::new();
+        for p in parts {
+            let (err, leader_epoch, end) = match p.rx {
+                Some(rx) => match rx.await {
+                    Ok((le, end_off)) => (0i16, le, end_off),
+                    Err(_) => (16i16, -1, -1),
+                },
+                None => (3i16, -1, -1),
+            };
+            pvals.push(s([
+                ("ErrorCode", Value::I16(err)),
+                ("PartitionIndex", Value::I32(p.index)),
+                ("LeaderEpoch", Value::I32(leader_epoch)),
+                ("EndOffset", Value::I64(end)),
+            ]));
+        }
+        responses.push(s([("Name", Value::str(name)), ("Partitions", Value::Array(pvals))]));
+    }
+    s([("ThrottleTimeMs", Value::I32(0)), ("Topics", Value::Array(responses))])
+}

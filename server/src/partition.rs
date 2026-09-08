@@ -298,14 +298,21 @@ impl PartitionActor {
                         continue;
                     }
                     let now = now_ms();
+                    let m = crate::partition::metrics();
+                    m.produce_requests.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                     let outcome = match self.log.append(&batches, policy, now) {
-                        Ok(r) => ProduceOutcome {
-                            base_offset: r.base_offset,
-                            last_offset: r.last_offset,
-                            log_append_time: r.log_append_time,
-                            error: None,
-                        },
+                        Ok(r) => {
+                            m.messages_produced.fetch_add((r.last_offset - r.base_offset + 1) as u64, std::sync::atomic::Ordering::Relaxed);
+                            m.bytes_produced.fetch_add(batches.len() as u64, std::sync::atomic::Ordering::Relaxed);
+                            ProduceOutcome {
+                                base_offset: r.base_offset,
+                                last_offset: r.last_offset,
+                                log_append_time: r.log_append_time,
+                                error: None,
+                            }
+                        }
                         Err(e) => {
+                            m.produce_errors.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                             tracing::warn!(topic=%self.name, partition=self.index, error=%e, "produce append failed");
                             ProduceOutcome { base_offset: -1, last_offset: -1, log_append_time: now, error: Some(e) }
                         }
@@ -327,6 +334,7 @@ impl PartitionActor {
                     let _ = reply.send(outcome);
                 }
                 PartitionCmd::Fetch { offset, max_bytes, deadline, reply } => {
+                    crate::partition::metrics().fetch_requests.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                     if self.role != Role::Leader {
                         let _ = reply.send(FetchOutcome { result: None, error: Some(StorageError::NotLeader) });
                         continue;
@@ -451,6 +459,28 @@ impl PartitionActor {
             }
         }
     }
+}
+
+// ---- 全局指标（AtomicU64 无锁计数，Prometheus 格式暴露） ----
+use std::sync::atomic::AtomicU64;
+
+#[derive(Default)]
+pub struct Metrics {
+    pub messages_produced: AtomicU64,
+    pub bytes_produced: AtomicU64,
+    #[allow(dead_code)]
+    pub messages_consumed: AtomicU64,
+    #[allow(dead_code)]
+    pub bytes_consumed: AtomicU64,
+    pub produce_errors: AtomicU64,
+    pub fetch_requests: AtomicU64,
+    pub produce_requests: AtomicU64,
+}
+
+static METRICS: std::sync::OnceLock<Metrics> = std::sync::OnceLock::new();
+
+pub fn metrics() -> &'static Metrics {
+    METRICS.get_or_init(Metrics::default)
 }
 
 pub fn now_ms() -> i64 {

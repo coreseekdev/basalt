@@ -103,6 +103,34 @@ async fn async_main(cfg: Config) {
         });
     }
 
+    // Metrics HTTP 端点（Prometheus 格式）
+    let metrics_port: u16 = std::env::var("BASALT_METRICS_PORT").ok().and_then(|v| v.parse().ok()).unwrap_or(9094);
+    let metrics_listener = tokio::net::TcpListener::bind(format!("0.0.0.0:{metrics_port}")).await.expect("bind metrics");
+    tokio::spawn(async move {
+        use tokio::io::AsyncWriteExt;
+        loop {
+            let Ok((mut sock, _)) = metrics_listener.accept().await else { break };
+            tokio::spawn(async move {
+                let m = crate::partition::metrics();
+                let produced = m.messages_produced.load(std::sync::atomic::Ordering::Relaxed);
+                let bytes_p = m.bytes_produced.load(std::sync::atomic::Ordering::Relaxed);
+                let consumed = m.messages_consumed.load(std::sync::atomic::Ordering::Relaxed);
+                let errors = m.produce_errors.load(std::sync::atomic::Ordering::Relaxed);
+                let fetches = m.fetch_requests.load(std::sync::atomic::Ordering::Relaxed);
+                let produces = m.produce_requests.load(std::sync::atomic::Ordering::Relaxed);
+                let body = format!(
+                    "# TYPE basalt_messages_produced_total counter\nbasalt_messages_produced_total {produced}\n# TYPE basalt_bytes_produced_total counter\nbasalt_bytes_produced_total {bytes_p}\n# TYPE basalt_messages_consumed_total counter\nbasalt_messages_consumed_total {consumed}\n# TYPE basalt_produce_errors_total counter\nbasalt_produce_errors_total {errors}\n# TYPE basalt_fetch_requests_total counter\nbasalt_fetch_requests_total {fetches}\n# TYPE basalt_produce_requests_total counter\nbasalt_produce_requests_total {produces}\n"
+                );
+                let resp = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                    body.len()
+                );
+                let _ = sock.write_all(resp.as_bytes()).await;
+                let _ = sock.shutdown().await;
+            });
+        }
+    });
+
     // 客户端监听
     let listener = tokio::net::TcpListener::bind(cfg.listen_addr()).await.expect("bind");
     tracing::info!(addr = %cfg.listen_addr(), "basalt listening");

@@ -353,3 +353,19 @@ pub async fn list_groups(_req: &basalt_protocol::value::Struct, _ctx: &Ctx) -> V
         ("Groups", Value::Array(vec![])),
     ])
 }
+
+
+// ---------- InitProducerId ----------
+
+use std::sync::atomic::{AtomicI64, Ordering};
+static NEXT_PRODUCER_ID: AtomicI64 = AtomicI64::new(1000);
+
+pub async fn init_producer_id(_req: &basalt_protocol::value::Struct, _ctx: &Ctx) -> Value {
+    let pid = NEXT_PRODUCER_ID.fetch_add(1, Ordering::Relaxed);
+    s([
+        ("ThrottleTimeMs", Value::I32(0)),
+        ("ErrorCode", Value::I16(ErrorCode::None as i16)),
+        ("ProducerId", Value::I64(pid)),
+        ("ProducerEpoch", Value::I16(0)),
+    ])
+}

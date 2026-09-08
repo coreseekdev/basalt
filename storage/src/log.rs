@@ -296,6 +296,33 @@ impl<D: DiskIo> Log<D> {
             return Err(StorageError::Other("no valid batches".into()));
         }
 
+        // ---- Fast path：单批次 + 无需 patch + 适配当前段 → 直接写 raw（零 staging 拷贝） ----
+        if pendings.len() == 1 {
+            let pd = &pendings[0];
+            let needs_roll = self.active.next_rel > 0
+                && self.active.bytes + pd.total as u64 > self.opts.segment_max_bytes;
+            let needs_patch = policy == AssignPolicy::Assign
+                && raw[0..8] != pd.assigned.to_be_bytes();
+
+            if !needs_roll && !needs_patch {
+                // 直接写 raw 到磁盘（无中间缓冲）
+                self.disk.append(&self.active.path, raw)?;
+                self.active.push_batch(pd.total, pd.count, pd.max_ts);
+                self.next_offset = pd.assigned + pd.count;
+                if !self.replicated && self.high_watermark < self.next_offset {
+                    self.high_watermark = self.next_offset;
+                }
+                if self.opts.fsync == FsyncSchedule::SyncEach {
+                    self.disk.sync_file(&self.active.path)?;
+                }
+                return Ok(AppendResult {
+                    base_offset: pd.assigned,
+                    last_offset: pd.assigned + pd.count - 1,
+                    log_append_time: now_ms,
+                });
+            }
+        }
+
         // ---- 阶段 2：落盘 + 内存应用（checkpoint 回滚保护） ----
         let cp = Checkpoint {
             next_offset: self.next_offset,

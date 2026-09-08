@@ -203,6 +203,9 @@ impl Controller {
             .keys()
             .copied()
             .filter(|id| {
+                if *id == self.node_id {
+                    return false; // 控制器自身永不死
+                }
                 self.last_heartbeat
                     .get(id)
                     .map(|t| now.duration_since(*t) > self.heartbeat_timeout)

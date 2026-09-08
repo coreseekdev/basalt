@@ -146,6 +146,7 @@ impl<D: DiskIo> Log<D> {
                                 }
                                 nr
                             };
+                            seg.next_rel = next_rel;
                             next_offset = seg.base_offset + seg.next_rel;
                             sealed.push(seg.clone());
                             continue;

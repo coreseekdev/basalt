@@ -8,9 +8,8 @@ use crate::partition::{PartitionActor, PartitionCmd};
 use basalt_metadata::cluster::{BrokerInfo, ClusterState};
 use basalt_metadata::TopicMeta;
 use basalt_storage::log::{FsyncSchedule, LogOptions};
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::path::PathBuf;
-use std::sync::{Mutex, OnceLock};
 use tokio::sync::{mpsc, oneshot, watch};
 
 #[derive(Clone)]
@@ -71,11 +70,10 @@ pub struct MetaService {
     /// 控制器内部地址（host:internal_port），非控制器节点经它转发建题
     controller_addr: Option<String>,
     cluster: ClusterState,
-    /// 已停掉拉取任务的分区（failover 成为 leader 后）
+    /// 活跃拉取任务的停止信号 + 当前目标地址
+    active_pulls: HashMap<(String, i32), tokio::sync::watch::Sender<bool>>,
     #[allow(dead_code)]
-    stop_pulls: HashSet<(String, i32)>,
-    /// 每分区当前拉取目标地址（leader 变更检测）
-    pull_addrs: HashMap<(String, i32), String>,
+    active_pull_addrs: HashMap<(String, i32), String>,
     /// topic name -> (topic_id, 本地已 spawn 的分区集合)
     local: HashMap<String, (u128, std::collections::HashSet<i32>)>,
     routes: RoutingTable,
@@ -133,8 +131,8 @@ impl MetaService {
             cfg,
             controller_addr,
             cluster: ClusterState::default(),
-            stop_pulls: std::collections::HashSet::new(),
-            pull_addrs: HashMap::new(),
+            active_pulls: HashMap::new(),
+            active_pull_addrs: HashMap::new(),
             local: HashMap::new(),
             routes: RoutingTable::default(),
             tx_watch: tw,
@@ -188,6 +186,31 @@ impl MetaService {
                 }
             }
         }
+    }
+
+    /// 停止指定分区的拉取任务。
+    fn stop_pull(&mut self, topic: &str, partition: i32) {
+        let key = (topic.to_string(), partition);
+        if let Some(tx) = self.active_pulls.remove(&key) {
+            let _ = tx.send(true); // 信号：停止
+            tracing::info!(topic=%topic, partition=%partition, "pull task stopped");
+        }
+    }
+
+    /// 启动拉取任务（带 watch 停止信号）。
+    fn spawn_pull(&mut self, topic: &str, partition: i32, leader: i32, leader_addr: &str, local_tx: &mpsc::Sender<PartitionCmd>) {
+        let (stop_tx, stop_rx) = tokio::sync::watch::channel(false);
+        let pull = FollowerPull {
+            topic: topic.to_string(),
+            partition,
+            node_id: self.cfg.node_id,
+            leader,
+            leader_addr: leader_addr.to_string(),
+            local_tx: local_tx.clone(),
+            stop_rx,
+        };
+        self.active_pulls.insert((topic.to_string(), partition), stop_tx);
+        tokio::spawn(pull.run());
     }
 
     async fn create_via_controller(&mut self, name: &str, partitions: i32, rf: i32) -> bool {
@@ -274,80 +297,48 @@ impl MetaService {
                                 replicas: a.replicas.clone(),
                             })
                             .await;
-                        // follower：启动拉取任务（leader 变更时由 ApplyCluster 停旧起新）
+                        // follower：启动拉取任务
                         if a.leader != self.cfg.node_id {
                             if let Some(leader_info) = self.cluster.brokers.get(&a.leader) {
                                 let leader_addr = format!("{}:{}", leader_info.host, leader_info.port + 1);
-                                clear_pull_stop(&a.topic, a.partition);
-                                let pull = FollowerPull {
-                                    topic: a.topic.clone(),
-                                    partition: a.partition,
-                                    node_id: self.cfg.node_id,
-                                    leader: a.leader,
-                                    leader_addr,
-                                    local_tx: tx,
-                                };
-                                tokio::spawn(pull.run());
+                                self.spawn_pull(&a.topic, a.partition, a.leader, &leader_addr, &tx);
                             }
                         }
                     }
                     Err(e) => tracing::error!(topic=%a.topic, partition=a.partition, error=%e, "spawn failed"),
                 }
             } else if let Some(route) = self.routes.by_name.get_mut(&(a.topic.clone(), a.partition)) {
-                // 已有 actor：仅更新角色/路由
-                let was_leader = route.leader == self.cfg.node_id;
+                // 提取 route 信息（限制 borrow 范围）
+                let (_was_leader, tx_clone) = {
+                    route.leader = a.leader;
+                    route.epoch = a.epoch;
+                    (route.leader == self.cfg.node_id, route.tx.clone())
+                };
                 let is_leader = a.leader == self.cfg.node_id;
-                route.leader = a.leader;
-                route.epoch = a.epoch;
-                let _ = route
-                    .tx
+                // drop route borrow 后再 await
+                let _ = tx_clone
                     .send(PartitionCmd::SetRole {
                         leader: is_leader,
                         epoch: a.epoch,
                         replicas: a.replicas.clone(),
                     })
                     .await;
-                if is_leader && !was_leader {
-                    // failover：本副本从 follower 变为 leader → 停掉拉取任务
-                    set_pull_stop(&a.topic, a.partition);
-                } else if !is_leader && was_leader {
-                    // 原 leader 失去 leadership → 必须起新拉取任务（指向新 leader）
-                    if let Some(leader_info) = self.cluster.brokers.get(&a.leader) {
-                        let leader_addr = format!("{}:{}", leader_info.host, leader_info.port + 1);
-                        clear_pull_stop(&a.topic, a.partition);
-                        let pull = FollowerPull {
-                            topic: a.topic.clone(),
-                            partition: a.partition,
-                            node_id: self.cfg.node_id,
-                            leader: a.leader,
-                            leader_addr,
-                            local_tx: route.tx.clone(),
-                        };
-                        tokio::spawn(pull.run());
-                    }
-                } else if !is_leader {
-                    // follower 不变但 leader 换了人 → 停旧起新（指向新 leader 地址）
-                    if let Some(leader_info) = self.cluster.brokers.get(&a.leader) {
-                        let new_addr = format!("{}:{}", leader_info.host, leader_info.port + 1);
-                        if self.pull_addrs.get(&(a.topic.clone(), a.partition)).map(|old| old != &new_addr).unwrap_or(true) {
-                            set_pull_stop(&a.topic, a.partition);
-                            clear_pull_stop(&a.topic, a.partition);
-                            let pull = FollowerPull {
-                                topic: a.topic.clone(),
-                                partition: a.partition,
-                                node_id: self.cfg.node_id,
-                                leader: a.leader,
-                                leader_addr: new_addr.clone(),
-                                local_tx: route.tx.clone(),
-                            };
-                            tokio::spawn(pull.run());
-                        }
+                // 拉取任务管理
+                let key = (a.topic.clone(), a.partition);
+                if is_leader {
+                    self.stop_pull(&a.topic, a.partition);
+                } else if let Some(leader_info) = self.cluster.brokers.get(&a.leader) {
+                    let new_addr = format!("{}:{}", leader_info.host, leader_info.port + 1);
+                    if self.active_pull_addrs.get(&key).map(|old| old != &new_addr).unwrap_or(true) {
+                        self.stop_pull(&a.topic, a.partition);
+                        self.spawn_pull(&a.topic, a.partition, a.leader, &new_addr, &tx_clone);
                     }
                 }
-                self.pull_addrs.insert((a.topic.clone(), a.partition), format!("{}:{}", {
-                    let info = self.cluster.brokers.get(&a.leader);
-                    match info { Some(b) => format!("{}:{}", b.host, b.port), None => String::new() }
-                }, a.leader));
+                self.active_pull_addrs.insert(key, if is_leader { String::new() } else {
+                    self.cluster.brokers.get(&a.leader)
+                        .map(|b| format!("{}:{}", b.host, b.port + 1))
+                        .unwrap_or_default()
+                });
             }
         }
         let _ = self.tx_watch.send(self.routes.clone());
@@ -355,22 +346,9 @@ impl MetaService {
 }
 
 // follower 拉取任务的停止标志（failover 时由 MetaService 置位）
-fn pull_stops() -> &'static Mutex<HashSet<(String, i32)>> {
-    static S: OnceLock<Mutex<HashSet<(String, i32)>>> = OnceLock::new();
-    S.get_or_init(|| Mutex::new(HashSet::new()))
-}
 
-pub fn set_pull_stop(topic: &str, partition: i32) {
-    pull_stops().lock().unwrap().insert((topic.to_string(), partition));
-}
 
-pub fn clear_pull_stop(topic: &str, partition: i32) {
-    pull_stops().lock().unwrap().remove(&(topic.to_string(), partition));
-}
 
-pub fn pull_stop_requested(topic: &str, partition: i32) -> bool {
-    pull_stops().lock().unwrap().contains(&(topic.to_string(), partition))
-}
 
 /// 启动期恢复：数据目录里已有的 topic 在控制器未登记时补登记（幂等）。
 #[allow(dead_code)]
@@ -399,6 +377,7 @@ struct FollowerPull {
     leader: i32,
     leader_addr: String,
     local_tx: mpsc::Sender<PartitionCmd>,
+    stop_rx: tokio::sync::watch::Receiver<bool>,
 }
 
 impl FollowerPull {
@@ -496,6 +475,6 @@ impl FollowerPull {
 
     fn stop_requested(&self) -> bool {
         // 由 MetaService 在 failover 时置位；POC 经全局注册表轮询
-        crate::meta::pull_stop_requested(&self.topic, self.partition)
+        *self.stop_rx.borrow()
     }
 }

@@ -197,7 +197,13 @@ async fn async_main(cfg: Config) {
     // 优雅停机：SIGTERM/SIGINT → 停 accept → 短暂 drain → sync
     tokio::select! {
         _ = &mut accept_loop => {},
-        _ = tokio::signal::ctrl_c() => {
+        _ = async {
+            let mut term = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate()).expect("SIGTERM handler");
+            tokio::select! {
+                _ = tokio::signal::ctrl_c() => {},
+                _ = term.recv() => {},
+            }
+        } => {
             tracing::info!("SIGTERM/SIGINT: shutting down gracefully");
         }
     }

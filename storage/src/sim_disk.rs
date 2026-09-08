@@ -30,6 +30,7 @@ pub struct SimDiskInner {
 
 #[derive(Clone)]
 pub struct SimDisk {
+    /// 测试基建内部引用计数（非调用方所有权图；clippy disallowed-types 例外）
     inner: std::sync::Arc<SimDiskInner>,
 }
 

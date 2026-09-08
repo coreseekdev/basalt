@@ -5,3 +5,5 @@ disallowed-types = [
     "std::cell::Cell",
     "std::sync::Arc",
 ]
+
+# SimDisk 测试基建内部 Arc 例外（引用计数是实现细节，非调用方所有权图）

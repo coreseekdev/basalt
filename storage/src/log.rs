@@ -522,9 +522,10 @@ impl<D: DiskIo> Log<D> {
         if self.opts.retention_max_bytes == 0 {
             return 0;
         }
-        let total: u64 = self.sealed.iter().map(|s| s.bytes).sum::<u64>() + self.active.bytes;
+        let mut total: u64 = self.sealed.iter().map(|s| s.bytes).sum::<u64>() + self.active.bytes;
         while total > self.opts.retention_max_bytes && self.sealed.len() > 1 {
             let seg = self.sealed.remove(0);
+            total -= seg.bytes;
             let _ = self.disk.remove(&seg.path);
             let _ = self.disk.remove(&seg.index_path);
             let _ = self.disk.remove(&seg.time_path);

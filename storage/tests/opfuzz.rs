@@ -153,12 +153,14 @@ fn run_seed(seed: u64, torn: f64) {
                 if rng.below(2) == 0 {
                     ops.push(format!("{step}:truncate({to})"));
                     let _ = log.truncate_to(to);
+                    tracked.clear(); // 批对齐向下取整：跨线批可能被截，保守重置
                 } else {
                     ops.push(format!("{step}:delete({to})"));
                     let _ = log.delete_records(to);
+                    // delete 只删 < to 的数据：>= to 的追加仍应可读
+                    tracked.retain(|t| t.last_offset >= to);
                 }
-                tracked.clear();
-                synced_upto = log.next_offset;
+                synced_upto = synced_upto.max(log.log_start_offset());
             }
         }
     }
@@ -172,11 +174,12 @@ fn run_seed(seed: u64, torn: f64) {
         assert!(log.next_offset >= synced_upto, "收尾：已 sync 数据丢失");
     }
 
-    // 安全断言（两档通用）：从 0 全量读必须成功、批流 CRC 合法且连续
-    if log.next_offset == 0 {
-        return; // 恢复后全空：合法状态
+    // 安全断言（两档通用）：从 log_start 全量读必须成功、批流 CRC 合法且连续
+    if log.next_offset <= log.log_start_offset() {
+        return; // 恢复后无可读区间：合法状态
     }
-    let r = log.read(0, 1 << 20, &pool).unwrap();
+    let from = log.log_start_offset();
+    let r = log.read(from, 1 << 20, &pool).unwrap();
     assert_batch_stream(&r.data);
 
     // 持久断言（clean）：tracked 标签按序全部可读回
@@ -184,6 +187,7 @@ fn run_seed(seed: u64, torn: f64) {
         let text = String::from_utf8_lossy(&r.data).to_string();
         let mut cursor = 0usize;
         for t in &tracked {
+            if t.last_offset < from { continue; }
             match text[cursor..].find(&t.payload) {
                 Some(pos) => cursor += pos + t.payload.len(),
                 None => panic!("已 sync 追加丢失: {}（seed={seed}）", t.payload),
@@ -197,8 +201,14 @@ fn run_seed(seed: u64, torn: f64) {
 /// crash 后重开 LEO < 27，全部追加均 SyncEach 已 sync）。前两项已修：
 /// SimDisk::len 只返回 pending（crash 后 seg.bytes=0 致簿记失真）、
 /// truncate_to 盲设 next_offset 与批边界错位。待根因定位后去除 ignore。
+/// WIP（不计入账本）：发现 ③ 已窄化——delete/truncate 后段布局存在空洞时，
+/// Log::open 的孤儿段跳过（base != next_offset → continue）会把后续有数据的
+/// 段整段丢弃，重开 LEO 停在 log_start（seed=1 clean：leo=27/start=14 → 重开 14）。
+/// 修复方向：delete/truncate 保证剩余段链连续，或恢复扫描按 log_start 预热
+/// next_offset。含两处已修复的真实缺陷（SimDisk::len、truncate_to 批对齐）
+/// 与一处已修复的反向删除（truncate_to_front 保留/删除颠倒——均已入库）。
 #[test]
-#[ignore = "WIP: delete/truncate/roll/crash 交互丢数据——见函数注释"]
+#[ignore = "WIP: delete/truncate/roll/crash 交互——见函数注释"]
 fn opfuzz_clean_seeds() {
     for seed in 1..=40u64 {
         run_seed(seed, 0.0);
@@ -206,7 +216,7 @@ fn opfuzz_clean_seeds() {
 }
 
 #[test]
-#[ignore = "WIP: 依赖 clean 档先行闭合；另需 log_start 感知的读取入口"]
+#[ignore = "WIP: 依赖 clean 档闭合"]
 fn opfuzz_chaos_seeds() {
     for seed in 1..=20u64 {
         let torn = if seed % 2 == 0 { 0.05 } else { 0.15 };

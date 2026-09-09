@@ -576,6 +576,10 @@ impl<D: DiskIo> Log<D> {
         Ok((-1, -1)) // NOT_FOUND
     }
 
+    pub fn log_start_offset(&self) -> i64 {
+        self.log_start_offset
+    }
+
     pub fn segment_count(&self) -> usize {
         self.sealed.len() + 1
     }
@@ -610,20 +614,25 @@ impl<D: DiskIo> Log<D> {
             if seg.base_offset < offset && seg.base_offset + seg.next_rel > offset {
                 let rel = (offset - seg.base_offset) as i64;
                 let data = self.disk.read_all(&seg.path)?;
+                // 删除整批位于 offset 之前的前缀；包含 offset 的批整批保留
+                // （读取时按 log_start_offset 过滤）。opfuzz C7' 发现原实现
+                // 条件写反：保留了 < offset 的前缀、删掉了 >= offset 的全部数据。
                 let mut p = 0usize;
                 let mut rel_cur: i64 = 0;
                 while p + RECORD_BATCH_HEADER_LEN <= data.len() {
                     if let Some(h) = BatchHeader::parse(&data[p..]) {
                         let total = h.total_len();
                         if total == 0 || p + total > data.len() { break; }
-                        if rel_cur >= rel { break; }
-                        rel_cur += h.record_count.max(0) as i64;
+                        let end = rel_cur + h.record_count.max(0) as i64;
+                        if end > rel { break; }
+                        rel_cur = end;
                         p += total;
                     } else { break; }
                 }
                 if p > 0 {
                     self.disk.truncate(&seg.path, p as u64)?;
                     seg.bytes = p as u64;
+                    crate::log::rescan_segment(&self.disk, seg);
                 }
             }
         }
@@ -631,20 +640,23 @@ impl<D: DiskIo> Log<D> {
             let rel = (offset - self.active.base_offset) as i64;
             if rel > 0 && self.active.bytes > 0 {
                 let data = self.disk.read_all(&self.active.path)?;
+                // 同上：删前缀（整批 end <= rel），跨线批保留
                 let mut p = 0usize;
                 let mut rel_cur: i64 = 0;
                 while p + RECORD_BATCH_HEADER_LEN <= data.len() {
                     if let Some(h) = BatchHeader::parse(&data[p..]) {
                         let total = h.total_len();
                         if total == 0 || p + total > data.len() { break; }
-                        if rel_cur >= rel { break; }
-                        rel_cur += h.record_count.max(0) as i64;
+                        let end = rel_cur + h.record_count.max(0) as i64;
+                        if end > rel { break; }
+                        rel_cur = end;
                         p += total;
                     } else { break; }
                 }
                 if p > 0 {
                     self.disk.truncate(&self.active.path, p as u64)?;
                     self.active.bytes = p as u64;
+                    crate::log::rescan_segment(&self.disk, &mut self.active);
                 }
             }
         }

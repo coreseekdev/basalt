@@ -10,3 +10,8 @@ splitbrain:       ; $(TLC) -config splitbrain.cfg BasaltDataPlane.tla
 splitbrain-cepoch:; $(TLC) -config splitbrain-cepoch.cfg BasaltDataPlane.tla
 
 .PHONY: check demo-eager splitbrain splitbrain-cepoch
+
+consumer-group:        ; $(TLC) -config consumer-group.cfg ConsumerGroup.tla
+consumer-group-demo:   ; $(TLC) -config consumer-group-demo.cfg ConsumerGroup.tla
+
+.PHONY: consumer-group consumer-group-demo

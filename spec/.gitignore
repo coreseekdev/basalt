@@ -1,0 +1,5 @@
+states/
+*.old
+*_TTrace_*
+ConsumerGroup.cfg
+*.bin

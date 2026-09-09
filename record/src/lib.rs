@@ -139,7 +139,9 @@ pub fn validate_crc(buf: &[u8]) -> bool {
         return false;
     };
     let total = h.total_len();
-    if buf.len() < total {
+    // batchLength 必须至少覆盖 12..61 的头部其余部分，否则 CRC 覆盖域
+    // （从 21 起）为空/倒挂——crafted 报文（如 batch_length=0）在此拒绝。
+    if buf.len() < total || total < RECORD_BATCH_HEADER_LEN {
         return false;
     }
     let payload = &buf[CRC_PAYLOAD_OFFSET..total];
@@ -147,8 +149,11 @@ pub fn validate_crc(buf: &[u8]) -> bool {
 }
 
 /// 便捷：从缓冲中读出第一个完整批的长度（不足/非法返回 None）。
+/// batchLength 不足以容纳头部其余部分（total < 61）视为非法帧。
 pub fn batch_len_at(buf: &[u8]) -> Option<usize> {
-    BatchHeader::parse(buf).map(|h| h.total_len())
+    let total = BatchHeader::parse(buf)?.total_len();
+    if total < RECORD_BATCH_HEADER_LEN { return None; }
+    Some(total)
 }
 
 // ---------- 构造（测试与内部复制/标记用） ----------
@@ -408,5 +413,29 @@ mod tests {
             let unpacked = decompress(codec, &packed, body.len()).unwrap();
             assert_eq!(&unpacked[..], body, "{codec:?}");
         }
+    }
+}
+
+#[cfg(test)]
+mod crafted_tests {
+    use super::*;
+
+    /// 合法 magic + batch_length=0 的报文：total_len()=12 < CRC 起点 21。
+    #[test]
+    fn validate_crc_on_crafted_zero_batch_length() {
+        let mut m = vec![0u8; 64];
+        m[16] = MAGIC_V2 as u8;                   // magic 合法
+        m[8..12].copy_from_slice(&0i32.to_be_bytes()); // batch_length = 0
+        // 修复前：此处 panic（&buf[21..12]）；修复后：应返回 false
+        assert_eq!(validate_crc(&m), false);
+    }
+
+    #[test]
+    fn batch_len_at_on_crafted_zero_batch_length() {
+        let mut m = vec![0u8; 64];
+        m[16] = MAGIC_V2 as u8;
+        m[8..12].copy_from_slice(&0i32.to_be_bytes());
+        // 修复前：Some(12)（调用方按此切片 [21..12] 必 panic）；修复后：None
+        assert_eq!(batch_len_at(&m), None);
     }
 }

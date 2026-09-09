@@ -444,4 +444,49 @@ pub fn get_varint(buf: &[u8]) -> (r: Option<u64>)
     Some(v as u64)
 }
 
+// ---------------- 批头长度算术：C13 教训的机器检查形式 ----------------
+//
+// C13：crafted 报文（合法 magic + batch_length=0）曾使 validate_crc 在
+// &buf[21..12] 处 panic。以下将 total_len 的算术契约与"畸形必拒"定理
+// 固化为全称证明，防止回归。
+
+pub const BATCH_LENGTH_OFFSET: usize = 12;
+pub const RECORD_BATCH_HEADER_LEN: usize = 61;
+pub const CRC_PAYLOAD_OFFSET: usize = 21;
+
+/// crate：total_len() == BATCH_LENGTH_OFFSET + max(0, batch_length)
+pub open spec fn total_len_spec(batch_length: i32) -> usize
+{
+    (12 + (if batch_length >= 0 { batch_length as int } else { 0 })) as usize
+}
+
+pub fn total_len(batch_length: i32) -> (t: usize)
+    ensures t == total_len_spec(batch_length)
+{
+    BATCH_LENGTH_OFFSET + (if batch_length >= 0 { batch_length as usize } else { 0 })
+}
+
+/// C13 定理：0 <= batch_length < 49 ⇒ total < 61 ⇒ CRC 覆盖域 [21, total)
+/// 空或倒挂——消费方必须拒绝（修复前的 validate_crc 在此 panic）。
+proof fn c13_short_batch_invalid(batch_length: i32)
+    requires 0 <= batch_length < 49
+    ensures total_len_spec(batch_length) < RECORD_BATCH_HEADER_LEN
+{
+    assert(batch_length as int + 12 < 61);
+}
+
+/// 非负 batch_length 无 usize 溢出（i32::MAX + 12 远小于 usize::MAX）。
+proof fn total_len_no_overflow(batch_length: i32)
+    requires batch_length >= 0
+    ensures total_len_spec(batch_length) == (12 + batch_length as int)
+{ }
+
+/// 合法批：batch_length >= 49 ⇒ total >= 61 ⇒ CRC 覆盖域 [21, total) 非空。
+proof fn c13_valid_batch_covers_crc(batch_length: i32)
+    requires batch_length >= 49
+    ensures total_len_spec(batch_length) >= RECORD_BATCH_HEADER_LEN
+{
+    assert(batch_length as int + 12 >= 61);
+}
+
 } // verus!

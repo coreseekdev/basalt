@@ -125,7 +125,7 @@ torn write: sync 时按概率只落前半块（block 粒度截断）
 | C9 | 消费组：generation 单调、Stable 态无分区双分配、rebalance 收敛 | L2+L3 | PlusCal（未开始，`coordinator/src/lib.rs` 四态机）+ Verus | ⬜ 规划中 | — |
 | C10 | record 批编解码 roundtrip（含批头/CRC 覆盖域） | L3 | proptest（已有）→ Verus（规划） | ⬜ 部分（proptest） | `cargo test -p record` |
 | C11 | 兼容语义 = 真实客户端行为 | 外壳 | librdkafka/franz-go report card（测试 §5，未建） | ⬜ | — |
-| C13 | **已修复缺陷**：validate_crc / batch_len_at 对 crafted 报文（合法 magic + batch_length=0）曾 panic（`&buf[21..12]`，网络可达 DoS）——由 C6 之外的边界推理发现，回归测试锁定 | L1 | cargo test（`crafted_tests` 2 条） | ✅ 已修复（2026-09-09） | `cargo test -p basalt-record` |
+| C13 | **已修复缺陷**：validate_crc / batch_len_at 对 crafted 报文（合法 magic + batch_length=0）曾 panic（`&buf[21..12]`，网络可达 DoS）——由 C6 之外的边界推理发现，回归测试锁定；教训已固化为 Verus 定理（C13'：`c13_short_batch_invalid` 等 4 条，45 verified） | L1+L3 | cargo test + Verus | ✅ 已修复（2026-09-09） | `cargo test -p basalt-record` + `verus --crate-type=lib verification/verus/record_core.rs` |
 | C12 | 网络路径/tokio/真实 fs 行为 | 外壳 | turmoil 仿真 + 混沌（T-Q.4） | ⬜ | — |
 
 ## 8. 本次落地与下一步

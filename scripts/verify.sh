@@ -18,6 +18,13 @@ echo "反例按预期检出"
 echo "== Verus record 切片（账本 C5/C6/C6a）=="
 "${VERUS:-verus}" --crate-type=lib verification/verus/record_core.rs
 
+echo "== Kani L1 无 panic 门禁（账本 C13'）=="
+if [ -n "${KANI:-}" ]; then
+    PATH="$HOME/.kani/kani-0.67.0/bin:$PATH" kani verification/kani/record_l1.rs
+else
+    echo "跳过（KANI 未设置）"
+fi
+
 echo "== record 回归（含 C13 crafted 报文）=="
 cargo test -p basalt-record
 

@@ -737,14 +737,19 @@ impl<D: DiskIo> Log<D> {
         }
         // 2) active（或目标段）内截断
         let target_seg = offset >= self.active.base_offset;
+        let mut kept_end = offset;
         if target_seg {
             let seg = &mut self.active;
+            // 批是磁盘最小单元：LEO 目标必须向下取整到批边界（opfuzz C13 同族教训：
+            // 盲设 next_offset = offset 会与保留的批内容错位，重启后恢复按位置
+            // 重排 offset，客户端可见漂移）。仅保留完整位于 offset 之前的批。
             let pos = seg.locate(offset);
-            // 精确对齐：从 pos 起扫批头找 base == offset 的批起点
             let mut exact = pos;
             let mut scan = pos;
             loop {
                 if scan + RECORD_BATCH_HEADER_LEN as u64 > seg.bytes {
+                    // 内容耗尽：全部批都完整位于 offset 之前
+                    kept_end = seg.base_offset + seg.next_rel;
                     break;
                 }
                 let mut hdr = [0u8; RECORD_BATCH_HEADER_LEN];
@@ -753,8 +758,13 @@ impl<D: DiskIo> Log<D> {
                     break;
                 }
                 let Some(h) = BatchHeader::parse(&hdr) else { break };
-                if h.base_offset >= offset {
-                    exact = scan;
+                let end = h.base_offset + h.record_count.max(0) as i64;
+                if end <= offset {
+                    exact = scan + h.total_len() as u64;
+                    kept_end = end;
+                } else {
+                    // 首个跨过 offset 的批：连同其后全部截掉
+                    kept_end = h.base_offset;
                     break;
                 }
                 scan += h.total_len() as u64;
@@ -763,8 +773,13 @@ impl<D: DiskIo> Log<D> {
             self.disk.sync_file(&seg.path)?;
             self.disk.sync_dir(&seg.path)?;
             seg.bytes = exact;
+            let empty_misaligned = seg.bytes == 0 && seg.base_offset != kept_end;
             // 重建内存索引（复用恢复扫描：文件已截断，扫描即重建）
             crate::log::rescan_segment(&self.disk, seg);
+            // 空段且 base 与新 LEO 不对齐：以 kept_end 重建，恢复扫描期望才一致
+            if empty_misaligned {
+                self.active = Segment::new(&self.dir, kept_end);
+            }
         } else {
             // offset 落在 sealed 区：active 整段删除，sealed 收缩
             let _ = self.disk.remove(&self.active.path);
@@ -772,11 +787,11 @@ impl<D: DiskIo> Log<D> {
             let _ = self.disk.remove(&self.active.time_path);
             self.active = Segment::new(&self.dir, offset);
         }
-        self.next_offset = offset;
-        if self.high_watermark > offset {
-            self.high_watermark = offset;
+        self.next_offset = kept_end;
+        if self.high_watermark > kept_end {
+            self.high_watermark = kept_end;
         }
-        tracing::warn!(offset, "log truncated (divergent tail healing)");
+        tracing::warn!(offset, kept_end, "log truncated (divergent tail healing)");
         Ok(())
     }
 

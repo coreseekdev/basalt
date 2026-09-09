@@ -140,8 +140,12 @@ impl DiskIo for SimDisk {
         Ok(())
     }
     fn len(&self, path: &Path) -> Result<u64> {
+        // 与 read_at/read_all 的 page-cache 语义一致：committed + pending。
+        // 只返回 pending 会让 crash（清 pending）后 seg.bytes=0，
+        // Log::open 的簿记与 roll 的空段判定全部失真。
         let files = self.inner.files.lock().unwrap();
-        Ok(files.get(path).map(|f| f.pending.len() as u64).unwrap_or(0))
+        let Some(f) = files.get(path) else { return Ok(0) };
+        Ok((f.committed.len() + f.pending.len()) as u64)
     }
     fn truncate(&self, path: &Path, size: u64) -> Result<()> {
         let mut files = self.inner.files.lock().unwrap();

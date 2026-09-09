@@ -131,11 +131,15 @@ fn run_seed(seed: u64, torn: f64) {
             8 => {
                 // crash + reopen：无 Drop 副作用，直接弃置后崩溃仿真（掉电语义）
                 let leo_before = log.next_offset;
-                ops.push(format!("{step}:crash(leo={leo_before},start={})", log.log_start_offset));
+                let start_before = log.log_start_offset();
+                ops.push(format!("{step}:crash(leo={leo_before},start={start_before})"));
                 drop(log);
                 disk.crash();
                 log = Log::open(disk.clone(), dir.clone(), opts.clone()).unwrap();
-                assert!(log.next_offset <= leo_before, "crash 后 LEO 不得超前");
+                if log.next_offset > leo_before {
+                    panic!("chaos crash 后 LEO 超前（seed={seed}, torn={torn}, leo_before={leo_before}, start_before={start_before}, reopen={}, ops={ops:?})",
+                        log.next_offset);
+                }
                 if !chaos {
                     // SyncEach：ack 即持久，LEO 精确保
                     assert_eq!(log.next_offset, leo_before,
@@ -153,7 +157,9 @@ fn run_seed(seed: u64, torn: f64) {
                 if rng.below(2) == 0 {
                     ops.push(format!("{step}:truncate({to})"));
                     let _ = log.truncate_to(to);
-                    tracked.clear(); // 批对齐向下取整：跨线批可能被截，保守重置
+                    // 批对齐：kept_end = log.next_offset，之前的批全部保留
+                    tracked.retain(|t| t.last_offset < log.next_offset);
+                    synced_upto = synced_upto.min(log.next_offset);
                 } else {
                     ops.push(format!("{step}:delete({to})"));
                     let _ = log.delete_records(to);
@@ -174,20 +180,40 @@ fn run_seed(seed: u64, torn: f64) {
         assert!(log.next_offset >= synced_upto, "收尾：已 sync 数据丢失");
     }
 
-    // 安全断言（两档通用）：从 log_start 全量读必须成功、批流 CRC 合法且连续
+    if !chaos && !tracked.is_empty() {
+        // 发现③签名检测：有未核对数据时 LEO 不得停在 log_start
+        assert!(log.next_offset > log.log_start_offset(),
+            "重开 LEO 停在 log_start——数据丢失（seed={seed}）");
+    }
+    // 安全断言（两档通用）：跨段循环读全量、批流 CRC 合法且连续
     if log.next_offset <= log.log_start_offset() {
         return; // 恢复后无可读区间：合法状态
     }
-    let from = log.log_start_offset();
-    let r = log.read(from, 1 << 20, &pool).unwrap();
-    assert_batch_stream(&r.data);
+    let mut off = log.log_start_offset();
+    let mut all = BytesMut::new();
+    for _ in 0..1000 {
+        let r = log.read(off, 1 << 20, &pool).expect("读必须成功");
+        if r.data.is_empty() { break; }
+        let mut cnt: i64 = 0;
+        let mut p = 0usize;
+        while p < r.data.len() {
+            let bl = batch_len_at(&r.data[p..]).expect("批流内 batch_len_at 必须成功");
+            if let Some(h) = BatchHeader::parse(&r.data[p..]) { cnt += h.record_count.max(0) as i64; }
+            p += bl;
+        }
+        all.extend_from_slice(&r.data);
+        off = r.first_offset + cnt;
+    }
+    let r = all.freeze();
+    assert_batch_stream(&r);
 
     // 持久断言（clean）：tracked 标签按序全部可读回
     if !chaos {
-        let text = String::from_utf8_lossy(&r.data).to_string();
+        let text = String::from_utf8_lossy(&r).to_string();
         let mut cursor = 0usize;
+        let log_start = log.log_start_offset();
         for t in &tracked {
-            if t.last_offset < from { continue; }
+            if t.last_offset < log_start { continue; }
             match text[cursor..].find(&t.payload) {
                 Some(pos) => cursor += pos + t.payload.len(),
                 None => panic!("已 sync 追加丢失: {}（seed={seed}）", t.payload),
@@ -207,8 +233,19 @@ fn run_seed(seed: u64, torn: f64) {
 /// 修复方向：delete/truncate 保证剩余段链连续，或恢复扫描按 log_start 预热
 /// next_offset。含两处已修复的真实缺陷（SimDisk::len、truncate_to 批对齐）
 /// 与一处已修复的反向删除（truncate_to_front 保留/删除颠倒——均已入库）。
+/// WIP（不计入账本已验证集合）。已修复：SimDisk::len 语义、truncate_to 批对齐、
+/// truncate_to_front 保留/删除颠倒（含确定回归 log_test 2 条）。
+/// 剩余义务（复现序列已捕获，见 panic 输出 ops=...）：
+/// 1. clean seed=1：delete/truncate 降低 LEO 后，重开 LEO 仍 < synced_upto
+///    （已修 synced_upto 未随 truncate 下调的模型缺陷，仍失败——疑恢复扫描
+///    与前缀截断/段提升的 base 对齐交互）；
+/// 2. chaos seed=95028：delete(3) 后 crash(leo=4,start=3)，重开 LEO=8 > 4
+///    ——LEO 复活，疑 checkpoint 快速路径信任的段尺寸与前缀截断后的实际
+///    内容错位，或 straddler base 未随前缀删除 rebase。
+/// 修复方向：delete/truncate 后统一 rebase 段（base 对齐 log_start）并禁用
+/// 该状态的 checkpoint 快速路径；或恢复扫描按批头 base 校验连续性。
 #[test]
-#[ignore = "WIP: delete/truncate/roll/crash 交互——见函数注释"]
+#[ignore = "WIP: delete/truncate/roll/crash 交互 2 项——见函数注释"]
 fn opfuzz_clean_seeds() {
     for seed in 1..=40u64 {
         run_seed(seed, 0.0);
@@ -216,7 +253,7 @@ fn opfuzz_clean_seeds() {
 }
 
 #[test]
-#[ignore = "WIP: 依赖 clean 档闭合"]
+#[ignore = "WIP: LEO 复活——见 clean 注释义务 2"]
 fn opfuzz_chaos_seeds() {
     for seed in 1..=20u64 {
         let torn = if seed % 2 == 0 { 0.05 } else { 0.15 };

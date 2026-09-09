@@ -125,3 +125,82 @@ fn absolute_policy_for_replication() {
     assert_eq!(log.next_offset, 4);
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+/// P0 探针回归（review-storage-c7-20260909）：delete_records 保留 >= offset
+/// 数据、跨 crash+reopen 与 log_start 持久化。
+#[test]
+fn delete_records_keeps_suffix_across_reopen() {
+    let dir = tmpdir("c7-delete");
+    let disk = StdDisk::new();
+    let mut log = Log::open(
+        disk,
+        dir.clone(),
+        LogOptions { segment_max_bytes: 4096, fsync: FsyncSchedule::SyncEach, retention_ms: 0, retention_max_bytes: 0 },
+    )
+    .unwrap();
+    let pool = BufferPool::new();
+    for i in 0..5u64 {
+        let raw = batch_bytes(0, 2, &format!("m{i}"));
+        log.append(&raw, AssignPolicy::Assign, 1000).unwrap();
+    }
+    assert_eq!(log.next_offset, 10);
+
+    log.delete_records(9).unwrap();
+    assert_eq!(log.log_start_offset(), 9);
+    // 删除后 9..10 仍可读
+    let r = log.read(9, 1 << 20, &pool).unwrap();
+    assert!(r.data.len() > 0);
+
+    // crash + reopen（SyncEach：ack 即持久；log_start 不得回退）
+    drop(log);
+    let mut log = Log::open(
+        StdDisk::new(),
+        dir.clone(),
+        LogOptions { segment_max_bytes: 4096, fsync: FsyncSchedule::SyncEach, retention_ms: 0, retention_max_bytes: 0 },
+    )
+    .unwrap();
+    assert_eq!(log.log_start_offset(), 9, "log_start 必须持久化");
+    assert_eq!(log.next_offset, 10, ">= offset 的数据不得丢失");
+    let r = log.read(9, 1 << 20, &pool).unwrap();
+    assert!(r.data.len() > 0);
+}
+
+/// P0 探针回归（review-storage-c7-20260909 P0-2）：truncate_to 落在 sealed 区——
+/// 批对齐向下取整、包含 offset 的段提升为 active、重开不复活。
+#[test]
+fn truncate_to_sealed_region_batch_aligned() {
+    let dir = tmpdir("c7-trunc");
+    let disk = StdDisk::new();
+    let mut log = Log::open(
+        disk,
+        dir.clone(),
+        LogOptions { segment_max_bytes: 4096, fsync: FsyncSchedule::SyncEach, retention_ms: 0, retention_max_bytes: 0 },
+    )
+    .unwrap();
+    for i in 0..5u64 {
+        let raw = batch_bytes(0, 2, &format!("m{i}"));
+        log.append(&raw, AssignPolicy::Assign, 1000).unwrap();
+    }
+    assert_eq!(log.next_offset, 10);
+    // roll：batch[0..2] sealed，active base=6
+    log.roll().unwrap();
+    assert_eq!(log.next_offset, 10);
+
+    // offset=3 落在 sealed [0,6) 内：批对齐向下取整 → LEO=2
+    log.truncate_to(3).unwrap();
+    assert_eq!(log.next_offset, 2, "批对齐：LEO 向下取整到批边界");
+
+    // crash + reopen：不得复活
+    drop(log);
+    let log = Log::open(
+        StdDisk::new(),
+        dir.clone(),
+        LogOptions { segment_max_bytes: 4096, fsync: FsyncSchedule::SyncEach, retention_ms: 0, retention_max_bytes: 0 },
+    )
+    .unwrap();
+    assert_eq!(log.next_offset, 2, "截断不得在重开后复活");
+    let pool = BufferPool::new();
+    let r = log.read(0, 1 << 20, &pool).unwrap();
+    assert_eq!(r.first_offset, 0);
+    assert!(r.data.len() > 0 && r.data.len() < 4096);
+}

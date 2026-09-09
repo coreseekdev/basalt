@@ -103,13 +103,27 @@ impl<D: DiskIo> Log<D> {
     /// 打开/恢复一个分区日志目录。
     pub fn open(disk: D, dir: std::path::PathBuf, opts: LogOptions) -> Result<Log<D>> {
         disk.create_dir_all(&dir)?;
-        // 恢复 checkpoint：{base:file_size} 匹配则跳过 CRC 全扫
+        // 恢复 checkpoint：{base:file_size} 匹配则跳过 CRC 全扫；
+        // start:<offset> 行持久化 log_start_offset（P1-1，删除/retention 后重写）
+        let mut persisted_start: Option<i64> = None;
         let cp: std::collections::HashMap<i64, u64> = std::fs::read_to_string(dir.join("recovery.checkpoint"))
             .ok()
-            .map(|data| data.lines().filter_map(|l| {
-                let mut it = l.split(':');
-                Some((it.next()?.parse().ok()?, it.next()?.parse().ok()?))
-            }).collect())
+            .map(|data| {
+                let mut map = std::collections::HashMap::new();
+                for l in data.lines() {
+                    if let Some(v) = l.strip_prefix("start:") {
+                        if let Ok(v) = v.parse() { persisted_start = Some(v); }
+                        continue;
+                    }
+                    let mut it = l.split(':');
+                    if let (Some(b), Some(sz)) = (it.next(), it.next()) {
+                        if let (Ok(b), Ok(sz)) = (b.parse(), sz.parse()) {
+                            map.insert(b, sz);
+                        }
+                    }
+                }
+                map
+            })
             .unwrap_or_default();
         let mut segs: Vec<Segment> = Vec::new();
         for name in disk.list(&dir)? {
@@ -174,7 +188,11 @@ impl<D: DiskIo> Log<D> {
             sealed.push(seg.clone());
         }
         let active = sealed.pop().unwrap_or_else(|| Segment::new(&dir, next_offset));
-        let log_start_offset = sealed.first().map(|s| s.base_offset).unwrap_or(active.base_offset);
+        let derived_start = sealed.first().map(|s| s.base_offset).unwrap_or(active.base_offset);
+        let log_start_offset = persisted_start
+            .map(|s| s.max(derived_start))
+            .unwrap_or(derived_start)
+            .min(next_offset);
 
         let log = Log {
             disk,
@@ -190,12 +208,8 @@ impl<D: DiskIo> Log<D> {
             batch_staging: BytesMut::new(),
             epoch_history: vec![(0, next_offset)],
         };
-        // 写恢复 checkpoint（下次启动跳过 CRC 全扫）
-        let mut cp_content = String::new();
-        for seg in &log.sealed {
-            cp_content.push_str(&format!("{}:{}\n", seg.base_offset, seg.bytes));
-        }
-        let _ = std::fs::write(log.dir.join("recovery.checkpoint"), &cp_content);
+        // 写恢复 checkpoint（下次启动跳过 CRC 全扫；含 log_start 持久化）
+        log.persist_checkpoint();
 
         tracing::info!(
             dir = %log.dir.display(),
@@ -596,7 +610,13 @@ impl<D: DiskIo> Log<D> {
         Ok(self.log_start_offset)
     }
 
-    /// 截断 front：删除 < offset 的段，保留 >= offset 的数据。
+    /// 删除 < offset 的记录（DeleteRecords 语义，Kafka 同型）：
+    /// - 整段位于 offset 之前的段整体删除；
+    /// - 包含 offset 的段文件不动（读取按 log_start_offset 过滤，
+    ///   ReadResult 整批返回由客户端过滤）；
+    /// - log_start_offset 持久化于 recovery.checkpoint（P1-1）。
+    /// （opfuzz C7' 实证：文件 truncate 无法删前缀，此前"保留前缀截掉后缀"
+    ///   的实现精确反向——整段删除语义下该问题不再存在。）
     fn truncate_to_front(&mut self, offset: i64) -> Result<()> {
         let mut removed = 0usize;
         while let Some(seg) = self.sealed.first() {
@@ -610,59 +630,22 @@ impl<D: DiskIo> Log<D> {
                 break;
             }
         }
-        if let Some(seg) = self.sealed.first_mut() {
-            if seg.base_offset < offset && seg.base_offset + seg.next_rel > offset {
-                let rel = (offset - seg.base_offset) as i64;
-                let data = self.disk.read_all(&seg.path)?;
-                // 删除整批位于 offset 之前的前缀；包含 offset 的批整批保留
-                // （读取时按 log_start_offset 过滤）。opfuzz C7' 发现原实现
-                // 条件写反：保留了 < offset 的前缀、删掉了 >= offset 的全部数据。
-                let mut p = 0usize;
-                let mut rel_cur: i64 = 0;
-                while p + RECORD_BATCH_HEADER_LEN <= data.len() {
-                    if let Some(h) = BatchHeader::parse(&data[p..]) {
-                        let total = h.total_len();
-                        if total == 0 || p + total > data.len() { break; }
-                        let end = rel_cur + h.record_count.max(0) as i64;
-                        if end > rel { break; }
-                        rel_cur = end;
-                        p += total;
-                    } else { break; }
-                }
-                if p > 0 {
-                    self.disk.truncate(&seg.path, p as u64)?;
-                    seg.bytes = p as u64;
-                    crate::log::rescan_segment(&self.disk, seg);
-                }
-            }
-        }
-        if offset > self.active.base_offset {
-            let rel = (offset - self.active.base_offset) as i64;
-            if rel > 0 && self.active.bytes > 0 {
-                let data = self.disk.read_all(&self.active.path)?;
-                // 同上：删前缀（整批 end <= rel），跨线批保留
-                let mut p = 0usize;
-                let mut rel_cur: i64 = 0;
-                while p + RECORD_BATCH_HEADER_LEN <= data.len() {
-                    if let Some(h) = BatchHeader::parse(&data[p..]) {
-                        let total = h.total_len();
-                        if total == 0 || p + total > data.len() { break; }
-                        let end = rel_cur + h.record_count.max(0) as i64;
-                        if end > rel { break; }
-                        rel_cur = end;
-                        p += total;
-                    } else { break; }
-                }
-                if p > 0 {
-                    self.disk.truncate(&self.active.path, p as u64)?;
-                    self.active.bytes = p as u64;
-                    crate::log::rescan_segment(&self.disk, &mut self.active);
-                }
-            }
-        }
         self.log_start_offset = offset;
+        self.persist_checkpoint();
         tracing::info!(offset, removed_segments = removed, "delete_records");
         Ok(())
+    }
+
+    /// 恢复 checkpoint：段大小表 + log_start（P1-1）。
+    fn persist_checkpoint(&self) {
+        let mut cp = String::new();
+        if self.log_start_offset > 0 {
+            cp.push_str(&format!("start:{}\n", self.log_start_offset));
+        }
+        for seg in &self.sealed {
+            cp.push_str(&format!("{}:{}\n", seg.base_offset, seg.bytes));
+        }
+        let _ = std::fs::write(self.dir.join("recovery.checkpoint"), &cp);
     }
 
     /// 记录 epoch 变更（leader 变更时由 actor 调用）。
@@ -714,6 +697,7 @@ impl<D: DiskIo> Log<D> {
             self.log_start_offset = self.sealed.first()
                 .map(|s| s.base_offset)
                 .unwrap_or(self.active.base_offset);
+            self.persist_checkpoint();
             tracing::info!(deleted, log_start = self.log_start_offset, "retention deleted segments");
         }
         deleted
@@ -747,61 +731,70 @@ impl<D: DiskIo> Log<D> {
             let _ = self.disk.remove(&seg.index_path);
             let _ = self.disk.remove(&seg.time_path);
         }
-        // 2) active（或目标段）内截断
-        let target_seg = offset >= self.active.base_offset;
-        let mut kept_end = offset;
-        if target_seg {
-            let seg = &mut self.active;
-            // 批是磁盘最小单元：LEO 目标必须向下取整到批边界（opfuzz C13 同族教训：
-            // 盲设 next_offset = offset 会与保留的批内容错位，重启后恢复按位置
-            // 重排 offset，客户端可见漂移）。仅保留完整位于 offset 之前的批。
-            let pos = seg.locate(offset);
-            let mut exact = pos;
-            let mut scan = pos;
-            loop {
-                if scan + RECORD_BATCH_HEADER_LEN as u64 > seg.bytes {
-                    // 内容耗尽：全部批都完整位于 offset 之前
-                    kept_end = seg.base_offset + seg.next_rel;
-                    break;
-                }
-                let mut hdr = [0u8; RECORD_BATCH_HEADER_LEN];
-                let n = self.disk.read_at(&seg.path, scan, &mut hdr)?;
-                if n < RECORD_BATCH_HEADER_LEN {
-                    break;
-                }
-                let Some(h) = BatchHeader::parse(&hdr) else { break };
-                let end = h.base_offset + h.record_count.max(0) as i64;
-                if end <= offset {
-                    exact = scan + h.total_len() as u64;
-                    kept_end = end;
-                } else {
-                    // 首个跨过 offset 的批：连同其后全部截掉
-                    kept_end = h.base_offset;
-                    break;
-                }
-                scan += h.total_len() as u64;
+        // 2) offset 落在保留的最后一段内：整段提升为 active，统一批对齐截断
+        //    （P0-2 修复：原实现不删该段数据、以 offset 重建空 active——重开复活）
+        if offset < self.active.base_offset {
+            let old = std::mem::replace(&mut self.active, Segment::new(&self.dir, offset));
+            let _ = self.disk.remove(&old.path);
+            let _ = self.disk.remove(&old.index_path);
+            let _ = self.disk.remove(&old.time_path);
+            if let Some(seg) = self.sealed.pop() {
+                self.active = seg;
             }
-            self.disk.truncate(&seg.path, exact)?;
-            self.disk.sync_file(&seg.path)?;
-            self.disk.sync_dir(&seg.path)?;
-            seg.bytes = exact;
-            let empty_misaligned = seg.bytes == 0 && seg.base_offset != kept_end;
-            // 重建内存索引（复用恢复扫描：文件已截断，扫描即重建）
-            crate::log::rescan_segment(&self.disk, seg);
-            // 空段且 base 与新 LEO 不对齐：以 kept_end 重建，恢复扫描期望才一致
-            if empty_misaligned {
-                self.active = Segment::new(&self.dir, kept_end);
+        }
+        // 清空批量合并缓冲：截断后旧 staging 写入会流错位（P2）
+        self.batch_staging.clear();
+        // 3) active 内批对齐截断：仅保留完整位于 offset 之前的批
+        let seg = &mut self.active;
+        let pos = seg.locate(offset);
+        let mut exact = pos;
+        let mut rel_kept: i64 = 0;
+        let mut scan = pos;
+        loop {
+            if scan + RECORD_BATCH_HEADER_LEN as u64 > seg.bytes {
+                break;
             }
-        } else {
-            // offset 落在 sealed 区：active 整段删除，sealed 收缩
-            let _ = self.disk.remove(&self.active.path);
-            let _ = self.disk.remove(&self.active.index_path);
-            let _ = self.disk.remove(&self.active.time_path);
-            self.active = Segment::new(&self.dir, offset);
+            let mut hdr = [0u8; RECORD_BATCH_HEADER_LEN];
+            let n = self.disk.read_at(&seg.path, scan, &mut hdr)?;
+            if n < RECORD_BATCH_HEADER_LEN {
+                break;
+            }
+            let Some(h) = BatchHeader::parse(&hdr) else { break };
+            let end = h.base_offset + h.record_count.max(0) as i64;
+            if end > offset {
+                break;
+            }
+            rel_kept = end - seg.base_offset;
+            exact = scan + h.total_len() as u64;
+            scan += h.total_len() as u64;
+        }
+        let kept_end = seg.base_offset + rel_kept;
+        self.disk.truncate(&seg.path, exact)?;
+        self.disk.sync_file(&seg.path)?;
+        self.disk.sync_dir(&seg.path)?;
+        seg.bytes = exact;
+        let empty_misaligned = seg.bytes == 0 && seg.base_offset != kept_end;
+        // 重建内存索引（复用恢复扫描：文件已截断，扫描即重建）
+        crate::log::rescan_segment(&self.disk, seg);
+        // 空段且 base 与新 LEO 不对齐：以 kept_end 重建，恢复扫描期望才一致
+        if empty_misaligned {
+            self.active = Segment::new(&self.dir, kept_end);
         }
         self.next_offset = kept_end;
         if self.high_watermark > kept_end {
             self.high_watermark = kept_end;
+        }
+        // P2：epoch 历史按 kept_end 裁尾（end_offset_for_epoch 防虚报）
+        while self
+            .epoch_history
+            .last()
+            .map(|&(_, o)| o > kept_end)
+            .unwrap_or(false)
+        {
+            self.epoch_history.pop();
+        }
+        if self.epoch_history.is_empty() {
+            self.epoch_history.push((0, kept_end));
         }
         tracing::warn!(offset, kept_end, "log truncated (divergent tail healing)");
         Ok(())
@@ -821,6 +814,7 @@ impl<D: DiskIo> Log<D> {
         self.next_offset = 0;
         self.high_watermark = 0;
         self.log_start_offset = 0;
+        self.persist_checkpoint();
         Ok(())
     }
 }

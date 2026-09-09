@@ -88,7 +88,7 @@ Basalt：Rust 版 Kafka 兼容消息流平台
 | T-M2.4 | ⬜ | 复制调优 | 按 follower 聚批、落后副本批量追赶+全局限流、共用心跳 RPC | 3 副本 acks=all 吞吐基线达标；追赶不影响前台 P99（基准） | T-M2.3 | [Redpanda §3](../docs/02-redpanda.md) |
 | T-M2.5 🔬 | ⬜ | 集群仿真场景 | 切主/分区/追赶/hold 重排/in-flight 重复投递五场景接入 harness | 每场景 ≥500 seeds 不丢不重 | T-M2.3 | [测试 §3.2](../docs/11-testing-strategy.md) |
 | T-M2.6 🔬 | ⬜ | ducktape 式混沌 v1 | bounce 矩阵（clean/hard）+ 网络分区注入 + 随机节点操作（1h 档） | 24 种注入组合下不变式全绿 | T-M2.5 | [测试 §7](../docs/11-testing-strategy.md) |
-| T-Q.2 | ⬜ | TLA+ 规约 v1 | 单写者、fencing、epoch 单调、多数派 commit、游标有界不变式的 PlusCal 模型（覆盖 ADR-10 数据面协议） | TLC 模型检查通过并入库（设计变更时重跑） | T-M2.1 | [Walrus §6](../docs/07-walrus.md) |
+| T-Q.2 | ✅ | TLA+ 规约 v1 | 单写者、fencing、epoch 单调、多数派 commit、游标有界不变式的 PlusCal 模型（覆盖 ADR-10 数据面协议） | TLC 模型检查通过并入库（设计变更时重跑） | T-M2.1 | [Walrus §6](../docs/07-walrus.md) |
 
 ## M3 高级语义
 

@@ -402,7 +402,6 @@ fn repro_seed1_minimal() {
 /// empty_misaligned 处理），或 delete/truncate 后强制下一段 append 走
 /// 全量校验慢路径。
 #[test]
-#[ignore = "WIP: batch_io LEO 复活——promotion 路径嫌疑，转储方法就位"]
 fn opfuzz_batch_io_seeds() {
     // P0-2 回归档：batch_io=true 的 roll/staging 交互（code review 二轮实证
     // 旧实现此处 ack 丢失）。clean 无故障 + SyncEach 语义经 flush 修正。

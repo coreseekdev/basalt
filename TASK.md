@@ -42,7 +42,7 @@ Basalt：Rust 版 Kafka 兼容消息流平台
 **版本分界（2026-09-08 决策）**：
 
 - **v1 = M0–M2 + T-M3.1（幂等 producer）**：3 节点集群、acks=all、Classic 消费组、ELR 选举、failover L1。对外发布的第一个可用版本。
-- **v2（依序）**：T-M3.2 事务（直接 TV2）→ T-M3.3/3.4 KIP-848 + cooperative → T-M4.3 分层存储 + 存储模式插件（ADR-11）→ share groups 评估（触发条件：librdkafka 支持落地）。
+- **v2（依序）**：T-M3.2 事务（直接 TV2）→ T-M3.3/3.4 KIP-848 + cooperative → T-M4.3 分层存储 + 存储模式插件（ADR-11）→ share groups 评估（触发条件：librdkafka 支持落地）。**T-M3.2 与 T-M4.3 启动设计前先读 [Arroyo §11](../docs/12-arroyo.md)**（对象存储 manifest/fencing/两段提交协议专项精读，ADR-11 路线的现成参照实现）。
 
 ---
 
@@ -95,7 +95,7 @@ Basalt：Rust 版 Kafka 兼容消息流平台
 | ID | 状态 | 任务 | 产出物 | 验收标准 | 依赖 | 参考 |
 |---|---|---|---|---|---|---|
 | T-M3.1 | ⬜ | 幂等 producer | InitProducerId；PID+epoch+sequence 服务端去重（最近 5 批缓存）；in-flight 限制 | 客户端重试风暴下零重复（仿真+rdkafka 幂等模式） | T-M2.3 | [Kafka §6](../docs/01-apache-kafka.md) |
-| T-M3.2 | ⬜ | 事务 | txn coordinator + 内部日志；事务版本直接 TV2（KIP-890，ADR-9）不做 TV1 兼容；LSO 推进；control record 占 offset 不投递；read_committed 过滤；KIP-447 验证 | read_uncommitted/read_committed 对比专项；abort 后数据不可见但 offset 已消耗 | T-M3.1 | [Kafka §5/§6](../docs/01-apache-kafka.md) |
+| T-M3.2 | ⬜ | 事务 | txn coordinator + 内部日志；事务版本直接 TV2（KIP-890，ADR-9）不做 TV1 兼容；LSO 推进；control record 占 offset 不投递；read_committed 过滤；KIP-447 验证；接管恢复判定纯函数化（Ready/ReplayCommit/Orphaned 三态） | read_uncommitted/read_committed 对比专项；abort 后数据不可见但 offset 已消耗 | T-M3.1 | [Kafka §5/§6](../docs/01-apache-kafka.md) [Arroyo §11](../docs/12-arroyo.md) |
 | T-M3.3 | ⬜ | KIP-848 新消费组协议 | ConsumerGroupHeartbeat、服务端分配、增量 rebalance；Range/RoundRobin/Sticky 分配器 | 新旧协议混布 rebalance 收敛；客户端（kafka-clients 4.x）跑通 | T-M1.1 | [Kafka §5](../docs/01-apache-kafka.md) |
 | T-M3.4 | ⬜ | cooperative-sticky rebalance | 增量 partition 交接协议 | franz-go/rdkafka cooperative 模式跑通且无停顿式双全量 rebalance | T-M3.3 | [生态 §C](../docs/08-ecosystem.md) |
 | T-M3.5 🔬 | ⬜ | 生态真实负载 e2e | 三模板：rdkafka 手动 assign 消费（RW 式）；Vector 式 drain-then-commit；Bento 式 checkpoint_limit 背压 | 模板各自跑通含事务场景；docker-compose 一键拉起 | T-M3.2 | [生态 §A/B/C](../docs/08-ecosystem.md) |
@@ -107,7 +107,7 @@ Basalt：Rust 版 Kafka 兼容消息流平台
 |---|---|---|---|---|---|---|
 | T-M4.1 | ⬜ | 安全 | SASL PLAIN/SCRAM-256/512（rsasl）、TLS（rustls+aws-lc-rs，ADR-13）、ACL（含 IDEMPOTENT_WRITE/CLUSTER） | 三客户端 SASL+TLS 矩阵全绿 | T-M1.5 | [生态 清单](../docs/08-ecosystem.md) |
 | T-M4.2 | ⬜ | 限流与会话 | quota（produce/fetch 带宽）、fetch session、fetch 大小 PID 控制器 | quota 生效有指标；session 复用降低 metadata 压力（基准） | T-M2.4 | [Redpanda §7](../docs/02-redpanda.md) |
-| T-M4.3 | ⬜ | Tiered storage | object_store 抽象；段上传+manifest；start_offset 前移解耦本地/云端保留；读路径 LRU+预取+熔断背压 | 内存 S3 假体全链路单测 + MinIO e2e；冷读正确性 | T-M2.3 | [Redpanda §6](../docs/02-redpanda.md) [KafScale §2](../docs/04-kafscale.md) |
+| T-M4.3 | ⬜ | Tiered storage | object_store 抽象；段上传+manifest（协议对象布局/fencing/GC 三纪律按 [Arroyo §11](../docs/12-arroyo.md) 评审）；start_offset 前移解耦本地/云端保留；读路径 LRU+预取+熔断背压 | 内存 S3 假体全链路单测 + MinIO e2e；冷读正确性 | T-M2.3 | [Redpanda §6](../docs/02-redpanda.md) [KafScale §2](../docs/04-kafscale.md) [Arroyo §11](../docs/12-arroyo.md) |
 | T-M4.4 | ⬜ | 性能工程 | criterion 微基准；端到端基准管线（对标 Kafka/Redpanda）；io_uring 写路径（O_DIRECT+批量提交）与 thread-per-core（compio）评估报告 | 吞吐/延迟基线报表；演进建议（动/不动执行器） | T-M2.4 | [蓝图 §7](../docs/10-rust-blueprint.md) [Iggy §3](../docs/03-iggy.md) |
 | T-M4.5 | ⬜ | 运维工具 | log_parser 离线段检查工具；集群 bootstrap/topic/消费组管理 CLI（对标 rpk 最小集） | 损坏段可检出并定位；CLI 覆盖常用运维动作 | T-M0.3, T-M2.2 | [StoneMQ §5](../docs/06-stonemq.md) |
 | T-M4.6 | ⬜ | 湖仓导出（v2 正式特性，ADR-12） | Kafka batch → Arrow → iceberg-rust 写表管道（REST catalog） | 消息落 Iceberg 表可被 DataFusion 查询 | T-M3.2 | [Nisshi §4](../docs/05-nisshi.md) [iceberg-rust](../docs/08-ecosystem.md) |

@@ -34,3 +34,4 @@ testing/seeds/failing/
 *.key
 *.crt
 *.p12
+basalt-franzgo-e2e

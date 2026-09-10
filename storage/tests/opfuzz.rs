@@ -388,8 +388,13 @@ fn repro_seed1_minimal() {
 /// 仍复现：truncate(9) 批对齐截断（LEO→8）→ append[8,9]（LEO→10）→ roll →
 /// crash 重开 LEO=10 > 8。PRE 逐步转储已就位（dump 条件含 1570935），
 /// 下一轮直接读转储定位截断/append/roll 的簿记交互。
+/// WIP（不计入账本）：batch_io 下 truncate(9)→LEO 8 → append[8,9]（LEO 应
+/// 10）→ roll → crash，但 leo_before 读回 8 而盘面 committed=10——in-memory
+/// next_offset 与盘面在 batch_io 下背离（非 batch_io 路径同序列通过）。
+/// 疑点：truncate_to 清 batch_staging 后 fast path（batch_staging.is_empty()
+/// 条件）与 staging 分支的簿记分流。复现：seed=1570935，ops 见 panic 输出。
 #[test]
-#[ignore = "WIP: batch_io LEO 背离根因——PRE 转储已就位（1570935）"]
+#[ignore = "WIP: batch_io LEO 簿记背离——需专项根因"]
 fn opfuzz_batch_io_seeds() {
     // P0-2 回归档：batch_io=true 的 roll/staging 交互（code review 二轮实证
     // 旧实现此处 ack 丢失）。clean 无故障 + SyncEach 语义经 flush 修正。

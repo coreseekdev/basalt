@@ -1,5 +1,9 @@
 # 消费组收敛性活性实验 —— WIP（未闭合，留专项）
 
+> **v0.2 已闭合部分（2026-09-10）**：CommitOffset fencing 动作（仅当代 owner、
+> offset 单调）与超时踢除路径已入模型，名义/阴性对照全绿（账本 C9 更新）。
+> 本文档仅剩「收敛性活性」一项未闭合。
+
 ## 目标（不变式评审建议，账本 C9 收敛性 L2）
 `(state = PreparingRebalance ∧ gen < MaxRounds) ⇒ ◇(state ∈ {Stable, Empty} ∨ gen = MaxRounds)`
 

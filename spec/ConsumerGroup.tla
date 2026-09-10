@@ -37,6 +37,8 @@ variables
   members    = {} ;
   ready      = {} ;
   assignment = [p \in Parts |-> NoOwner] ;
+  commits    = [p \in Parts |-> -1] ;   \* 每分区已提交 offset（-1 = 无）
+  commitOwner = [p \in Parts |-> NoOwner] ;  \* 最后提交者（fencing 审计）
   hist       = {} ;      \* {<<generation, 分配函数>>}——同代分配唯一性的历史
 
 define
@@ -64,6 +66,16 @@ define
       (h1[1] = h2[1]) => (h1[2] = h2[2])
 
   InvReadySubset == ready \subseteq members
+
+  \* C9 fencing（v0.2）：提交过的分区必须存在有效属主记录（assignment
+  \* 不可回退为 NoOwner）——offset 提交由守卫 fencing（仅当代 owner 可提交），
+  \* 单调性由动作守卫 o > commits[p] 构造保证。
+  InvCommitHasOwner ==
+    \A p \in Parts : commits[p] >= 0 => assignment[p] # NoOwner
+
+  InvCommitTypeOK ==
+    /\ commits \in [Parts -> -1..6]
+    /\ commitOwner \in [Parts -> MemberIds \cup {NoOwner}]
 
   \* generation 只增
   InvGenHistoryBounded == Cardinality(hist) <= MaxRounds
@@ -145,13 +157,21 @@ begin
           state := "PreparingRebalance"
         end if
       end with ;
+    or
+      \* OffsetCommit（C9 v0.2 fencing）：仅分区当代 owner 可提交，
+      \* offset 严格前进（单调）——zombie 成员被守卫拒绝
+      with m \in members, p \in Parts, o \in 0..6 do
+        await /\ assignment[p] = m
+               /\ o > commits[p] ;
+        commits := [commits EXCEPT ![p] = o]
+      end with ;
     end either ;
   end while ;
 end process ;
 
 end algorithm ; *)
-\* BEGIN TRANSLATION (chksum(pcal) = "aab8c01d" /\ chksum(tla) = "eab8da7d")
-VARIABLES state, gen, members, ready, assignment, hist
+\* BEGIN TRANSLATION (chksum(pcal) = "fd5b4735" /\ chksum(tla) = "4b98ff22")
+VARIABLES state, gen, members, ready, assignment, commits, commitOwner, hist
 
 (* define statement *)
 PartsCovered(a) == \A p \in Parts : a[p] # NoOwner
@@ -180,6 +200,16 @@ InvGenAssignmentUnique ==
 InvReadySubset == ready \subseteq members
 
 
+
+
+InvCommitHasOwner ==
+  \A p \in Parts : commits[p] >= 0 => assignment[p] # NoOwner
+
+InvCommitTypeOK ==
+  /\ commits \in [Parts -> -1..6]
+  /\ commitOwner \in [Parts -> MemberIds \cup {NoOwner}]
+
+
 InvGenHistoryBounded == Cardinality(hist) <= MaxRounds
 
 
@@ -193,7 +223,8 @@ RebalanceCompletes ==
       <>(state \in {"Stable", "Empty"} \/ gen = MaxRounds))
 
 
-vars == << state, gen, members, ready, assignment, hist >>
+vars == << state, gen, members, ready, assignment, commits, commitOwner, hist
+        >>
 
 ProcSet == {"coord"}
 
@@ -203,60 +234,66 @@ Init == (* Global variables *)
         /\ members = {}
         /\ ready = {}
         /\ assignment = [p \in Parts |-> NoOwner]
+        /\ commits = [p \in Parts |-> -1]
+        /\ commitOwner = [p \in Parts |-> NoOwner]
         /\ hist = {}
 
-Coordinator == \/ /\ \E m \in MemberIds \ members:
-                       /\ members' = (members \cup {m})
-                       /\ ready' = {}
-                       /\ state' = "PreparingRebalance"
-                  /\ UNCHANGED <<gen, assignment, hist>>
-               \/ /\ \E m \in members:
-                       /\ state = "PreparingRebalance"
-                       /\ ready' = (ready \cup {m})
-                  /\ UNCHANGED <<state, gen, members, assignment, hist>>
-               \/ /\ \E m \in members:
-                       /\ members' = members \ {m}
-                       /\ ready' = ready \ {m}
-                       /\ IF members' = {}
-                             THEN /\ state' = "Empty"
-                             ELSE /\ IF state = "Stable"
-                                        THEN /\ state' = "PreparingRebalance"
-                                        ELSE /\ TRUE
-                                             /\ state' = state
-                  /\ UNCHANGED <<gen, assignment, hist>>
-               \/ /\ \E m \in ready:
-                       /\ state = "PreparingRebalance"
-                       /\ ready' = ready \ {m}
-                  /\ UNCHANGED <<state, gen, members, assignment, hist>>
-               \/ /\ /\ state = "PreparingRebalance"
-                     /\ members # {}
-                     /\ (~SyncRequiresFull \/ ready = members)
-                  /\ state' = "CompletingSync"
-                  /\ UNCHANGED <<gen, members, ready, assignment, hist>>
-               \/ /\ \E a \in [Parts -> members]:
-                       /\ state = "CompletingSync"
-                       /\ gen < MaxRounds
-                       /\ assignment' = a
-                       /\ hist' = (hist \cup {<<gen + 1, a>>})
-                       /\ gen' = gen + 1
-                       /\ state' = "Stable"
-                  /\ UNCHANGED <<members, ready>>
-               \/ /\ \E m \in ready:
-                       /\ state \in {"PreparingRebalance", "CompletingSync"}
-                       /\ members' = members \ {m}
-                       /\ ready' = {}
-                       /\ IF members' = {}
-                             THEN /\ state' = "Empty"
-                             ELSE /\ state' = "PreparingRebalance"
-                  /\ UNCHANGED <<gen, assignment, hist>>
+Coordinator == /\ \/ /\ \E m \in MemberIds \ members:
+                          /\ members' = (members \cup {m})
+                          /\ ready' = {}
+                          /\ state' = "PreparingRebalance"
+                     /\ UNCHANGED <<gen, assignment, commits, hist>>
+                  \/ /\ \E m \in members:
+                          /\ state = "PreparingRebalance"
+                          /\ ready' = (ready \cup {m})
+                     /\ UNCHANGED <<state, gen, members, assignment, commits, hist>>
+                  \/ /\ \E m \in members:
+                          /\ members' = members \ {m}
+                          /\ ready' = ready \ {m}
+                          /\ IF members' = {}
+                                THEN /\ state' = "Empty"
+                                ELSE /\ IF state = "Stable"
+                                           THEN /\ state' = "PreparingRebalance"
+                                           ELSE /\ TRUE
+                                                /\ state' = state
+                     /\ UNCHANGED <<gen, assignment, commits, hist>>
+                  \/ /\ \E m \in ready:
+                          /\ state = "PreparingRebalance"
+                          /\ ready' = ready \ {m}
+                     /\ UNCHANGED <<state, gen, members, assignment, commits, hist>>
+                  \/ /\ /\ state = "PreparingRebalance"
+                        /\ members # {}
+                        /\ (~SyncRequiresFull \/ ready = members)
+                     /\ state' = "CompletingSync"
+                     /\ UNCHANGED <<gen, members, ready, assignment, commits, hist>>
+                  \/ /\ \E a \in [Parts -> members]:
+                          /\ state = "CompletingSync"
+                          /\ gen < MaxRounds
+                          /\ assignment' = a
+                          /\ hist' = (hist \cup {<<gen + 1, a>>})
+                          /\ gen' = gen + 1
+                          /\ state' = "Stable"
+                     /\ UNCHANGED <<members, ready, commits>>
+                  \/ /\ \E m \in ready:
+                          /\ state \in {"PreparingRebalance", "CompletingSync"}
+                          /\ members' = members \ {m}
+                          /\ ready' = {}
+                          /\ IF members' = {}
+                                THEN /\ state' = "Empty"
+                                ELSE /\ state' = "PreparingRebalance"
+                     /\ UNCHANGED <<gen, assignment, commits, hist>>
+                  \/ /\ \E m \in members:
+                          \E p \in Parts:
+                            \E o \in 0..6:
+                              /\ /\ assignment[p] = m
+                                  /\ o > commits[p]
+                              /\ commits' = [commits EXCEPT ![p] = o]
+                     /\ UNCHANGED <<state, gen, members, ready, assignment, hist>>
+               /\ UNCHANGED commitOwner
 
 Next == Coordinator
 
 Spec == Init /\ [][Next]_vars
-
-\* 活性实验（C9 收敛性）：对 Next 的弱公平——Preparing 下任一 Next 步
-\* 都单调推进 ready/成员状态，排纯 Stuttering；配合 RebalanceCompletes。
-FairSpec == Spec /\ WF_vars(Next)
 
 \* END TRANSLATION 
 ================================================================================

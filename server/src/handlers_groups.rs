@@ -16,9 +16,25 @@ fn coord_err(e: CoordError) -> Value {
 // ---------- FindCoordinator ----------
 
 pub async fn find_coordinator(version: i16, req: &basalt_protocol::value::Struct, ctx: &Ctx) -> Value {
-    // CoordinatorType: 0 = group（v1+）；统一返回本节点
-    let _key = req.get("CoordinatorKey").map(|v| v.as_str().to_string());
+    // v0-3：Key（单 string）；v4+：CoordinatorKeys（[]string 批量）。
+    // 响应 v4+ Coordinators[].Key 必须逐条回显请求 key（franz-go 按其匹配，
+    // 回显空串 = "coordinator was not returned"）。KeyType 统一 group（0）。
     let _ = version;
+    let keys: Vec<String> = match req.get("CoordinatorKeys") {
+        Some(Value::Array(ks)) => ks.iter().map(|k| k.as_str().to_string()).collect(),
+        _ => vec![req.get("Key").map(|v| v.as_str().to_string()).unwrap_or_default()],
+    };
+    let mut coordinators = Vec::new();
+    for k in &keys {
+        coordinators.push(s([
+            ("Key", Value::str(k.clone())),
+            ("NodeId", Value::I32(ctx.node_id)),
+            ("Host", Value::str(ctx.host.clone())),
+            ("Port", Value::I32(ctx.port as i32)),
+            ("ErrorCode", Value::I16(ErrorCode::None as i16)),
+            ("ErrorMessage", Value::Null),
+        ]));
+    }
     s([
         ("ThrottleTimeMs", Value::I32(0)),
         ("ErrorCode", Value::I16(ErrorCode::None as i16)),
@@ -26,14 +42,7 @@ pub async fn find_coordinator(version: i16, req: &basalt_protocol::value::Struct
         ("NodeId", Value::I32(ctx.node_id)),
         ("Host", Value::str(ctx.host.clone())),
         ("Port", Value::I32(ctx.port as i32)),
-        ("Coordinators", Value::Array(vec![s([
-            ("Key", Value::str(_key.unwrap_or_default())),
-            ("NodeId", Value::I32(ctx.node_id)),
-            ("Host", Value::str(ctx.host.clone())),
-            ("Port", Value::I32(ctx.port as i32)),
-            ("ErrorCode", Value::I16(ErrorCode::None as i16)),
-            ("ErrorMessage", Value::Null),
-        ])])),
+        ("Coordinators", Value::Array(coordinators)),
     ])
 }
 

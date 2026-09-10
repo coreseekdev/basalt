@@ -445,7 +445,11 @@ impl<D: DiskIo> Log<D> {
 
     /// 滚动：持久化索引，active → sealed；新段目录项随数据 fsync（P2 修复）。
     pub fn roll(&mut self) -> Result<()> {
-        if self.active.bytes == 0 && self.active.next_rel == 0 && !self.sealed.is_empty() {
+        // 空 active 封存是无条件 no-op：封存会创建与 active 同 base 的新段
+        // （next_offset == active.base 时路径重合），两个 Segment 对象共享
+        // 同一路径，任何一侧的文件删除都会炸掉另一侧的数据
+        // （opfuzz seed=1 实证：delete 删 sealed 空段文件 = 删 active 数据）。
+        if self.active.bytes == 0 && self.active.next_rel == 0 {
             return Ok(());
         }
         self.active.persist_indexes(&self.disk)?;

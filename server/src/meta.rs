@@ -485,3 +485,9 @@ impl FollowerPull {
         *self.stop_rx.borrow()
     }
 }
+
+
+// ===================== 协议 handler 布局回归（永久机制，五轮 review 沉淀）====
+#[cfg(test)]
+#[path = "handlers_layout_tests.rs"]
+mod handlers_layout_tests;

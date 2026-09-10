@@ -254,7 +254,13 @@ pub async fn offset_fetch(req: &basalt_protocol::value::Struct, version: i16, ct
 
         let topics: Vec<(String, Option<Vec<i32>>)> = match topic_filter {
             Some(ts) => ts.clone(),
-            None => all_topics.iter().map(|n| (n.clone(), None)).collect(),
+            // null 请求 = 该组全部：只回**有已提交 offset** 的 topic（Kafka 语义；
+            // 五轮探针实证——未知组/无提交组回路由全集属语义偏离）
+            None => all_topics
+                .iter()
+                .filter(|n| committed.iter().any(|o| o.topic == **n))
+                .map(|n| (n.clone(), None))
+                .collect(),
         };
         let mut tvals = Vec::new();
         for (name, parts) in &topics {

@@ -329,8 +329,23 @@ impl<D: DiskIo> Log<D> {
         if pendings.is_empty() {
             return Err(StorageError::Other("no valid batches".into()));
         }
+        // ---- 回滚检查点（fast path 与阶段 2 共用；构造本身零副作用） ----
+        let cp = Checkpoint {
+            next_offset: self.next_offset,
+            sealed_len: self.sealed.len(),
+            staged_len: self.batch_staging.len(),
+            active: ActiveCheckpoint {
+                base: self.active.base_offset,
+                bytes: self.active.bytes,
+                next_rel: self.active.next_rel,
+                offset_ix_len: self.active.offset_index.entries.len(),
+                time_ix_len: self.active.time_index.entries.len(),
+                bytes_since_index: self.active.bytes_since_index_snapshot(),
+            },
+        };
 
-        // ---- Fast path：单批次 + 无需 patch + 适配当前段 → 直接写 raw（零 staging 拷贝） ----
+        // ---- Fast path：单批次 + 无需 patch + 适配当前段 → 免去阶段 2 的
+        //      checkpoint/循环开销（零 staging 拷贝或 batch_io 收编） ----
         if pendings.len() == 1 {
             let pd = &pendings[0];
             let needs_roll = self.active.next_rel > 0
@@ -339,15 +354,38 @@ impl<D: DiskIo> Log<D> {
                 && raw[0..8] != pd.assigned.to_be_bytes();
 
             if !needs_roll && !needs_patch && self.batch_staging.is_empty() {
-                // 直接写 raw 到磁盘（无中间缓冲）
-                self.disk.append(&self.active.path, raw)?;
+                if self.batch_io {
+                    // batch_io：窗口语义优先（四轮 review P1-2 溯源）——直写
+                    // 磁盘会绕过窗口，settle 前数据已可持久；收编进 staging，
+                    // 与多批路径同在 end_batch_window 统一写盘。
+                    self.batch_staging.extend_from_slice(&raw[pd.src.0..pd.src.1]);
+                    self.active.push_batch(pd.total, pd.count, pd.max_ts);
+                    self.next_offset = pd.assigned + pd.count;
+                    if !self.replicated && self.high_watermark < self.next_offset {
+                        self.high_watermark = self.next_offset;
+                    }
+                    return Ok(AppendResult {
+                        base_offset: pd.assigned,
+                        last_offset: pd.assigned + pd.count - 1,
+                        log_append_time: now_ms,
+                    });
+                }
+                // 直接写 raw 到磁盘（无中间缓冲）。append 失败时零内存变更；
+                // SyncEach 失败时数据已写盘——必须 checkpoint 回滚 + 截盘，
+                // 否则错误应答的数据滞留盘上（僵尸数据，四轮 review P1-2）
+                if let Err(e) = self.disk.append(&self.active.path, raw) {
+                    return Err(e);
+                }
                 self.active.push_batch(pd.total, pd.count, pd.max_ts);
                 self.next_offset = pd.assigned + pd.count;
                 if !self.replicated && self.high_watermark < self.next_offset {
                     self.high_watermark = self.next_offset;
                 }
                 if self.opts.fsync == FsyncSchedule::SyncEach {
-                    self.disk.sync_file(&self.active.path)?;
+                    if let Err(e) = self.disk.sync_file(&self.active.path) {
+                        self.rollback_to(&cp, true);
+                        return Err(e);
+                    }
                 }
                 return Ok(AppendResult {
                     base_offset: pd.assigned,
@@ -358,18 +396,6 @@ impl<D: DiskIo> Log<D> {
         }
 
         // ---- 阶段 2：落盘 + 内存应用（checkpoint 回滚保护） ----
-        let cp = Checkpoint {
-            next_offset: self.next_offset,
-            sealed_len: self.sealed.len(),
-            active: ActiveCheckpoint {
-                base: self.active.base_offset,
-                bytes: self.active.bytes,
-                next_rel: self.active.next_rel,
-                offset_ix_len: self.active.offset_index.entries.len(),
-                time_ix_len: self.active.time_index.entries.len(),
-                bytes_since_index: self.active.bytes_since_index_snapshot(),
-            },
-        };
         let log_append_time = now_ms;
         let mut staging = BytesMut::new();
         let mut base_assigned: Option<i64> = None;
@@ -419,7 +445,11 @@ impl<D: DiskIo> Log<D> {
                 last_err = Some(e);
             }
         }
-        if !rollback && self.opts.fsync == FsyncSchedule::SyncEach {
+        // SyncEach 档的逐追加持久：仅非 batch_io 生效。batch_io 的持久化点
+        // 是 end_batch_window（flush 后补 sync）——窗口内 staging 尚未写盘，
+        // 此处 sync 无物可持久（StdDisk 对不存在文件 sync 还会 NotFound，
+        // 四轮 review P2-3）。
+        if !rollback && self.opts.fsync == FsyncSchedule::SyncEach && !self.batch_io {
             if let Err(e) = self.disk.sync_file(&self.active.path) {
                 rollback = true;
                 last_err = Some(e);
@@ -476,7 +506,13 @@ impl<D: DiskIo> Log<D> {
         if self.batch_staging.is_empty() {
             return Ok(());
         }
-        self.disk.append(&self.active.path, &self.batch_staging)?;
+        // 写失败时保留 staging：字节归属由调用方裁决——
+        //   · roll() 内部 flush 失败 → append 回滚路径按 cp.staged_len 截除；
+        //   · 窗口收口（end_batch_window/sync）失败 → 窗口内全部 produce
+        //     按错误结算，staging 整体丢弃（见下）。
+        if let Err(e) = self.disk.append(&self.active.path, &self.batch_staging) {
+            return Err(e);
+        }
         self.batch_staging.clear();
         Ok(())
     }
@@ -492,19 +528,37 @@ impl<D: DiskIo> Log<D> {
     /// DirectDisk（O_DIRECT，M4 预留）= 设备写 + FLUSH CACHE。
     /// 禁止假设缓冲 I/O 特有行为（如"未 fsync 仍可读"作为持久性依据）。
     pub fn sync(&mut self) -> Result<()> {
-        self.flush_batch()?;
-        self.disk.sync_file(&self.active.path)
+        if let Err(e) = self.flush_batch() {
+            self.batch_staging.clear();
+            return Err(e);
+        }
+        self.sync_active_data()
     }
 
     /// batch_io 窗口收口（ADR-14）：排空 staging；SyncEach 档补 fsync。
     /// 窗口内 produce 的应答必须在本调用成功后发放——否则存在
     /// "ack 而未写文件"窗口（opfuzz batch_io 档实证）。
     pub fn end_batch_window(&mut self) -> Result<()> {
-        self.flush_batch()?;
+        if let Err(e) = self.flush_batch() {
+            // 收口失败：调用方（partition actor）把窗口内全部 produce 按
+            // 错误结算——staged 字节必须整体丢弃。保留则下一窗口 flush
+            // 把错误结算的数据带出（僵尸数据，四轮 review P1-2）。
+            self.batch_staging.clear();
+            return Err(e);
+        }
         if self.opts.fsync == FsyncSchedule::SyncEach {
-            self.disk.sync_file(&self.active.path)?;
+            self.sync_active_data()?;
         }
         Ok(())
+    }
+
+    /// 空段跳过 sync：文件可能尚未创建（DiskIo 实现对不存在文件的行为
+    /// 各异，SimDisk no-op / StdDisk NotFound），且无数据即无持久化语义。
+    fn sync_active_data(&self) -> Result<()> {
+        if self.active.bytes == 0 && self.active.next_rel == 0 {
+            return Ok(());
+        }
+        self.disk.sync_file(&self.active.path)
     }
 
     // ---------- 读路径 ----------
@@ -562,7 +616,10 @@ impl<D: DiskIo> Log<D> {
             }
             let Some(h) = BatchHeader::parse(&raw[pos..]) else { break };
             let total = h.total_len() as usize;
-            if total == 0 || pos + total > raw.len() {
+            if total == 0 {
+                break;
+            }
+            if pos + total > raw.len() {
                 // 批体越窗且尚未返回任何批：补读批体（保持旧实现
                 // "首批即便超预算/超窗口也整批带上"，防消费活锁——三轮 P1-1）
                 if out.is_empty() && start_pos + ((pos as u64) + (total as u64)) <= seg.bytes {
@@ -571,6 +628,11 @@ impl<D: DiskIo> Log<D> {
                     raw.resize(raw.len() + need, 0);
                     let got = self.disk.read_at(&seg.path, abs, &mut raw[pos..]).unwrap_or(0);
                     raw.truncate(pos + got);
+                    if pos + total <= raw.len() {
+                        // 补读到位：回到解析（四轮 P1-1——此前无条件 break，
+                        // 大批 + 小 max_bytes 消费者拿到永久空响应活锁）
+                        continue;
+                    }
                 }
                 break;
             }
@@ -788,6 +850,11 @@ impl<D: DiskIo> Log<D> {
     /// 截断到 `offset`（含）之前的数据：丢弃 >= offset 的所有批与后续段。
     /// 用于 follower 分叉尾巴自愈与新 leader 清理未提交尾巴。
     pub fn truncate_to(&mut self, offset: i64) -> Result<()> {
+        // batch_io 窗口内截断：先收口排空 staging（四轮 review P1-3）——
+        // 否则完整位于 offset 之下的 staged 批被直接 clear，它们从未写盘
+        // 却被按"低于截断点=保留"结算，形成"ack 成功但数据从未落盘"。
+        // 收口后截断语义统一作用于已写盘内容；空 staging 时本调用为 no-op。
+        self.end_batch_window()?;
         if offset >= self.next_offset {
             return Ok(()); // 无需截断
         }
@@ -915,6 +982,9 @@ fn rescan_segment<D: DiskIo>(disk: &D, seg: &mut Segment) {
 struct Checkpoint {
     next_offset: i64,
     sealed_len: usize,
+    /// 本 append 开始时 batch_staging 的长度：回滚只需截除本 append
+    /// 收编的字节，更早窗口字节仍属未结算的 produce（ADR-14）
+    staged_len: usize,
     active: ActiveCheckpoint,
 }
 
@@ -931,6 +1001,11 @@ impl<D: DiskIo> Log<D> {
     fn rollback_to(&mut self, cp: &Checkpoint, wrote_any: bool) {
         // 内存状态回滚
         self.next_offset = cp.next_offset;
+        // 截除本 append 收编进 staging 的字节（若有）：留则随窗口收口落盘，
+        // 错误应答的数据可读（僵尸）+ offset 双批（四轮 review P1-2）。
+        // 注意只能截到 cp.staged_len——更早窗口字节属未结算 produce，
+        // 必须保留随窗口正常落盘（本层不感知应答类型，ADR-14）。
+        self.batch_staging.truncate(cp.staged_len);
         // 清理 roll 遗留的孤儿段文件（append 中途 roll 产生的新段）
         while self.sealed.len() > cp.sealed_len {
             let orphan = self.sealed.pop().unwrap();

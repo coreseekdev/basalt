@@ -26,6 +26,8 @@ pub struct SimDiskInner {
     pub torn_write_prob: f64,
     pub enospc_after: u64,
     pub fail_prob: f64,
+    /// 确定性写失败开关（append/sync 一律报错）——回归测试的瞬时故障注入点。
+    fail_writes: std::sync::atomic::AtomicBool,
 }
 
 #[derive(Clone)]
@@ -56,6 +58,15 @@ impl SimDisk {
         for f in files.values_mut() {
             f.pending.clear();
         }
+    }
+
+    /// 确定性写失败开关：开启后 append/sync_file 一律返回错误。
+    /// 用于回归测试在精确的调用点注入瞬时 IO 故障（fail_prob 是概率性的，
+    /// 无法锁定"哪一次写失败"）。
+    pub fn set_fail_writes(&self, on: bool) {
+        self.inner
+            .fail_writes
+            .store(on, std::sync::atomic::Ordering::Relaxed);
     }
 
     /// 读取 committed 数据（排除 pending）。
@@ -111,7 +122,12 @@ impl DiskIo for SimDisk {
         Ok(out)
     }
     fn append(&self, path: &Path, data: &[u8]) -> Result<u64> {
-        if self.should_fail() {
+        if self.should_fail()
+            || self
+                .inner
+                .fail_writes
+                .load(std::sync::atomic::Ordering::Relaxed)
+        {
             return Err(StorageError::Other("simulated IO failure".into()));
         }
         let wc = self.inner.write_count.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
@@ -124,7 +140,12 @@ impl DiskIo for SimDisk {
         Ok((f.pending.len()) as u64)
     }
     fn sync_file(&self, path: &Path) -> Result<()> {
-        if self.should_fail() {
+        if self.should_fail()
+            || self
+                .inner
+                .fail_writes
+                .load(std::sync::atomic::Ordering::Relaxed)
+        {
             return Err(StorageError::Other("simulated sync failure".into()));
         }
         let mut files = self.inner.files.lock().unwrap();

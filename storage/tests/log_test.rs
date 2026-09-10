@@ -239,3 +239,164 @@ fn append_rejects_malformed_batch_length() {
     let raw = batch_bytes(0, 2, "ok");
     log.append(&raw, AssignPolicy::Assign, 1002).unwrap();
 }
+
+// ==================== 四轮 code review（docs/review-adr14-pool-20260910.md）回归 ====================
+
+use basalt_storage::log::ReadCap;
+use basalt_storage::sim_disk::SimDisk;
+
+/// P1-1：read_ex 首批批体越过读窗口时曾无条件 break——补读结果从不参与
+/// 解析，返回空数据 + HW 前探。小 max_bytes 消费者拉到大批分区永久活锁。
+#[test]
+fn read_ex_large_batch_small_max_bytes_returns_batch() {
+    let dir = tmpdir("readex-bigbatch");
+    let disk = StdDisk::new();
+    let mut log = Log::open(
+        disk,
+        dir.clone(),
+        LogOptions { segment_max_bytes: 1 << 30, fsync: FsyncSchedule::OnRoll, retention_ms: 0, retention_max_bytes: 0 },
+    )
+    .unwrap();
+    let pool = BufferPool::new();
+
+    // 单批 ~30KB（1 条记录），窗口 want = 1024 + 索引间隔 + 批头 < 批长
+    let raw = batch_bytes(0, 1, &"x".repeat(30 * 1024));
+    let r = log.append(&raw, AssignPolicy::Assign, 1234).unwrap();
+    assert_eq!(r.last_offset, 0);
+    log.sync().unwrap();
+
+    let rr = log.read_ex(0, 1024, &pool, ReadCap::LogEnd).unwrap();
+    assert!(
+        rr.data.len() >= raw.len(),
+        "大批 + 小 max_bytes 必须整批返回（防消费活锁），实得 {}B / 批 {}B",
+        rr.data.len(),
+        raw.len()
+    );
+    assert_eq!(rr.first_offset, 0);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// P1-2（append 错误路径）：batch_io 窗口内 append 失败（roll → flush 失败）
+/// 时，失败 append 自身的字节不得残留 staging（否则随窗口收口落盘=僵尸），
+/// 而**先于失败的 staged 批必须保留**（它们仍属未结算 produce——清空会把
+/// ack 边界搞错）。回滚按检查点的 staged_len 截除。
+#[test]
+fn append_failure_clears_staging_no_zombie() {
+    let dir = tmpdir("appendfail-staging");
+    let disk = SimDisk::new();
+    let mut log = Log::open(
+        disk.clone(),
+        dir.clone(),
+        LogOptions { segment_max_bytes: 500, fsync: FsyncSchedule::SyncEach, retention_ms: 0, retention_max_bytes: 0 },
+    )
+    .unwrap();
+    let pool = BufferPool::new();
+    log.batch_io = true;
+
+    // ① produce X：进 staging（batch_io fast path 收编，未写盘）
+    let x = batch_bytes(0, 2, "X");
+    log.append(&x, AssignPolicy::Assign, 1000).unwrap();
+    // ② 注入瞬时故障：produce A（大批，触发 roll → flush_batch 失败 →
+    //    rollback_to）。A 报错；其前成功但未落盘的 X 不得残留在 staging
+    disk.set_fail_writes(true);
+    let a = batch_bytes(0, 1, &"A".repeat(600));
+    assert!(log.append(&a, AssignPolicy::Assign, 1001).is_err(), "注入点：A 必须失败");
+    // ③ 故障解除：produce B 复用回卷后的 offset 区间，成功
+    disk.set_fail_writes(false);
+    let b = batch_bytes(0, 2, "B");
+    let rb = log.append(&b, AssignPolicy::Assign, 1002).unwrap();
+    assert_eq!(rb.base_offset, 2, "B 接在 X 之后（A 的分配已回卷）");
+    assert_eq!(rb.last_offset, 3);
+    // ④ 窗口收口后：X（先于失败、仍在窗口内）与 B 都必须真实落盘——
+    //    回滚只截除失败 append 自身的字节，不得波及更早窗口数据
+    log.end_batch_window().unwrap();
+
+    let rr = log.read_ex(0, 1 << 20, &pool, ReadCap::LogEnd).unwrap();
+    let text = String::from_utf8_lossy(&rr.data).into_owned();
+    assert!(!text.contains("A-"), "失败批（错误应答）数据不得落盘：{text:?}");
+    assert!(text.contains("X-"), "先于失败的 staged 批 X 不得被回滚波及：{text:?}");
+    assert!(text.contains("B-"), "成功批数据必须在：{text:?}");
+    // offset 流不得回卷：X(0..1) + B(2..3)
+    assert_eq!(rr.first_offset, 0);
+
+    // crash + reopen：数据不复活不丢失
+    drop(log);
+    let log2 = Log::open(disk.clone(), dir.clone(), LogOptions::default()).unwrap();
+    assert_eq!(log2.next_offset, 4, "重开 LEO == B 末尾");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// P1-2（flush 错误路径）：flush_batch 写失败曾保留 staging，下一次 flush
+/// 把[失败批][新批]一并落盘。错误结算的窗口数据必须随失败丢弃。
+#[test]
+fn flush_failure_drops_staged_bytes() {
+    let dir = tmpdir("flushfail-staging");
+    let disk = SimDisk::new();
+    let mut log = Log::open(
+        disk.clone(),
+        dir.clone(),
+        LogOptions { segment_max_bytes: 1 << 30, fsync: FsyncSchedule::SyncEach, retention_ms: 0, retention_max_bytes: 0 },
+    )
+    .unwrap();
+    log.batch_io = true;
+
+    // A 进 staging（尚未写盘）
+    let a = batch_bytes(0, 2, "A");
+    log.append(&a, AssignPolicy::Assign, 1000).unwrap();
+    // flush 失败（actor 层会把窗口内 produce 全部按错误结算）
+    disk.set_fail_writes(true);
+    assert!(log.flush_batch().is_err(), "注入点：flush 必须失败");
+    disk.set_fail_writes(false);
+    // 恢复后再次 flush：不得把失败批字节带出
+    log.flush_batch().unwrap();
+    let files = std::fs::read_dir(&dir).unwrap();
+    let _ = files; // 内容断言经 SimDisk committed 数据
+    let seg_path = dir.join("00000000000000000000.log");
+    let committed = disk.committed_data(&seg_path).unwrap_or_default();
+    let text = String::from_utf8_lossy(&committed).into_owned();
+    assert!(!text.contains("A-"), "flush 失败的 staged 字节不得随后续 flush 落盘：{text:?}");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// P1-3：batch_io 窗口内 truncate_to 曾无条件 clear staging——完整位于
+/// offset 之下的 staged 批从未写盘却被按"保留"结算。截断前必须先收口窗口。
+#[test]
+fn truncate_to_flushes_window_first_keeps_staged_below_offset() {
+    let dir = tmpdir("trunc-staged");
+    let disk = SimDisk::new();
+    let mut log = Log::open(
+        disk.clone(),
+        dir.clone(),
+        LogOptions { segment_max_bytes: 1 << 30, fsync: FsyncSchedule::SyncEach, retention_ms: 0, retention_max_bytes: 0 },
+    )
+    .unwrap();
+    let pool = BufferPool::new();
+    log.batch_io = true;
+
+    // A(0..1) + B(2..3) 全部在 staging（未写盘）
+    let a = batch_bytes(0, 2, "A");
+    log.append(&a, AssignPolicy::Assign, 1000).unwrap();
+    let b = batch_bytes(0, 2, "B");
+    log.append(&b, AssignPolicy::Assign, 1001).unwrap();
+    assert_eq!(log.next_offset, 4);
+
+    // 截断到 3：A(0..1) 完整位于截断点之下，必须真实保留；
+    // B(2..3) 跨线（end=4 > 3），按整批粒度截掉 → LEO = A 末尾 2（批对齐）
+    log.truncate_to(3).unwrap();
+    assert_eq!(log.next_offset, 2, "B（跨线批）必须被截掉，LEO 批对齐到 A 末尾");
+
+    let rr = log.read_ex(0, 1 << 20, &pool, ReadCap::LogEnd).unwrap();
+    let text = String::from_utf8_lossy(&rr.data).into_owned();
+    assert!(text.contains("A-"), "低于截断点的 staged 批必须真实落盘并可读：{text:?}");
+    assert!(!text.contains("B-"), "截断点之上的批不得残留：{text:?}");
+    assert_eq!(rr.high_watermark, 2);
+
+    // crash + reopen：A 不复活也不丢失
+    drop(log);
+    let log2 = Log::open(disk.clone(), dir.clone(), LogOptions::default()).unwrap();
+    assert_eq!(log2.next_offset, 2, "重开 LEO == A 末尾");
+    let rr2 = log2.read_ex(0, 1 << 20, &pool, ReadCap::LogEnd).unwrap();
+    let text2 = String::from_utf8_lossy(&rr2.data).into_owned();
+    assert!(text2.contains("A-") && !text2.contains("B-"));
+    let _ = std::fs::remove_dir_all(&dir);
+}

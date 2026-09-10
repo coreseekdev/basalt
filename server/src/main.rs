@@ -78,6 +78,7 @@ async fn async_main(cfg: Config) {
         .await
         .expect("bind internal");
     let controller_tx_internal = controller_tx.clone();
+    let pool_internal = pool.clone();
     {
         let cfg = cfg.clone();
         tokio::spawn(async move {
@@ -92,17 +93,17 @@ async fn async_main(cfg: Config) {
                         .unwrap_or(true)
                 })
                 .unwrap_or(true);
-            let _ = is_controller;
-            // controller_tx 在下方通过闭包传递有所有权问题 —— POC 简化：
-            // 内部服务的 controller 命令经 meta 通道回环由 sync 任务代为转发
-    let pool = std::sync::Arc::new(BufferPool::new());
-    let ctx = internal::InternalCtx {
-        node_id: cfg.node_id,
-        pool: pool.clone(),
-        is_controller,
-        controller_tx: controller_tx_internal,
-        routes_rx: routes_rx_internal,
-    };
+            // 内部服务与客户端路径共享同一 BufferPool（性能 #2 闭环前提；
+            // 四轮 review P0-1：7d5f11d 曾在此丢失 serve 接线，多节点内部
+            // RPC 全部静默挂死）
+            let ctx = internal::InternalCtx {
+                node_id: cfg.node_id,
+                pool: pool_internal,
+                is_controller,
+                controller_tx: controller_tx_internal,
+                routes_rx: routes_rx_internal,
+            };
+            internal::serve(internal_listener, ctx).await;
         });
     }
 

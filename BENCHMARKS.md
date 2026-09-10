@@ -39,6 +39,22 @@ Redpanda consume 快 29%，原因：
 两者 p50/p99 在同一量级（亚毫秒级）。Basalt p99=1.5ms 偏高可能因为
 tokio 调度延迟，后续可通过减少 per-request spawn 优化。
 
+## 客户端多样性：confluent-kafka（librdkafka 2.15）档（2026-09-10）
+
+同场景与 kafka-python 档一一对应（`benches/throughput_confluent.py`，
+`BENCH=throughput_confluent.py bash benches/run_bench.sh`）：
+
+| 指标 | kafka-python 2.2.3 | confluent-kafka 2.15 | 说明 |
+|---|---|---|---|
+| **Produce 吞吐** | 153,546 msg/s | **437,826–605,884 msg/s（427–592 MB/s）** | librdkafka C 客户端批量更激进，broker 侧零改动 |
+| **Consume 吞吐** | 143,403 msg/s | **254,639–257,937 msg/s（249–252 MB/s）** | fetch.max.bytes=16MB 大窗拉取 |
+| 延迟 p50/p99 | 0.2/1.5ms | **<0.1/0.1ms** | 逐条 produce+回执 RTT |
+
+**兼容性价值 > 性能价值**：该档首个运行即抓出 OffsetFetch v8+ 双侧布局
+缺失（librdkafka 协商 v9，旧实现回 v0-7 形状 → 解析 underflow、消费 0 条；
+kafka-python 停在 v7 探测不到）。修复 + e2e 回归见账本缺陷⑩
+（`testing/e2e/librdkafka_compat.py`）。
+
 ## 压缩端到端验证
 
 | Codec | Produce 数据完整性 | Broker CPU 开销 |

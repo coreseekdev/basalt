@@ -7,4 +7,4 @@ BASALT_DATA_DIR="$DATA" BASALT_PORT=9092 BASALT_NUM_PARTITIONS=2 \
   ./target/release/basalt-server > /dev/null 2>&1 &
 PID=$!
 sleep 1
-python3 benches/throughput.py
+python3 benches/${BENCH:-throughput.py}

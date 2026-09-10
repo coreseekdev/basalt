@@ -814,6 +814,9 @@ impl<D: DiskIo> Log<D> {
         self.disk.sync_file(&seg.path)?;
         self.disk.sync_dir(&seg.path)?;
         seg.bytes = exact;
+        // 重建内存索引（截断后必须：next_rel/offset_index/bytes 与文件一致
+        // ——P3 清理时误删本调用导致 LEO 簿记失真，opfuzz batch_io 档实证）
+        crate::log::rescan_segment(&self.disk, seg);
         self.next_offset = kept_end;
         if self.high_watermark > kept_end {
             self.high_watermark = kept_end;

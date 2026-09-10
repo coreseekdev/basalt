@@ -112,7 +112,20 @@ fn run_seed_io(seed: u64, torn: f64, batch_io: bool) {
     let mut synced_upto: i64 = 0;
     let mut ops: Vec<String> = vec![];
 
+    let dump = batch_io && (seed == 418916 || seed == 1570935);
     for step in 0..64u64 {
+        if dump {
+            let files: Vec<String> = disk
+                .list(&dir)
+                .unwrap()
+                .into_iter()
+                .filter(|n| n.ends_with(".log"))
+                .map(|n| format!("{n}:{}", disk.len(&dir.join(&n)).unwrap()))
+                .collect();
+            eprintln!("PRE{step} leo={} start={} flushed={} synced={} segs={} files={}",
+                log.next_offset, log.log_start_offset(), flushed_upto, synced_upto,
+                log.segment_count(), files.join(","));
+        }
         match rng.below(10) {
             0..=4 => {
                 let payload = format!("s{seed}p{step}");
@@ -148,6 +161,7 @@ fn run_seed_io(seed: u64, torn: f64, batch_io: bool) {
                 // crash + reopen：无 Drop 副作用，直接弃置后崩溃仿真（掉电语义）
                 let leo_before = log.next_offset;
                 let start_before = log.log_start_offset();
+                if dump { eprintln!("CRASH{step} leo={leo_before} start={start_before} tracked={}", tracked.len()); }
                 ops.push(format!("{step}:crash(leo={leo_before},start={start_before})"));
                 drop(log);
                 disk.crash();
@@ -359,8 +373,16 @@ fn repro_seed1_minimal() {
 /// 疑 batch_staging 与 truncate_to 的清理时序（truncate 只在 target 路径
 /// clear，truncate_to_front/promotion 路径未清）或 fast path 直写与
 /// staging 的交错。复现序列见 panic 输出 ops=...。
+/// WIP + 设计决策项：batch_io × SyncEach 组合的持久化点未定案——
+/// batch_io 下 append 进 batch_staging（不落盘），SyncEach 的 sync_file
+/// 只 fsync 已写文件（staging 未写入）→ "已 ack 不持久"。
+/// 三个候选语义（需 ADR 决策，性能 review #8 同一问题）：
+///   (a) batch_io 下 SyncEach 升级为组末 flush+fsync（持久化点=组边界）；
+///   (b) sync() 内先排空 staging 再 fsync（sync() 改 &mut，语义=立即持久）；
+///   (c) 文档化"batch_io 仅限 Os 调度"并断言拒绝其他组合。
+/// 修复后解除 ignore（当前断言按 SyncEach 精确保留语义，对该组合必红）。
 #[test]
-#[ignore = "WIP: batch_io 下 truncate/append/roll LEO 背离——见函数注释"]
+#[ignore = "WIP: batch_io×SyncEach 持久化点未定案——需 ADR 决策（见函数注释）"]
 fn opfuzz_batch_io_seeds() {
     // P0-2 回归档：batch_io=true 的 roll/staging 交互（code review 二轮实证
     // 旧实现此处 ack 丢失）。clean 无故障 + SyncEach 语义经 flush 修正。

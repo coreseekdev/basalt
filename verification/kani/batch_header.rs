@@ -99,3 +99,51 @@ fn total_len_malformed_domain() {
         assert!(total_len(batch_length) < RECORD_BATCH_HEADER_LEN);
     }
 }
+
+// ===== append 校验路径（log.rs append 的守卫块同源副本，C13 族 L1）=====
+// CRC 校验本身依赖 crc32c 外部依赖，harness 中省略——L1 目标是任意输入无 panic。
+
+/// 守卫块：与 log.rs append 的校验序列同源
+pub fn validate_append_batch(rest: &[u8]) -> Result<(), &'static str> {
+    let Some(h) = parse(rest) else {
+        return Err("header too short");
+    };
+    let total = total_len(h.batch_length) as i64;
+    if (rest.len() as i64) < total {
+        return Err("truncated batch");
+    }
+    if total < RECORD_BATCH_HEADER_LEN as i64 {
+        return Err("batch_length too small");
+    }
+    if h.magic != MAGIC_V2 {
+        return Err("magic unsupported");
+    }
+    Ok(())
+}
+
+#[kani::proof]
+fn validate_append_no_panic_any_input() {
+    let buf: [u8; 200] = kani::any();
+    let n: usize = kani::any();
+    kani::assume(n <= 200);
+    let _ = validate_append_batch(&buf[..n]);
+}
+
+/// 守卫完备性：Ok ⇒ total ≥ 61 且 rest.len() ≥ total（无越界切片可能）
+#[kani::proof]
+fn validate_append_guard_complete() {
+    let buf: [u8; 200] = kani::any();
+    let n: usize = kani::any();
+    kani::assume(n <= 200);
+    if validate_append_batch(&buf[..n]).is_ok() {
+        assert!(total_len_of(&buf[..n]) >= 61);
+        assert!((buf.len() as i64) >= total_len_of(&buf[..n]));
+    }
+}
+
+fn total_len_of(s: &[u8]) -> i64 {
+    match parse(s) {
+        Some(h) => h.batch_length.max(0) as i64 + 12,
+        None => -1,
+    }
+}

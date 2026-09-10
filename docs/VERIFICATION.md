@@ -131,7 +131,7 @@ torn write: sync 时按概率只落前半块（block 粒度截断）
 | C7 | recover() 后日志合法（offset 连续、索引可重建）、已 sync 数据存活 | L1+L3 | opfuzz（T-Q.1）+ Verus storage（未开始） | ⬜ 规划中（M2 前） | — |
 | C8 | 水位正确：HW ≤ LEO、HW 单调、fetch 不越过 HW/LSO | L2+L3 | TLA+（已含 C1 模型）+ Verus partition actor（未开始） | ⬜ L3 未开始 | — |
 | C9 | 消费组安全性：Stable 良构（全员就绪/每分区恰一 owner/owner ∈ 成员集）、同代分配唯一；阴性对照（部分就绪 Sync）反例已检出——CompletingSync 入口"全员完成加入"守卫为必要设计。收敛性归仿真层/T-Q.4 | L2 | PlusCal/TLC `spec/ConsumerGroup.tla` | ✅ v0.1（2026-09-09）；L3 待 coordinator 完整实现 | `make -C spec consumer-group` / `-demo` |
-| C10 | record 批编解码（批头/CRC 域） | L1+L3 | proptest（已有）+ Kani parse harness（`verification/kani/batch_header.rs`，3/3 ✅：任意输入 parse 无 panic、Some ⇒ magic 约束、畸形 total 域）→ Verus 契约（规划） | 🚧 L1 已闭合（2026-09-10） | `kani verification/kani/batch_header.rs` |
+| C10 | record 批编解码（批头/CRC 域） | L1+L3 | proptest（已有）+ Kani parse harness（`verification/kani/batch_header.rs`，5/5 ✅：parse/append 守卫任意输入无 panic + 守卫完备性 + 畸形 total 域）→ Verus 契约（规划） | 🚧 L1 已闭合（2026-09-10） | `kani verification/kani/batch_header.rs` |
 | C11 | 兼容语义 = 真实客户端行为 | 外壳 | librdkafka/franz-go report card（测试 §5，未建） | ⬜ | — |
 | C14 | **规约 v0.2 扩展**（不变式评审清单）：① crash 模型加 synced 边界（与 §3 故障模型对齐，机器检查"commit ⇒ 多数派已持久"）；② 消费组 CommitOffsets fencing（带 generation 的提交动作 + 僵尸消费）；③ 超时踢除路径；④ 活性公平性实验（收敛性 leadtos，分钟级）；⑤ view 回退方向实验。已识别的结构性恒真不变式（InvGenAssignmentUnique 等）标注降级，防回归价值保留 | L2 | TLC | ⬜ 规划（VERIFICATION-GUIDE 未建模边界清单） | — |
 | C13 | **已修复缺陷**：validate_crc / batch_len_at 对 crafted 报文（合法 magic + batch_length=0）曾 panic（`&buf[21..12]`，网络可达 DoS）——由 C6 之外的边界推理发现，回归测试锁定；教训已固化为 Verus 定理（C13'：`c13_short_batch_invalid` 等 4 条，45 verified） | L1+L3 | cargo test + Verus | ✅ 已修复（2026-09-09） | `cargo test -p basalt-record` + `verus --crate-type=lib verification/verus/record_core.rs` |

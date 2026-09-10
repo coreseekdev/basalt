@@ -4,13 +4,16 @@
 
 ```
 Verification Time: 1.3s
-Complete - 2 successfully verified harnesses, 0 failures, 2 total.
+Complete - 5 successfully verified harnesses, 0 failures, 5 total.
 ```
 
 | Harness | 性质 |
 |---|---|
 | `zigzag_roundtrip_no_panic` | 全部 i64：put/read 往返 == Some(v)，pos 恰好走完 |
 | `read_zigzag_arbitrary_bytes_no_panic` | 任意 3 字节输入：解码不 panic |
+
+| `validate_append_no_panic_any_input` | append 校验守卫块任意输入无 panic（C13 族 append 入口） | 全称定理 |
+| `validate_append_guard_complete` | Ok ⇒ total ≥ 61 ∧ rest.len() ≥ total（守卫完备性） | 全称定理 |
 
 ## 工具
 

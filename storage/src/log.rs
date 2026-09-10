@@ -537,6 +537,19 @@ impl<D: DiskIo> Log<D> {
 
         loop {
             if pos + RECORD_BATCH_HEADER_LEN > raw.len() {
+                // 读窗口耗尽：若段仍有数据且尚未返回任何批，补充读窗口至段尾
+                // ——保持旧实现"首批即便超预算/超窗口也整批带上"的语义，
+                // 否则消费端对 HW 内位点立即重取形成活锁（三轮 review P1）。
+                if out.is_empty() && (pos as u64) < seg.bytes {
+                    let more = (seg.bytes - pos as u64) as usize;
+                    raw.resize(raw.len() + more, 0);
+                    let got = self
+                        .disk
+                        .read_at(&seg.path, pos as u64, &mut raw[pos..])
+                        .unwrap_or(0);
+                    raw.truncate(pos + got);
+                    continue;
+                }
                 break;
             }
             let Some(h) = BatchHeader::parse(&raw[pos..]) else { break };
@@ -796,26 +809,25 @@ impl<D: DiskIo> Log<D> {
         //    批，在首个跨线批处截断。不得用 locate(offset) 作扫描起点——
         //    那会跳过包含 < offset 记录的更早批（opfuzz 实证数据丢失）。
         let seg = &mut self.active;
+        // 一次性读入内存后批走（P2-2：消除每批 61B pread 的 3 次 syscall；
+        // 段大小受 segment_max_bytes 约束，failover 路径可接受）
+        let data = self.disk.read_all(&seg.path)?;
         let mut exact: u64 = 0;
         let mut rel_kept: i64 = 0;
         let mut scan: u64 = 0;
-        loop {
-            if scan + RECORD_BATCH_HEADER_LEN as u64 > seg.bytes {
+        while scan + RECORD_BATCH_HEADER_LEN as u64 <= data.len() as u64 {
+            let Some(h) = BatchHeader::parse(&data[scan as usize..]) else { break };
+            let total = h.total_len() as u64;
+            if total == 0 || scan + total > data.len() as u64 {
                 break;
             }
-            let mut hdr = [0u8; RECORD_BATCH_HEADER_LEN];
-            let n = self.disk.read_at(&seg.path, scan, &mut hdr)?;
-            if n < RECORD_BATCH_HEADER_LEN {
-                break;
-            }
-            let Some(h) = BatchHeader::parse(&hdr) else { break };
             let end = h.base_offset + h.record_count.max(0) as i64;
             if end > offset {
                 break;
             }
             rel_kept = end - seg.base_offset;
-            exact = scan + h.total_len() as u64;
-            scan += h.total_len() as u64;
+            exact = scan + total;
+            scan += total;
         }
         let kept_end = seg.base_offset + rel_kept;
         self.disk.truncate(&seg.path, exact)?;
@@ -826,6 +838,13 @@ impl<D: DiskIo> Log<D> {
         // ——P3 清理时误删本调用导致 LEO 簿记失真，opfuzz batch_io 档实证）
         crate::log::rescan_segment(&self.disk, seg);
         self.next_offset = kept_end;
+        // 运行期不变式：log_start 不得高于 LEO（DeleteRecords 落批中 +
+        // 分叉尾巴截断落入同一批时，kept_end 会低于 log_start——钳制，
+        // 否则 read 永久 OffsetOutOfRange、list_offset 虚报，三轮 review P2-1）
+        if self.log_start_offset > kept_end {
+            self.log_start_offset = kept_end;
+            self.persist_checkpoint();
+        }
         if self.high_watermark > kept_end {
             self.high_watermark = kept_end;
         }

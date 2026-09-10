@@ -45,9 +45,9 @@ fn batch_bytes(payload: &str) -> Bytes {
     b.freeze()
 }
 
-fn open(dir: &PathBuf) -> Log<SimDisk> {
+fn open(disk: &SimDisk, dir: &PathBuf) -> Log<SimDisk> {
     Log::open(
-        SimDisk::new(),
+        disk.clone(),
         dir.clone(),
         LogOptions {
             segment_max_bytes: 100, // 高频滚动：多段场景
@@ -94,16 +94,17 @@ fn sim_disk_len_matches_read_len() {
 /// （next_rel > 0 才滚动）与空 active 的交互，或 commit_staged 写入路径
 /// 对 0 字节文件的句柄状态。修复后解除 ignore。
 #[test]
-#[ignore = "WIP: 空截断后 append 静默失效——见函数注释"]
 fn boundary_table_delete_and_truncate() {
     for b in 0..=10usize {
         // ---- delete(b)：log_start 精确等于 b（跨线批整批保留）----
         let dir = tmpdir(&format!("del-{b}"));
-        let mut log = open(&dir);
+        let disk = SimDisk::new();
+        let mut log = open(&disk, &dir);
         for i in 0..5 {
             log.append(&batch_bytes(&format!("d{b}m{i}")), AssignPolicy::Assign, 1).unwrap();
         }
         log.delete_records(b as i64).unwrap();
+        eprintln!("B{b} after delete: start={} leo={} segs={:?}", log.log_start_offset(), log.next_offset, log.debug_segments());
         assert_eq!(log.log_start_offset(), b as i64, "delete({b})");
         assert_eq!(log.next_offset, 10, "delete 不得改变 LEO");
         let chain = log.debug_segments();
@@ -113,13 +114,15 @@ fn boundary_table_delete_and_truncate() {
 
         // crash + reopen：log_start 持久化、数据不复活不丢失
         drop(log);
-        let log = open(&dir);
+        let log = open(&disk, &dir);
+        eprintln!("B{b} after reopen: start={} leo={} segs={:?}", log.log_start_offset(), log.next_offset, log.debug_segments());
         assert_eq!(log.log_start_offset(), b as i64, "delete({b}) 重开回退");
         assert_eq!(log.next_offset, 10);
 
         // ---- truncate_to(b)：批对齐向下取整（LEO = b & !1，2 记录/批）----
         let dir2 = tmpdir(&format!("tr-{b}"));
-        let mut log = open(&dir2);
+        let disk2 = SimDisk::new();
+        let mut log = open(&disk2, &dir2);
         for i in 0..5 {
             log.append(&batch_bytes(&format!("t{b}m{i}")), AssignPolicy::Assign, 1).unwrap();
         }
@@ -128,7 +131,7 @@ fn boundary_table_delete_and_truncate() {
         assert_eq!(log.next_offset, expect_leo, "truncate_to({b}) 批对齐");
 
         drop(log);
-        let log = open(&dir2);
+        let log = open(&disk2, &dir2);
         assert_eq!(log.next_offset, expect_leo, "truncate_to({b}) 重开复活");
     }
 }
@@ -138,7 +141,8 @@ fn boundary_table_delete_and_truncate() {
 #[test]
 fn read_containment_across_segments() {
     let dir = tmpdir("contain");
-    let mut log = open(&dir);
+    let disk = SimDisk::new();
+    let mut log = open(&disk, &dir);
     let pool = basalt_storage::pool::BufferPool::new();
     for i in 0..12 {
         log.append(&batch_bytes(&format!("c{i}")), AssignPolicy::Assign, 1).unwrap();
@@ -164,7 +168,8 @@ fn read_containment_across_segments() {
 #[ignore = "WIP: 依赖 boundary 表闭合（同上）"]
 fn segment_chain_strictly_increasing_after_mixed_ops() {
     let dir = tmpdir("chain");
-    let mut log = open(&dir);
+    let disk = SimDisk::new();
+    let mut log = open(&disk, &dir);
     use AssignPolicy::Assign;
     for i in 0..8 {
         log.append(&batch_bytes(&format!("x{i}")), Assign, 1).unwrap();

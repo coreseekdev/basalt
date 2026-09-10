@@ -1,36 +1,51 @@
-# 消费组收敛性活性实验 —— 已闭合（结论：eager rebalance 在持续 churn 下无收敛保证）
+# 消费组收敛性活性实验 —— 已闭合（四级公平性二分，2026-09-10）
 
-## 实证结论（2026-09-10，TLC 反例确认）
-`WF_vars(Coordinator)` 公平性下，TLC 给出真实反例循环：
-`NewJoin m1（ready 重置）→ Rejoin m2 → …` 无限重复——
-**eager rebalance 在成员持续 churn（离开-重入环）下不保证收敛**。
-这是协议固有性质（Kafka 同款已知问题，KIP-429 cooperative rebalance
-即为其缓解方案），不是实现缺陷。
+## 结论
 
-> **v0.2 已闭合部分（2026-09-10）**：CommitOffset fencing 动作（仅当代 owner、
-> offset 单调）与超时踢除路径已入模型，名义/阴性对照全绿（账本 C9 更新）。
-> 本文档仅剩「收敛性活性」一项未闭合。
+`RebalanceCompletes` 在**任何 coordinator 侧公平性强度下都不可满足**——
+不是公平性写得不够，而是模型允许成员无限「报到↔取消报到」churn，收口
+动作永远无法**持续可用**（continuously enabled），WF 在语义上就无法强制
+它。这是 eager rebalance 的固有性质（Kafka 同款，KIP-429 cooperative
+rebalance 的动机），需环境假设（churn 有界/最终停止）才能闭合收敛性。
 
-## 目标（不变式评审建议，账本 C9 收敛性 L2）
-`(state = PreparingRebalance ∧ gen < MaxRounds) ⇒ ◇(state ∈ {Stable, Empty} ∨ gen = MaxRounds)`
+## 二分实验（spec/ConsumerGroupLiveness.tla + consumer-group-l{0,2,3}.cfg）
 
-## 已尝试（2026-09-10）
-1. PlusCal `fair process`：翻译产物**不含 WF/SF 合取**（grep 零命中）——
-   公平性未生效，反例为纯 Stuttering（Preparing + ready={} +
-   members={m1,m2} 永久停留，类型上 Rejoin 明明持续可用）。
-2. 显式 `FairSpec == Spec /\ WF_vars(Next)` + `SPECIFICATION FairSpec`：
-   同一 stuttering 反例仍被 TLC 判为公平——疑点：`with` 语句对
-   ENABLED ⟨Next⟩_vars 计算的折叠、Next 合取粒度、或 WF_vars 对
-   合取动作的语义。
+| 级别 | 公平性假设 | 结果 | 反例结构 |
+|---|---|---|---|
+| L0 | 无（Spec） | 红 | 纯 Stuttering（State 3: Stuttering） |
+| L1 | `WF_vars(Coordinator)`（粗粒度合取动作，consumer-group-liveness.cfg） | 红 | **真实循环**（3→4→3），非 stuttering |
+| L2 | WF(收口) + WF(Sync)（单动作粒度） | 红 | 收口仅在 `ready=members` 时可用，被 ready 缩放反复打断 |
+| L3 | + WF(报到) + WF(完成加入)（rebalance 全部子动作） | 红 | **AddReady ↔ FinishJoin 乒乓**：`ready={} → {m2} → {}` 无限往复 |
 
-## 下一步
-- 单动作 WF 实验：`WF_vars(Rejoin-action)` 而非 `WF_vars(Next)` 合取；
-- 查 pcal 翻译的动作粒度（单标签 while + either 的动作展开方式）；
-- 或放弃模型层收敛性，转为仿真层结论（turmoil/timed 长跑），在
-  VERIFICATION-GUIDE「未建模边界」中如实标注——与账本 C9 行的
-  "收敛性归仿真层/T-Q.4" 条款一致。
+L3 反例轨迹（TLC 实录，684 状态全空间）：
 
-## 当前规约状态
-`ConsumerGroup.tla` 含活性编辑（fair process + RebalanceCompletes +
-FairSpec）——三个名义 cfg 全绿不受影响（FairSpec 未被其引用）；
-`consumer-group-liveness.cfg` 指向 FairSpec，当前红（见上）。
+```
+State 2: state=PreparingRebalance, members={m2}, ready={}   \* 收口 disabled
+State 3: state=PreparingRebalance, members={m2}, ready={m2} \* 收口 enabled
+Back to state 2                                             \* FinishJoin(m2) 再缩空
+```
+
+`WF_vars(EnterCompletingStep)` 要求该动作**持续**可用时最终发生；乒乓使它
+间歇可用，公平性公式不成立也不违约——这是 TLA+ 公平性的正确语义，不是
+工具问题。**更正**：本文件早先版本称 L1 反例为 "stuttering"，实为真实循环
+（每步 vars 均变化，粗粒度 WF 被任意进展步满足）——「下一步」的单动作
+WF 实验落地后厘清；`with` 折叠/翻译粒度疑点均排除。
+
+## 处置
+
+1. **模型层闭合（留待 v0.3）**：给模型加 churn 预算旋钮（如 `JoinBudget`
+   常量：报到/完成总次数上界），「churn 耗尽后必收敛」即可在 TLC 全空间
+   判定——届时 `RebalanceCompletes` 改写为预算耗尽后激活的条件性质。
+2. **现实收敛性**：归 T-Q.4 仿真长跑（账本 C9 行既定条款）。实现层
+   coordinator 已有 session timeout 踢除（v0.2 入模）；churn 上界由客户端
+   max.poll/retry 策略决定，属环境参数。
+3. `consumer-group-liveness.cfg`（指向粗粒度 FairSpec）保留为**已知红
+   阴性对照**：任何使其变绿的规约改动都必须解释 churn 语义发生了什么
+   变化。
+
+## 实验产物
+
+- `spec/ConsumerGroupLiveness.tla`——additive 扩展模块（四个子动作公式
+  逐一镜像翻译产物析取支，含全变量 UNCHANGED；不动 ConsumerGroup.tla 本体）
+- `spec/consumer-group-l0.cfg` / `-l2.cfg` / `-l3.cfg`——三级公平性配置
+- 运行：`java -cp spec/tools/tla2tools.jar tlc2.TLC -config spec/consumer-group-l3.cfg spec/ConsumerGroupLiveness.tla`（秒级）

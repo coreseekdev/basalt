@@ -564,14 +564,17 @@ impl<D: DiskIo> Log<D> {
     }
 
     fn segment_for(&self, offset: i64) -> &Segment {
-        // sealed 中最后一个 base <= offset 的段；否则 active
+        // active 是最后一个段：offset >= active.base 必然命中 active。
+        // （opfuzz 实证：此前只在 sealed 中找，多段日志下 fetch active 尾部
+        //  会返回最后一个 sealed 段——读到旧数据或空。）
+        if offset >= self.active.base_offset {
+            return &self.active;
+        }
+        // 否则：sealed 中最后一个 base <= offset 的段；不存在则 active（空日志）
         let idx = self
             .sealed
             .partition_point(|s| s.base_offset <= offset);
         if idx == 0 {
-            if self.sealed.first().is_some_and(|s| s.base_offset <= offset) {
-                return &self.sealed[0];
-            }
             return &self.active;
         }
         match self.sealed.get(idx - 1) {
@@ -606,6 +609,19 @@ impl<D: DiskIo> Log<D> {
 
     pub fn log_start_offset(&self) -> i64 {
         self.log_start_offset
+    }
+
+    /// 段调试转储（opfuzz 诊断用；只读，无副作用）。
+    pub fn debug_segments(&self) -> Vec<(i64, u64, i64)> {
+        self.sealed
+            .iter()
+            .map(|s| (s.base_offset, s.bytes, s.next_rel))
+            .chain(std::iter::once((
+                self.active.base_offset,
+                self.active.bytes,
+                self.active.next_rel,
+            )))
+            .collect()
     }
 
     pub fn segment_count(&self) -> usize {

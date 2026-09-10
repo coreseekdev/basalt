@@ -105,18 +105,6 @@ fn run_seed(seed: u64, torn: f64) {
     let mut ops: Vec<String> = vec![];
 
     for step in 0..64u64 {
-        if seed == 1 && !chaos {
-            let files: Vec<String> = disk
-                .list(&dir)
-                .unwrap()
-                .into_iter()
-                .map(|n| {
-                    let l = disk.len(&dir.join(&n)).unwrap();
-                    format!("{n}:{l}")
-                })
-                .collect();
-            eprintln!("PRE{step} leo={} start={} segs={} files={}", log.next_offset, log.log_start_offset(), log.segment_count(), files.join(","));
-        }
         match rng.below(10) {
             0..=4 => {
                 let payload = format!("s{seed}p{step}");
@@ -194,7 +182,7 @@ fn run_seed(seed: u64, torn: f64) {
         let len = disk.len(&dir.join(&name)).unwrap();
         eprintln!("DIAG file {name} len={len}");
     }
-    eprintln!("DIAG reopen: leo={} start={} synced_upto={}", log.next_offset, log.log_start_offset(), synced_upto);
+    eprintln!("DIAG reopen: leo={} start={} synced_upto={} segs={:?}", log.next_offset, log.log_start_offset(), synced_upto, log.debug_segments());
 
     if !chaos && !tracked.is_empty() {
         assert!(log.next_offset >= synced_upto, "收尾：已 sync 数据丢失（seed={seed}, synced_upto={synced_upto}, reopen_leo={}, start={}, ops={ops:?})", log.next_offset, log.log_start_offset());
@@ -216,9 +204,9 @@ fn run_seed(seed: u64, torn: f64) {
     }
     let mut off = log.log_start_offset();
     let mut all = BytesMut::new();
-    for _ in 0..1000 {
+    let mut it: usize = 0;
+    loop {
         let r = log.read(off, 1 << 20, &pool).expect("读必须成功");
-        if r.data.is_empty() { break; }
         let mut cnt: i64 = 0;
         let mut p = 0usize;
         while p < r.data.len() {
@@ -226,10 +214,15 @@ fn run_seed(seed: u64, torn: f64) {
             if let Some(h) = BatchHeader::parse(&r.data[p..]) { cnt += h.record_count.max(0) as i64; }
             p += bl;
         }
+        it += 1;
+        if it > 50 || r.data.is_empty() {
+            break;
+        }
         all.extend_from_slice(&r.data);
         off = r.first_offset + cnt;
     }
-    let r = all.freeze();
+    let r = all.clone().freeze();
+    let r = all.clone().freeze();
     assert_batch_stream(&r);
 
     // 持久断言（clean）：tracked 标签按序全部可读回
@@ -287,7 +280,6 @@ fn run_seed(seed: u64, torn: f64) {
 /// （read_len=1149 < 预期，疑 read_ex 单段读循环拼接边界或真实尾批丢失，
 /// 需结合 read_ex 语义专项排查——见 docs/review-storage-c7-20260909.md）。
 #[test]
-#[ignore = "WIP: seed=4 尾批子序列待查——见函数注释"]
 fn opfuzz_clean_seeds() {
     for seed in 1..=40u64 {
         run_seed(seed, 0.0);

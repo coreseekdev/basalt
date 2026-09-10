@@ -1,7 +1,8 @@
 //! DiskIo 抽象（ADR-7 硬约束）：路径寻址的读写/同步/目录操作。
 //!
-//! - [`StdDisk`]：真实文件系统；内部按路径缓存追加句柄（BufWriter 语义由
-//!   flush 控制）。
+//! - [`StdDisk`]：真实文件系统；内部按路径缓存追加句柄，`write_all` 直写
+//!   （ADR-14 写边界：append 即 page-cache 可见；持久性仅由 [`DiskIo::sync_file`]
+//!   保证，无 BufWriter 式隐式缓冲）。
 //! - 仿真实现（torn write/ENOSPC/crash 丢 pending）由 basalt-testing 提供，
 //!   实现同一 trait——「ack 前必须 sync」的正确性由仿真逼出。
 //!

@@ -369,6 +369,8 @@ fn decode_record(data: &[u8]) -> Option<ClusterRecord> {
 #[derive(Clone)]
 #[allow(dead_code)]
 pub struct InternalCtx {
+    // BufferPool 进程单例共享资源池：Arc 表达资源共享而非共享可变所有权（ADR-13）。
+    #[allow(clippy::disallowed_types)]
     pub pool: std::sync::Arc<BufferPool>,
     #[allow(dead_code)]
     pub node_id: i32,

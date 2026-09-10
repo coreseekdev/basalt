@@ -15,10 +15,15 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
 const MAX_FRAME: i32 = 100 * 1024 * 1024;
 
+// BufferPool 参数：进程单例共享资源池（内部 Mutex 串行化）——Arc 表达资源
+// 共享而非共享可变所有权，与 Bytes/mpsc 内部引用计数同级豁免（ADR-13）。
+#[allow(clippy::disallowed_types)]
 pub async fn serve_connection(
     sock: tokio::net::TcpStream,
     peer: std::net::SocketAddr,
     ctx: Ctx,
+    // BufferPool 进程单例共享资源池（内部 Mutex 串行化）：Arc 表达资源共享而非
+    // 共享可变所有权，与 Bytes/mpsc 内部引用计数同级豁免（ADR-13）。
     pool: std::sync::Arc<basalt_storage::pool::BufferPool>,
 ) {
     // 读半 + 写半分离：请求处理可并发（消除队头阻塞——长轮询 fetch 不再拖死同连接

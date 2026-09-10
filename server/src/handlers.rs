@@ -26,6 +26,9 @@ pub struct Ctx {
     pub routes_rx: tokio::sync::watch::Receiver<crate::meta::RoutingTable>,
     pub brokers_cache: std::sync::Mutex<Option<Vec<basalt_metadata::cluster::BrokerInfo>>>,
     /// 读缓冲池（perf #2：writer 归还 + actor 读复用共享同一池）
+    // BufferPool 进程单例共享资源池（内部 Mutex 串行化）：Arc 表达资源共享而非
+    // 共享可变所有权，与 Bytes/mpsc 内部引用计数同级豁免（ADR-13）。
+    #[allow(clippy::disallowed_types)]
     pub pool: std::sync::Arc<basalt_storage::pool::BufferPool>,
 }
 

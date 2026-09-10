@@ -30,12 +30,15 @@ pub struct SimDiskInner {
     fail_writes: std::sync::atomic::AtomicBool,
 }
 
+/// 测试基建内部引用计数（clippy.toml 例外注释对应处）：非调用方所有权图。
+#[allow(clippy::disallowed_types)]
 #[derive(Clone)]
 pub struct SimDisk {
     /// 测试基建内部引用计数（非调用方所有权图；clippy disallowed-types 例外）
     inner: std::sync::Arc<SimDiskInner>,
 }
 
+#[allow(clippy::disallowed_types)] // 测试基建内部 Arc（clippy.toml 例外注释对应处）
 impl SimDisk {
     pub fn new() -> SimDisk {
         SimDisk { inner: std::sync::Arc::new(SimDiskInner::default()) }

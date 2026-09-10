@@ -118,6 +118,8 @@ pub struct PartitionActor {
     pub index: i32,
     node_id: i32,
     log: Log<StdDisk>,
+    // BufferPool 进程单例共享资源池：Arc 表达资源共享而非共享可变所有权（ADR-13）。
+    #[allow(clippy::disallowed_types)]
     pool: std::sync::Arc<BufferPool>,
     rx: mpsc::Receiver<PartitionCmd>,
     pending: Vec<PendingFetch>,
@@ -134,6 +136,7 @@ pub struct PartitionActor {
 }
 
 impl PartitionActor {
+    #[allow(clippy::disallowed_types)] // pool 参数：进程单例共享资源池（ADR-13 豁免）
     pub fn spawn(
         name: String,
         index: i32,

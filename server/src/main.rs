@@ -68,6 +68,9 @@ async fn async_main(cfg: Config) {
 
     let controller_addr = ctrl.as_ref().map(|(_, h, p)| format!("{h}:{}", p + 1));
 
+    // BufferPool 进程单例共享资源池：Arc 表达资源共享而非共享可变所有权，
+    // 与 Bytes/mpsc 内部引用计数同级豁免（ADR-13）。
+    #[allow(clippy::disallowed_types)]
     let pool: std::sync::Arc<BufferPool> = std::sync::Arc::new(BufferPool::new());
     let (meta_tx, routes_rx) = meta::MetaService::spawn(cfg.clone(), controller_addr, controller_tx.clone(), pool.clone());
     let group_tx = basalt_coordinator::GroupManager::spawn(std::path::Path::new(&cfg.data_dir));

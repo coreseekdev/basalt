@@ -67,6 +67,8 @@ pub enum MetaCmd {
 }
 
 pub struct MetaService {
+    // BufferPool 进程单例共享资源池：Arc 表达资源共享而非共享可变所有权（ADR-13）。
+    #[allow(clippy::disallowed_types)]
     pub pool: std::sync::Arc<BufferPool>,
     cfg: Config,
     /// 控制器内部地址（host:internal_port），非控制器节点经它转发建题
@@ -121,6 +123,7 @@ fn topic_id_from(name: &str) -> u128 {
 }
 
 impl MetaService {
+    #[allow(clippy::disallowed_types)] // pool 参数：进程单例共享资源池（ADR-13 豁免）
     pub fn spawn(
         cfg: Config,
         controller_addr: Option<String>,

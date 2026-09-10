@@ -791,12 +791,13 @@ impl<D: DiskIo> Log<D> {
         }
         // 清空批量合并缓冲：截断后旧 staging 写入会流错位（P2）
         self.batch_staging.clear();
-        // 3) active 内批对齐截断：仅保留完整位于 offset 之前的批
+        // 3) active 内批对齐截断：**从段首扫描**，保留完整位于 offset 之前的
+        //    批，在首个跨线批处截断。不得用 locate(offset) 作扫描起点——
+        //    那会跳过包含 < offset 记录的更早批（opfuzz 实证数据丢失）。
         let seg = &mut self.active;
-        let pos = seg.locate(offset);
-        let mut exact = pos;
+        let mut exact: u64 = 0;
         let mut rel_kept: i64 = 0;
-        let mut scan = pos;
+        let mut scan: u64 = 0;
         loop {
             if scan + RECORD_BATCH_HEADER_LEN as u64 > seg.bytes {
                 break;

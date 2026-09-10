@@ -112,7 +112,7 @@ torn write: sync 时按概率只落前半块（block 粒度截断）
 
 | # | Claim（对外承诺） | 层 | 工具/版本 | 状态 | 复验 |
 |---|---|---|---|---|---|
-| C1 | 不丢：ack 数据存在于任一多数派（多数派持久性），控制器现任主一旦可服务必持有全部 acked 数据 | L2 | PlusCal/TLC (TLC2 2026.09.09.014814)，`spec/BasaltDataPlane.tla` | ✅ v0.1 全空间通过（3 节点×日志长 2×2 值，8890 万状态）；**SplitBrain 场景同样通过**（控制器 fencing 失效下 follower 侧 epoch fencing + 继任规则自足） | `make -C spec check` |
+| C1 | 不丢：ack 数据存在于任一多数派（多数派持久性），控制器现任主一旦可服务必持有全部 acked 数据 | L2 | PlusCal/TLC (TLC2 2026.09.09.014814)，`spec/BasaltDataPlane.tla` | ✅ v0.1 全空间通过（3 节点×日志长 2×2 值，8890 万状态）；**SplitBrain 场景同样通过**（控制器 fencing 失效下 follower 侧 epoch fencing + 继任规则自足）。**适用条款**（不变式评审 P0-1）：结论以 acks=all 提交 = ack ≥ 多数派且 `unclean.leader.election=false`（ADR-8）为前提；ISR 收缩/扩张与事务未建模（见 VERIFICATION-GUIDE 未建模边界清单），M2 实现必须钉死该提交条件 | `make -C spec check` |
 | C2 | 单写者：每 epoch 至多一个有效 leader；日志匹配（同 index 同 epoch 同值）；view epoch 不超前 | L2 | 同上 | ✅ v0.1 通过 | `make -C spec check` |
 | C3 | 继任规则（(lastEpoch, len) 字典序最大者接管）是 C1 的**必要设计**：跳过它（EagerLeader）TLC 检出"新主缺 acked 数据"反例 | L2 | 同上 | ✅ 反例已检出 | `make -C spec demo-eager` |
 | C4 | 游标有界：消费者只读已提交前缀，且每条可从任一多数派恢复 | L2 | 同上 | ✅ v0.1 通过 | `make -C spec check` |
@@ -126,6 +126,7 @@ torn write: sync 时按概率只落前半块（block 粒度截断）
 | C9 | 消费组安全性：Stable 良构（全员就绪/每分区恰一 owner/owner ∈ 成员集）、同代分配唯一；阴性对照（部分就绪 Sync）反例已检出——CompletingSync 入口"全员完成加入"守卫为必要设计。收敛性归仿真层/T-Q.4 | L2 | PlusCal/TLC `spec/ConsumerGroup.tla` | ✅ v0.1（2026-09-09）；L3 待 coordinator 完整实现 | `make -C spec consumer-group` / `-demo` |
 | C10 | record 批编解码 roundtrip（含批头/CRC 覆盖域） | L3 | proptest（已有）→ Verus（规划） | ⬜ 部分（proptest） | `cargo test -p record` |
 | C11 | 兼容语义 = 真实客户端行为 | 外壳 | librdkafka/franz-go report card（测试 §5，未建） | ⬜ | — |
+| C14 | **规约 v0.2 扩展**（不变式评审清单）：① crash 模型加 synced 边界（与 §3 故障模型对齐，机器检查"commit ⇒ 多数派已持久"）；② 消费组 CommitOffsets fencing（带 generation 的提交动作 + 僵尸消费）；③ 超时踢除路径；④ 活性公平性实验（收敛性 leadtos，分钟级）；⑤ view 回退方向实验。已识别的结构性恒真不变式（InvGenAssignmentUnique 等）标注降级，防回归价值保留 | L2 | TLC | ⬜ 规划（VERIFICATION-GUIDE 未建模边界清单） | — |
 | C13 | **已修复缺陷**：validate_crc / batch_len_at 对 crafted 报文（合法 magic + batch_length=0）曾 panic（`&buf[21..12]`，网络可达 DoS）——由 C6 之外的边界推理发现，回归测试锁定；教训已固化为 Verus 定理（C13'：`c13_short_batch_invalid` 等 4 条，45 verified） | L1+L3 | cargo test + Verus | ✅ 已修复（2026-09-09） | `cargo test -p basalt-record` + `verus --crate-type=lib verification/verus/record_core.rs` |
 | C12 | 网络路径/tokio/真实 fs 行为 | 外壳 | turmoil 仿真 + 混沌（T-Q.4） | ⬜ | — |
 
@@ -140,6 +141,26 @@ torn write: sync 时按概率只落前半块（block 粒度截断）
 2. coordinator 消费组 PlusCal 模型（C9 上半）；
 3. Kani nightly（L1 全量无 panic）+ Creusot bake-off 补齐切换协议数据；
 4. M2 实现 ISR 复制时启动 L4 ghost 重表达与对应表。
+
+## 12. 缺陷 → 检测机制矩阵（2026-09-10，评审驱动新增）
+
+> 原则：**每个已发生的缺陷必须落一个永久检测机制**，并指明该机制覆盖的错误类。
+> 机制分层：L1 Kani（不可信输入边界）→ opfuzz（状态机交互采样）→ 一致性/边界表/
+> 属性测试（确定性边界与表示不变式）→ L2 TLC（协议语义）→ L3 Verus（算术与
+> 包含性，C7 深水区）。code review agent 作为跨层兜底。
+
+| # | 缺陷 | 错误类别 | 抓住它的机制 | 新增/补强的永久机制 |
+|---|---|---|---|---|
+| ① | SimDisk::len 只返回 pending | 环境模型语义不一致 | opfuzz（间接） | DiskIo len≡read 一致性属性测试（conformance.rs）+ C7 DiskIo 规约翻译 |
+| ② | truncate_to 盲设 next_offset | 派生状态与内容不一致 | opfuzz crash 比对 | truncate 批对齐回归 + LEO==base+next_rel 结构断言（conformance）|
+| ③ | truncate_to_front 保留/删除颠倒 | 边界循环方向错误 | 边界表测试（新增）| delete/truncate 边界表（0..=10 每值）+ 规格层"前缀物理删除不可行"论证（Kafka 语义采纳）|
+| ④ | roll 空段封存同路径双 Segment | 表示不变式违反（base 唯一性）| opfuzz crash-reopen 分歧 | roll no-op 守卫 + 段链严格递增断言（conformance）|
+| ⑤ | segment_for 忽略 active | 情形分析不完备 | opfuzz 跨段循环读（新增）| 读包含性属性测试（任意 offset 读回覆盖）+ segment_for active 守卫 |
+| ⑥ | 空截断后 append 静默失效 | 空状态与判定条件交互 | 边界表测试（新增）| 🚧 WIP——needs_roll 判定修复后解除 ignore |
+| C13/7 | crafted 批 panic（validate_crc/append 双入口）| 不可信输入边界错误 | crafted 回归测试 + **Kani harness**（新增）| Verus total_len 算术定理（已有）+ Kani parse 扩展至 append 校验路径（待做）|
+| 8 | batch_io roll staging 丢失（review P0-2）| 多缓冲生命周期交互 | **opfuzz batch_io 档**（新增）| 🚧 WIP（LEO 背离复现中）+ 远期两级水位 TLA+ 小模型 |
+| 9 | checkpoint stale 窗口（truncate 不重写）| 派生持久化遗漏 | code review agent | truncate_to/retention 重写 checkpoint（已修）+ fsync（已修）|
+
 
 ## 9. 参考
 

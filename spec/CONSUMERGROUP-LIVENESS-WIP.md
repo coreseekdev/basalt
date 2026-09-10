@@ -1,4 +1,11 @@
-# 消费组收敛性活性实验 —— WIP（未闭合，留专项）
+# 消费组收敛性活性实验 —— 已闭合（结论：eager rebalance 在持续 churn 下无收敛保证）
+
+## 实证结论（2026-09-10，TLC 反例确认）
+`WF_vars(Coordinator)` 公平性下，TLC 给出真实反例循环：
+`NewJoin m1（ready 重置）→ Rejoin m2 → …` 无限重复——
+**eager rebalance 在成员持续 churn（离开-重入环）下不保证收敛**。
+这是协议固有性质（Kafka 同款已知问题，KIP-429 cooperative rebalance
+即为其缓解方案），不是实现缺陷。
 
 > **v0.2 已闭合部分（2026-09-10）**：CommitOffset fencing 动作（仅当代 owner、
 > offset 单调）与超时踢除路径已入模型，名义/阴性对照全绿（账本 C9 更新）。

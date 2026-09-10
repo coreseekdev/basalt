@@ -77,6 +77,8 @@ define
     /\ commits \in [Parts -> -1..6]
     /\ commitOwner \in [Parts -> MemberIds \cup {NoOwner}]
 
+
+
   \* generation 只增
   InvGenHistoryBounded == Cardinality(hist) <= MaxRounds
 
@@ -296,5 +298,9 @@ Next == Coordinator
 Spec == Init /\ [][Next]_vars
 
 \* END TRANSLATION 
+
+
+\* 活性性质（C9 收敛性）：RebalanceCompletes 定义见上方 hoisted define 区
+FairSpec == Spec /\ WF_vars(Coordinator)
 ================================================================================
 \* 2026-09-09 v0.1：安全性不变式（Stable 良构 / 同代分配唯一）；收敛性归仿真层。

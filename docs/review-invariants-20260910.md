@@ -66,3 +66,7 @@ view 陈旧，而是"崩溃后以原 epoch 自恢复服务"**——租约语义�
    已覆盖"已退成员/旧代成员"两类僵尸，更细粒度（组内代错位）不可表达。
 3. Stable 态成员失联踢除与 Leave 动作在模型中同效（效果等价的转移不改变
    行为图）——以注释标注，不增设冗余动作。
+4. code review 四轮 P2-4（truncate 后 Leader 继续接受 produce 复用截断区
+   offset）已于同日修复：partition actor 的 TruncateTo 在 Leader 角色且
+   offset < LEO 时拒绝（Err）——截断是 follower 侧分叉自愈动作，自愈前
+   必须先经 SetRole Follower；对照测试锁定 Follower 角色截断仍可用。

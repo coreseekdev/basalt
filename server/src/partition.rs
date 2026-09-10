@@ -444,6 +444,16 @@ impl PartitionActor {
                     let _ = reply.send(self.log.next_offset);
                 }
                 PartitionCmd::TruncateTo { offset, reply } => {
+                    // 四轮 review P2-4 fencing：截断是 follower 侧分叉自愈动作。
+                    // Leader 截自己的日志会让已 ack 的 offset 区间被后续
+                    // produce 复用（offset 流回卷、同 offset 双 success）——
+                    // 拒绝之；分叉自愈必须先经 SetRole Follower（控制器
+                    // failover 路径保证）。窗口内 deferred/parked 不受影响。
+                    if self.role == Role::Leader && offset < self.log.next_offset {
+                        tracing::warn!(topic=%self.name, partition=self.index, offset, next=self.log.next_offset, "truncate rejected on leader");
+                        let _ = reply.send(Err(StorageError::Other("truncate on leader rejected".into())));
+                        continue;
+                    }
                     // ADR-14：截断使窗口内 deferred produce（offset >= 截断点）
                     // 的数据失效——先按错误结算，再执行截断，杜绝
                     // "ack 成功但数据被截掉"（code review 三轮 P1-2）。
@@ -568,4 +578,145 @@ pub fn now_ms() -> i64 {
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_millis() as i64)
         .unwrap_or(0)
+}
+
+#[cfg(test)]
+mod truncate_fencing_tests {
+    //! 四轮 review P2-4 回归：Leader 不得截自己的日志。
+    //! 缺陷形态：TruncateTo 在 Leader 上生效 → 已 ack 的 offset 区间被
+    //! 后续 produce 复用（offset 流回卷、同 offset 双 success）。
+
+    use super::*;
+    use basalt_record::{encode_batch, Rec};
+    use basalt_storage::log::{FsyncSchedule, LogOptions};
+    use bytes::{Bytes, BytesMut};
+
+    fn batch_bytes(count: usize, tag: &str) -> Bytes {
+        let recs: Vec<Rec> = (0..count)
+            .map(|i| Rec {
+                timestamp_delta: i as i64,
+                key: Some(Bytes::from(format!("k{i}"))),
+                value: Some(Bytes::from(format!("{tag}-{i}"))),
+                headers: vec![],
+            })
+            .collect();
+        let mut b = BytesMut::new();
+        encode_batch(0, 0, 1000, 0, -1, -1, -1, &recs, &mut b);
+        b.freeze()
+    }
+
+    #[tokio::test]
+    async fn leader_rejects_truncate_no_offset_reuse() {
+        let dir = std::env::temp_dir().join(format!(
+            "basalt-truncfence-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let pool = std::sync::Arc::new(BufferPool::new());
+        let tx = PartitionActor::spawn(
+            "t".into(),
+            0,
+            0,
+            dir.clone(),
+            LogOptions { segment_max_bytes: 1 << 30, fsync: FsyncSchedule::Os, retention_ms: 0, retention_max_bytes: 0 },
+            ReplicaConfig { min_insync: 1, isr_lag: Duration::from_millis(500) },
+            pool,
+        )
+        .unwrap();
+
+        // Leader 上任（单副本）
+        tx.send(PartitionCmd::SetRole { leader: true, epoch: 1, replicas: vec![0] }).await.unwrap();
+
+        // produce 5 批 ×2 记录 → offsets 0..10，全部 success
+        for i in 0..5 {
+            let (ptx, prx) = oneshot::channel();
+            tx.send(PartitionCmd::Produce {
+                batches: batch_bytes(2, &format!("b{i}")),
+                policy: AssignPolicy::Assign,
+                acks: 1,
+                reply: ptx,
+            })
+            .await
+            .unwrap();
+            let o = prx.await.unwrap();
+            assert!(o.error.is_none(), "produce {i} 失败：{:?}", o.error);
+            assert_eq!(o.base_offset, i * 2);
+        }
+
+        // Leader 收到截断指令：必须被 fencing 拒绝（Err）
+        let (ttx, trx) = oneshot::channel();
+        tx.send(PartitionCmd::TruncateTo { offset: 4, reply: ttx }).await.unwrap();
+        let r = trx.await.unwrap();
+        assert!(r.is_err(), "Leader 上的 TruncateTo 必须被拒绝（P2-4 fencing）");
+
+        // LEO 不动、后续 produce 接在 10 之后（offset 流不回卷）
+        let (ltx, lrx) = oneshot::channel();
+        tx.send(PartitionCmd::LocalLeo { reply: ltx }).await.unwrap();
+        assert_eq!(lrx.await.unwrap(), 10, "被拒绝的截断不得改动 LEO");
+
+        let (ptx, prx) = oneshot::channel();
+        tx.send(PartitionCmd::Produce {
+            batches: batch_bytes(2, "after"),
+            policy: AssignPolicy::Assign,
+            acks: 1,
+            reply: ptx,
+        })
+        .await
+        .unwrap();
+        let o = prx.await.unwrap();
+        assert!(o.error.is_none(), "{:?}", o.error);
+        assert_eq!(o.base_offset, 10, "后续 produce 不得复用截断区 offset");
+
+        drop(tx);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn follower_still_truncates_on_command() {
+        // 对照组：Follower 角色的分叉自愈截断保持可用（探针分辨力自证）
+        let dir = std::env::temp_dir().join(format!(
+            "basalt-truncfence-f-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let pool = std::sync::Arc::new(BufferPool::new());
+        let tx = PartitionActor::spawn(
+            "t".into(),
+            0,
+            0,
+            dir.clone(),
+            LogOptions { segment_max_bytes: 1 << 30, fsync: FsyncSchedule::Os, retention_ms: 0, retention_max_bytes: 0 },
+            ReplicaConfig { min_insync: 1, isr_lag: Duration::from_millis(500) },
+            pool,
+        )
+        .unwrap();
+        tx.send(PartitionCmd::SetRole { leader: true, epoch: 1, replicas: vec![0] }).await.unwrap();
+        for i in 0..2 {
+            let (ptx, prx) = oneshot::channel();
+            tx.send(PartitionCmd::Produce {
+                batches: batch_bytes(2, &format!("f{i}")),
+                policy: AssignPolicy::Assign,
+                acks: 1,
+                reply: ptx,
+            })
+            .await
+            .unwrap();
+            assert_eq!(prx.await.unwrap().last_offset, i * 2 + 1);
+        }
+
+        // 降级为 Follower（分叉自愈前置条件）后截断：允许生效
+        tx.send(PartitionCmd::SetRole { leader: false, epoch: 2, replicas: vec![0] }).await.unwrap();
+        let (ttx, trx) = oneshot::channel();
+        tx.send(PartitionCmd::TruncateTo { offset: 2, reply: ttx }).await.unwrap();
+        let r = trx.await.unwrap();
+        assert!(r.is_ok(), "Follower 的分叉自愈截断必须可用：{:?}", r.err());
+        let (ltx, lrx) = oneshot::channel();
+        tx.send(PartitionCmd::LocalLeo { reply: ltx }).await.unwrap();
+        assert_eq!(lrx.await.unwrap(), 2);
+
+        drop(tx);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 }

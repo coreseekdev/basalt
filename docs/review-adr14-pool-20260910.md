@@ -168,4 +168,8 @@ partition.rs 却把这类 produce 按 success 应答（数据"已在截断点之
 4. P1-3：TruncateTo 先 flush 再截断（或窗口内全错误结算）+ 探针场景转正。
 5. P2 逐条：pool 归还钩子（配合基准验证 perf #2 真实闭环）、clippy 例外或去
    Arc、sync_file create、truncate fencing、注释漂移两处。
+   （2026-09-10 复核：1/2/6 已闭环——pool 响应缓冲入池 + read_ex 窗口归还、
+   Arc 豁免注记、注释修正；3 sync_file create 以 batch_io 跳过窗口 sync +
+   空段守卫替代；4 truncate fencing 已落地——Leader 角色拒绝 TruncateTo，
+   回归测试 truncate_fencing_tests ×2；5 窗口内 fetch 空响应用例记录不改。）
 6. 账本（docs/VERIFICATION.md §12）登记本轮缺陷 → 机制映射。

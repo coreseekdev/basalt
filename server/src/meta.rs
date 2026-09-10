@@ -67,6 +67,7 @@ pub enum MetaCmd {
 }
 
 pub struct MetaService {
+    pub pool: std::sync::Arc<BufferPool>,
     cfg: Config,
     /// 控制器内部地址（host:internal_port），非控制器节点经它转发建题
     controller_addr: Option<String>,
@@ -125,11 +126,13 @@ impl MetaService {
         controller_addr: Option<String>,
         #[allow(dead_code)]
     controller_tx: Option<mpsc::Sender<crate::internal::ControllerCmd>>,
+        pool: std::sync::Arc<BufferPool>,
     ) -> (mpsc::Sender<MetaCmd>, watch::Receiver<RoutingTable>) {
         let (tx, rx) = mpsc::channel(256);
         let (tw, tr) = watch::channel(RoutingTable::default());
         let svc = MetaService {
-            cfg,
+            cfg: cfg.clone(),
+            pool,
             controller_addr,
             cluster: ClusterState::default(),
             active_pulls: HashMap::new(),
@@ -285,7 +288,7 @@ impl MetaService {
                     retention_ms: 7 * 24 * 3600 * 1000,
                     retention_max_bytes: 0,
                 };
-                match PartitionActor::spawn(a.topic.clone(), a.partition, self.cfg.node_id, dir, opts, self.cfg.replica_config(), std::sync::Arc::new(BufferPool::new())) {
+                match PartitionActor::spawn(a.topic.clone(), a.partition, self.cfg.node_id, dir, opts, self.cfg.replica_config(), self.pool.clone()) {
                     Ok(tx) => {
                         entry.1.insert(a.partition);
                         let route = Route { tx: tx.clone(), leader: a.leader, epoch: a.epoch };

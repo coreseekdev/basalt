@@ -68,7 +68,8 @@ async fn async_main(cfg: Config) {
 
     let controller_addr = ctrl.as_ref().map(|(_, h, p)| format!("{h}:{}", p + 1));
 
-    let (meta_tx, routes_rx) = meta::MetaService::spawn(cfg.clone(), controller_addr, controller_tx.clone());
+    let pool: std::sync::Arc<BufferPool> = std::sync::Arc::new(BufferPool::new());
+    let (meta_tx, routes_rx) = meta::MetaService::spawn(cfg.clone(), controller_addr, controller_tx.clone(), pool.clone());
     let group_tx = basalt_coordinator::GroupManager::spawn(std::path::Path::new(&cfg.data_dir));
     let routes_rx_internal = routes_rx.clone();
 
@@ -94,13 +95,14 @@ async fn async_main(cfg: Config) {
             let _ = is_controller;
             // controller_tx 在下方通过闭包传递有所有权问题 —— POC 简化：
             // 内部服务的 controller 命令经 meta 通道回环由 sync 任务代为转发
-            let ctx = internal::InternalCtx {
-                node_id: cfg.node_id,
-                is_controller,
-                controller_tx: controller_tx_internal,
-                routes_rx: routes_rx_internal,
-            };
-            internal::serve(internal_listener, ctx).await;
+    let pool = std::sync::Arc::new(BufferPool::new());
+    let ctx = internal::InternalCtx {
+        node_id: cfg.node_id,
+        pool: pool.clone(),
+        is_controller,
+        controller_tx: controller_tx_internal,
+        routes_rx: routes_rx_internal,
+    };
         });
     }
 
@@ -190,7 +192,6 @@ async fn async_main(cfg: Config) {
         }
     });
 
-    let pool: std::sync::Arc<BufferPool> = std::sync::Arc::new(BufferPool::new());
     let ctx = handlers::Ctx {
         node_id: cfg.node_id,
         host: cfg.host.clone(),

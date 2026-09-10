@@ -4,6 +4,7 @@
 //! - 控制器角色（最小 node id 承担）：独占 ClusterState + record 日志，
 //!   心跳超时 → LeaderChange（epoch+1，副本轮转）。
 
+use basalt_storage::pool::BufferPool;
 use basalt_metadata::cluster::{BrokerInfo, ClusterRecord, ClusterState};
 use bytes::{BufMut, Bytes, BytesMut};
 use std::collections::HashMap;
@@ -368,6 +369,7 @@ fn decode_record(data: &[u8]) -> Option<ClusterRecord> {
 #[derive(Clone)]
 #[allow(dead_code)]
 pub struct InternalCtx {
+    pub pool: std::sync::Arc<BufferPool>,
     #[allow(dead_code)]
     pub node_id: i32,
     #[allow(dead_code)]

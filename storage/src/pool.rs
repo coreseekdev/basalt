@@ -41,10 +41,11 @@ impl BufferPool {
     }
 
     pub fn release(&self, buf: BytesMut) {
-        let class = buf.capacity();
-        if class < MIN_CLASS || class > MAX_CLASS || !class.is_power_of_two() {
+        let cap = buf.capacity();
+        if cap < MIN_CLASS || cap > MAX_CLASS {
             return;
         }
+        let class = Self::class_of(cap);
         let mut free = self.free.lock().unwrap();
         let bucket = free.entry(class).or_default();
         if bucket.len() < 64 {

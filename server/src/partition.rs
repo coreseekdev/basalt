@@ -292,6 +292,10 @@ impl PartitionActor {
                         tracing::info!(topic=%self.name, partition=self.index, ?new_role, epoch, replicas=?replicas, "role updated");
                         // 角色翻转：清空上一任期状态（LEO 上报/停等/挂起 fetch 全部失效）
                         self.follower_leos.clear();
+                        for (_, outcome) in self.deferred_produce.drain(..) {
+                            let _ = outcome;
+                        }
+                        self.deferred_produce.clear();
                         for p in self.parked_acks.drain(..) {
                             let _ = p.reply.send(ProduceOutcome {
                                 base_offset: -1, last_offset: p.last_offset, log_append_time: now_ms(),
@@ -447,6 +451,20 @@ impl PartitionActor {
                             outcome.error = Some(StorageError::Other("truncated by failover".into()));
                         }
                         let _ = reply.send(outcome);
+                    }
+                    // 四轮 review P1-2：parked_acks 中 last_offset >= offset 的
+                    // 也按错误结算（防止 offset 复用别名放行）
+                    let parked = std::mem::take(&mut self.parked_acks);
+                    for mut p in parked {
+                        if p.last_offset >= offset {
+                            p.reply.send(ProduceOutcome {
+                                base_offset: -1, last_offset: p.last_offset,
+                                log_append_time: now_ms(),
+                                error: Some(StorageError::Other("truncated by failover".into())),
+                            }).ok();
+                        } else {
+                            self.parked_acks.push(p);
+                        }
                     }
                     let _ = reply.send(self.log.truncate_to(offset));
                 }

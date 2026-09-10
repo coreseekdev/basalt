@@ -21,6 +21,18 @@ pub enum GroupState {
     Stable,
 }
 
+impl GroupState {
+    /// Kafka DescribeGroups/ListGroups 的状态串。
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            GroupState::Empty => "Empty",
+            GroupState::PreparingRebalance => "PreparingRebalance",
+            GroupState::CompletingSync => "CompletingSync",
+            GroupState::Stable => "Stable",
+        }
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct Member {
     pub member_id: String,
@@ -98,6 +110,37 @@ pub enum GroupCmd {
     CommitOffsets { group: String, generation: i32, member_id: String, offsets: Vec<CommittedOffset>, reply: tokio::sync::oneshot::Sender<CoordError> },
     FetchOffsets { group: String, topics: Option<Vec<String>>, reply: tokio::sync::oneshot::Sender<Vec<CommittedOffset>> },
     DeleteGroup { group: String },
+    /// 管理面：列出全部组（ListGroups v0-4）。
+    ListGroups { reply: tokio::sync::oneshot::Sender<Vec<GroupSummary>> },
+    /// 管理面：查询单组详情（DescribeGroups）。组不存在回 None。
+    DescribeGroup { group: String, reply: tokio::sync::oneshot::Sender<Option<GroupDetail>> },
+}
+
+/// ListGroups 条目。
+#[derive(Debug, Clone)]
+pub struct GroupSummary {
+    pub group: String,
+    pub protocol_type: String,
+    pub state: String,
+}
+
+/// DescribeGroups 成员条目（client_id 当前不可得，恒空串）。
+#[derive(Debug, Clone)]
+pub struct MemberDetail {
+    pub member_id: String,
+    pub client_id: String,
+    pub client_host: String,
+    pub metadata: Vec<u8>,
+    pub assignment: Vec<u8>,
+}
+
+/// DescribeGroups 组详情。
+#[derive(Debug, Clone)]
+pub struct GroupDetail {
+    pub state: String,
+    pub protocol_type: String,
+    pub protocol: String,
+    pub members: Vec<MemberDetail>,
 }
 
 pub struct JoinResult {
@@ -311,6 +354,37 @@ impl GroupManager {
             }
             GroupCmd::DeleteGroup { group } => {
                 self.groups.remove(&group);
+            }
+            GroupCmd::ListGroups { reply } => {
+                let out = self
+                    .groups
+                    .iter()
+                    .map(|(name, g)| GroupSummary {
+                        group: name.clone(),
+                        protocol_type: g.protocol_type.clone(),
+                        state: g.state.as_str().to_string(),
+                    })
+                    .collect();
+                let _ = reply.send(out);
+            }
+            GroupCmd::DescribeGroup { group, reply } => {
+                let detail = self.groups.get(&group).map(|g| GroupDetail {
+                    state: g.state.as_str().to_string(),
+                    protocol_type: g.protocol_type.clone(),
+                    protocol: g.protocol.clone().unwrap_or_default(),
+                    members: g
+                        .members
+                        .iter()
+                        .map(|m| MemberDetail {
+                            member_id: m.member_id.clone(),
+                            client_id: String::new(),
+                            client_host: m.client_host.clone(),
+                            metadata: m.subscription.clone(),
+                            assignment: m.assignment.clone(),
+                        })
+                        .collect(),
+                });
+                let _ = reply.send(detail);
             }
         }
     }

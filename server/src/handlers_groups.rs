@@ -347,26 +347,41 @@ pub async fn create_topics(req: &basalt_protocol::value::Struct, ctx: &Ctx) -> V
 }
 
 pub async fn delete_topics(req: &basalt_protocol::value::Struct, ctx: &Ctx) -> Value {
-    let mut results = Vec::new();
+    // v0-5：TopicNames（[]string）；v6+：Topics（[]DeleteTopicState{Name?, TopicId}）
+    let mut targets: Vec<(String, u128)> = Vec::new();
     if let Some(Value::Array(topics)) = req.get("Topics") {
         for t in topics {
             let Value::Struct(ts) = t else { continue };
             let name = ts.get("Name").map(|v| v.as_str().to_string()).unwrap_or_default();
+            let tid = ts.get("TopicId").map(|v| v.as_uuid()).unwrap_or(0);
+            targets.push((name, tid));
+        }
+    } else if let Some(Value::Array(tn)) = req.get("TopicNames") {
+        for t in tn {
+            targets.push((t.as_str().to_string(), 0));
+        }
+    }
+    let mut results = Vec::new();
+    for (name, tid) in targets {
+        // 仅按名删除；纯 TopicId（Name 为空）请求暂不支持（返回 UNKNOWN_TOPIC_ID）
+        let err = if name.is_empty() {
+            ErrorCode::UnknownTopicId
+        } else {
             let (reply_tx, reply_rx) = oneshot::channel();
             let _ = ctx.meta_tx.send(MetaCmd::Lookup { names: Some(vec![name.clone()]), allow_create: false, reply: reply_tx }).await;
             let (found, _brokers) = reply_rx.await.unwrap_or_default();
-            let err = if found.is_empty() {
+            if found.is_empty() {
                 ErrorCode::UnknownTopicOrPartition
             } else {
                 ErrorCode::None // 删除语义 POC：标记即可，物理删除由 retention 完成
-            };
-            results.push(s([
-                ("Name", Value::str(name)),
-                ("TopicId", Value::Uuid(0)),
-                ("ErrorCode", Value::I16(err as i16)),
-                ("ErrorMessage", Value::Null),
-            ]));
-        }
+            }
+        };
+        results.push(s([
+            ("Name", Value::str(name)),
+            ("TopicId", Value::Uuid(tid)),
+            ("ErrorCode", Value::I16(err as i16)),
+            ("ErrorMessage", Value::Null),
+        ]));
     }
     s([("ThrottleTimeMs", Value::I32(0)), ("Responses", Value::Array(results))])
 }
@@ -374,41 +389,78 @@ pub async fn delete_topics(req: &basalt_protocol::value::Struct, ctx: &Ctx) -> V
 
 // ---------- DescribeGroups / ListGroups ----------
 
-pub async fn describe_groups(req: &basalt_protocol::value::Struct, _ctx: &Ctx) -> Value {
-    // GroupId 数组
+pub async fn describe_groups(req: &basalt_protocol::value::Struct, ctx: &Ctx) -> Value {
+    // 请求 v0-5：Groups 是 []string（非 struct 数组）
     let mut group_ids = Vec::new();
-    if let Some(Value::Array(gs)) = req.get("GroupIds") {
+    if let Some(Value::Array(gs)) = req.get("Groups") {
         for g in gs {
-            if let Value::Struct(gs2) = g {
-                group_ids.push(gs2.get("GroupId").map(|v| v.as_str().to_string()).unwrap_or_default());
-            }
+            group_ids.push(g.as_str().to_string());
         }
     }
+    let include_ops = req.get("IncludeAuthorizedOperations").map(|v| v.as_bool()).unwrap_or(false);
 
-    // GroupManager 没有直接暴露"列出所有组"——由 handler 层向协调器查询
-    // POC：返回空组描述（组存在但无活跃成员时返回 Dead 状态）
-    let responses: Vec<Value> = group_ids
-        .into_iter()
-        .map(|gid| {
-            s([
+    let mut responses = Vec::new();
+    for gid in group_ids {
+        let (tx, rx) = oneshot::channel();
+        ctx.group_tx.send(GroupCmd::DescribeGroup { group: gid.clone(), reply: tx }).await.ok();
+        let detail = rx.await.ok().flatten();
+        match detail {
+            Some(d) => responses.push(s([
                 ("ErrorCode", Value::I16(ErrorCode::None as i16)),
+                ("ErrorMessage", Value::Null),
                 ("GroupId", Value::str(gid)),
-                ("State", Value::str("Stable")),
-                ("ProtocolType", Value::str("consumer")),
-                ("Protocol", Value::str("range")),
+                ("GroupState", Value::str(d.state)),
+                ("ProtocolType", Value::str(d.protocol_type)),
+                ("ProtocolData", Value::str(d.protocol)),
+                ("Members", Value::Array(
+                    d.members.iter().map(|m| s([
+                        ("MemberId", Value::str(m.member_id.clone())),
+                        ("GroupInstanceId", Value::Null),
+                        ("ClientId", Value::str(m.client_id.clone())),
+                        ("ClientHost", Value::str(m.client_host.clone())),
+                        ("MemberMetadata", Value::Bytes(Bytes::copy_from_slice(&m.metadata))),
+                        ("MemberAssignment", Value::Bytes(Bytes::copy_from_slice(&m.assignment))),
+                    ])).collect(),
+                )),
+                ("AuthorizedOperations", Value::I32(if include_ops { 0 } else { -2147483648 })),
+            ])),
+            None => responses.push(s([
+                ("ErrorCode", Value::I16(ErrorCode::None as i16)),
+                ("ErrorMessage", Value::Null),
+                ("GroupId", Value::str(gid)),
+                ("GroupState", Value::str("Dead")),
+                ("ProtocolType", Value::str("")),
+                ("ProtocolData", Value::str("")),
                 ("Members", Value::Array(vec![])),
                 ("AuthorizedOperations", Value::I32(-2147483648)),
-            ])
-        })
-        .collect();
+            ])),
+        }
+    }
     s([("ThrottleTimeMs", Value::I32(0)), ("Groups", Value::Array(responses))])
 }
 
-pub async fn list_groups(_req: &basalt_protocol::value::Struct, _ctx: &Ctx) -> Value {
-    // POC：返回空组列表（组发现需要协调器全局视角——M1 补全）
+pub async fn list_groups(req: &basalt_protocol::value::Struct, ctx: &Ctx) -> Value {
+    let states_filter: Option<Vec<String>> = req.get("StatesFilter").and_then(|v| match v {
+        Value::Array(a) => Some(a.iter().map(|x| x.as_str().to_string()).collect()),
+        _ => None,
+    });
+    let (tx, rx) = oneshot::channel();
+    ctx.group_tx.send(GroupCmd::ListGroups { reply: tx }).await.ok();
+    let groups = rx.await.unwrap_or_default();
+    let groups: Vec<Value> = groups
+        .into_iter()
+        .filter(|g| states_filter.as_ref().map_or(true, |f| f.iter().any(|s| s == &g.state)))
+        .map(|g| s([
+            ("GroupId", Value::str(g.group)),
+            ("ProtocolType", Value::str(g.protocol_type)),
+            ("GroupState", Value::str(g.state)),
+            ("GroupType", Value::str("classic")),
+        ]))
+        .collect();
     s([
         ("ThrottleTimeMs", Value::I32(0)),
-        ("Groups", Value::Array(vec![])),
+        ("ErrorCode", Value::I16(ErrorCode::None as i16)),
+        ("Groups", Value::Array(groups)),
     ])
 }
 

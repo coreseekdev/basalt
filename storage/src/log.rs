@@ -289,6 +289,11 @@ impl<D: DiskIo> Log<D> {
             if rest.len() < total {
                 return Err(err("truncated batch".into()));
             }
+            // 批必须至少容纳 12..61 的头部其余部分（opfuzz/C13 同族：
+            // batch_length < 49 时 CRC 覆盖域 [21,total) 空或倒挂）
+            if total < RECORD_BATCH_HEADER_LEN {
+                return Err(err(format!("batch_length too small: total={total}")));
+            }
             if h.magic != crate::MAGIC_V2 {
                 return Err(err(format!("magic {} unsupported (ADR-4: v2 only)", h.magic)));
             }
@@ -333,7 +338,7 @@ impl<D: DiskIo> Log<D> {
             let needs_patch = policy == AssignPolicy::Assign
                 && raw[0..8] != pd.assigned.to_be_bytes();
 
-            if !needs_roll && !needs_patch {
+            if !needs_roll && !needs_patch && self.batch_staging.is_empty() {
                 // 直接写 raw 到磁盘（无中间缓冲）
                 self.disk.append(&self.active.path, raw)?;
                 self.active.push_batch(pd.total, pd.count, pd.max_ts);
@@ -445,6 +450,9 @@ impl<D: DiskIo> Log<D> {
 
     /// 滚动：持久化索引，active → sealed；新段目录项随数据 fsync（P2 修复）。
     pub fn roll(&mut self) -> Result<()> {
+        // 换段前必须排空跨调用累积的 batch_staging——否则旧段数据写入新段
+        // 文件（opfuzz 未覆盖 batch_io 档，code review P0-2 实证 ack 丢失）
+        self.flush_batch()?;
         // 空 active 封存是无条件 no-op：封存会创建与 active 同 base 的新段
         // （next_offset == active.base 时路径重合），两个 Segment 对象共享
         // 同一路径，任何一侧的文件删除都会炸掉另一侧的数据
@@ -675,7 +683,10 @@ impl<D: DiskIo> Log<D> {
         for seg in &self.sealed {
             cp.push_str(&format!("{}:{}\n", seg.base_offset, seg.bytes));
         }
-        let _ = std::fs::write(self.dir.join("recovery.checkpoint"), &cp);
+        let cp_path = self.dir.join("recovery.checkpoint");
+        let _ = std::fs::write(&cp_path, &cp);
+        // checkpoint 必须扛掉电：写后 fsync（真实 FS 语义；SimDisk 为 no-op）
+        let _ = std::fs::File::open(&cp_path).and_then(|f| f.sync_all());
     }
 
     /// 记录 epoch 变更（leader 变更时由 actor 调用）。
@@ -803,13 +814,6 @@ impl<D: DiskIo> Log<D> {
         self.disk.sync_file(&seg.path)?;
         self.disk.sync_dir(&seg.path)?;
         seg.bytes = exact;
-        let empty_misaligned = seg.bytes == 0 && seg.base_offset != kept_end;
-        // 重建内存索引（复用恢复扫描：文件已截断，扫描即重建）
-        crate::log::rescan_segment(&self.disk, seg);
-        // 空段且 base 与新 LEO 不对齐：以 kept_end 重建，恢复扫描期望才一致
-        if empty_misaligned {
-            self.active = Segment::new(&self.dir, kept_end);
-        }
         self.next_offset = kept_end;
         if self.high_watermark > kept_end {
             self.high_watermark = kept_end;
@@ -826,6 +830,7 @@ impl<D: DiskIo> Log<D> {
         if self.epoch_history.is_empty() {
             self.epoch_history.push((0, kept_end));
         }
+        self.persist_checkpoint();
         tracing::warn!(offset, kept_end, "log truncated (divergent tail healing)");
         Ok(())
     }
@@ -837,6 +842,7 @@ impl<D: DiskIo> Log<D> {
             let _ = self.disk.remove(&seg.time_path);
         }
         self.sealed.clear();
+        self.batch_staging.clear();
         let _ = self.disk.remove(&self.active.path);
         let _ = self.disk.remove(&self.active.index_path);
         let _ = self.disk.remove(&self.active.time_path);
@@ -914,7 +920,8 @@ fn scan_and_truncate<D: DiskIo>(disk: &D, seg: &mut Segment, expect_base: i64) -
     while pos + RECORD_BATCH_HEADER_LEN <= data.len() {
         let Some(h) = BatchHeader::parse(&data[pos..]) else { break };
         let total = h.total_len();
-        if total == 0 || pos + total > data.len() {
+        // total < 61 视为损坏尾（bit rot 可把 batch_length 打成 < 49）
+        if total < RECORD_BATCH_HEADER_LEN || pos + total > data.len() {
             break;
         }
         if h.magic != crate::MAGIC_V2 {

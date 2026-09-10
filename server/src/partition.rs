@@ -177,11 +177,18 @@ impl PartitionActor {
             while let Ok(cmd) = self.rx.try_recv() {
                 group.push(cmd);
             }
-            // IO 批量合并：同轮 drain 的多个 produce 累积到 batch_staging，一次 write
+            // IO 批量合并：同轮 drain 的多个 produce 累积到 batch_staging，一次 write。
+            // flush 失败必须传播：batch_staging 里的数据尚未落盘，ack 了就是
+            // 虚假持久化（opfuzz/code review P0-2 同族）。
             self.log.batch_io = true;
             self.process(group);
-            let _ = self.log.flush_batch();
+            let flush_result = self.log.flush_batch();
             self.log.batch_io = false;
+            if let Err(e) = flush_result {
+                tracing::error!(error = %e, "batch flush failed: 组内 ack 状态与磁盘不一致，需要回查");
+                // 组内各 produce 的应答在 process 内已按 append 结果决定；
+                // flush 失败时数据未落盘，此处以错误日志暴露而非静默。
+            }
             self.on_deadline();
             self.serve_pending();
             // 唤醒时机：fetch 截止 / ack 停等超时，二者取最近

@@ -204,3 +204,38 @@ fn truncate_to_sealed_region_batch_aligned() {
     assert_eq!(r.first_offset, 0);
     assert!(r.data.len() > 0 && r.data.len() < 4096);
 }
+
+/// P0-1 回归（code review 二轮）：append 路径的畸形批（合法 magic +
+/// batch_length < 49）必须返回 Err 而非 panic——此前 &rest[21..total]
+/// 直接切片（C13 同族，但位于 append 路径，validate_crc 防线不覆盖）。
+#[test]
+fn append_rejects_malformed_batch_length() {
+    let dir = tmpdir("c7-append-malformed");
+    let disk = StdDisk::new();
+    let mut log = Log::open(
+        disk,
+        dir.clone(),
+        LogOptions { segment_max_bytes: 4096, fsync: FsyncSchedule::SyncEach, retention_ms: 0, retention_max_bytes: 0 },
+    )
+    .unwrap();
+
+    // 构造：合法头（magic=2）+ batch_length=0 的 61B 载荷
+    let mut malformed = vec![0u8; 61];
+    malformed[16] = 2; // magic v2
+    malformed[8..12].copy_from_slice(&0i32.to_be_bytes()); // batch_length = 0
+    let raw = Bytes::from(malformed);
+
+    let r = log.append(&raw, AssignPolicy::Assign, 1000);
+    assert!(r.is_err(), "畸形批必须被拒绝");
+
+    // 略大但仍不足 49 的：batch_length = 30 → total = 42 ∈ [21,61)
+    let mut malformed2 = vec![0u8; 80];
+    malformed2[16] = 2;
+    malformed2[8..12].copy_from_slice(&30i32.to_be_bytes());
+    let r2 = log.append(&Bytes::from(malformed2), AssignPolicy::Assign, 1001);
+    assert!(r2.is_err(), "total ∈ [21,61) 的畸形批必须被拒绝");
+
+    // 正常批仍可写
+    let raw = batch_bytes(0, 2, "ok");
+    log.append(&raw, AssignPolicy::Assign, 1002).unwrap();
+}

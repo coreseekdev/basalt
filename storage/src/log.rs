@@ -496,6 +496,17 @@ impl<D: DiskIo> Log<D> {
         self.disk.sync_file(&self.active.path)
     }
 
+    /// batch_io 窗口收口（ADR-14）：排空 staging；SyncEach 档补 fsync。
+    /// 窗口内 produce 的应答必须在本调用成功后发放——否则存在
+    /// "ack 而未写文件"窗口（opfuzz batch_io 档实证）。
+    pub fn end_batch_window(&mut self) -> Result<()> {
+        self.flush_batch()?;
+        if self.opts.fsync == FsyncSchedule::SyncEach {
+            self.disk.sync_file(&self.active.path)?;
+        }
+        Ok(())
+    }
+
     // ---------- 读路径 ----------
 
     /// 读取；`cap` 决定上界（consumer=HW，复制拉取=LEO）。

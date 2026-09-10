@@ -187,7 +187,7 @@ impl PartitionActor {
             // flush 失败 → 窗口内 produce 全部按存储错误应答。
             self.log.batch_io = true;
             self.process(group);
-            let flush_result = self.log.flush_batch();
+            let flush_result = self.log.end_batch_window();
             self.log.batch_io = false;
             if let Err(e) = &flush_result {
                 tracing::error!(error = %e, "batch flush failed: 窗口内 produce 按错误应答");
@@ -213,7 +213,7 @@ impl PartitionActor {
                             }
                             self.log.batch_io = true;
                             self.process(group);
-                            let flush_ok = self.log.flush_batch().is_ok();
+                            let flush_ok = self.log.end_batch_window().is_ok();
                             self.log.batch_io = false;
                             self.settle_deferred_produce(flush_ok);
                             self.on_deadline();

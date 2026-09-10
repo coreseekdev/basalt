@@ -54,7 +54,7 @@ pub async fn serve_connection(
         tokio::spawn(async move {
             match dispatch(frame_bytes, &ctx).await {
                 Ok(Some(resp)) => {
-                    let _ = resp_tx.send(Bytes::from(resp)).await;
+                    let _ = resp_tx.send(resp).await;
                 }
                 Ok(None) => {} // acks=0：无响应
                 Err(DispatchError::UnknownApi) => {
@@ -63,7 +63,7 @@ pub async fn serve_connection(
                     // 读循环在客户端超时后自行收敛。生产化时可引入 per-conn 关闭令牌。
                 }
                 Err(DispatchError::UnsupportedVersion(api_key, version)) => {
-                    if let Some(b) = synth_unsupported(api_key, version) {
+                    if let Some(b) = synth_unsupported(api_key, version).map(Bytes::from) {
                         let _ = resp_tx.send(Bytes::from(b)).await;
                     }
                 }
@@ -129,7 +129,7 @@ impl From<ProtocolError> for DispatchError {
 }
 
 /// 处理一帧；返回完整响应帧（含长度前缀）。
-async fn dispatch(frame_bytes: Bytes, ctx: &Ctx) -> Result<Option<Vec<u8>>, DispatchError> {
+async fn dispatch(frame_bytes: Bytes, ctx: &Ctx) -> Result<Option<Bytes>, DispatchError> {
     let reg = Registry::global();
     // 预读 api_key/version 以定头版本（先偷看前 4 字节，读头时再正式解析）
     if frame_bytes.len() < 8 {
@@ -148,7 +148,7 @@ async fn dispatch(frame_bytes: Bytes, ctx: &Ctx) -> Result<Option<Vec<u8>>, Disp
             // KIP-511 探测语义：协商前的 ApiVersions 可能用旧头/无 tag section，
             // 解析失败也要以 v0 语义回 UNSUPPORTED_VERSION（corr 在固定偏移 4..8）
             if api_key == key::API_VERSIONS {
-                return Ok(Some(synth_apiversions_unsupported(&frame_bytes)));
+                return Ok(Some(Bytes::from(synth_apiversions_unsupported(&frame_bytes))));
             }
             return Err(DispatchError::Protocol(e));
         }
@@ -177,7 +177,7 @@ async fn dispatch(frame_bytes: Bytes, ctx: &Ctx) -> Result<Option<Vec<u8>>, Disp
             // KIP-511：客户端在版本协商前可能用旧头发 ApiVersions 探测。
             // Kafka broker 语义：该请求解析失败 → 以 v0 格式回 UNSUPPORTED_VERSION，连接保活。
             if api_key == key::API_VERSIONS {
-                return Ok(Some(synth_apiversions_unsupported(&frame_bytes)));
+                return Ok(Some(Bytes::from(synth_apiversions_unsupported(&frame_bytes))));
             }
             return Err(DispatchError::Protocol(e));
         }
@@ -213,16 +213,16 @@ async fn dispatch(frame_bytes: Bytes, ctx: &Ctx) -> Result<Option<Vec<u8>>, Disp
         }
     };
 
-    // 响应编码
-    let mut out = BytesMut::new();
+    // 响应编码（perf #3）：预留 4B 长度前缀占位，编码后回填——消除
+    // framed 中间缓冲与 to_vec 的两次整响应拷贝；freeze 后零拷贝进写通道。
+    let mut out = BytesMut::with_capacity(4 + 512);
+    out.extend_from_slice(&[0u8; 4]); // 长度前缀占位
     let resp_header_v = frame::response_header_version(api_key, flexible);
     frame::write_response_header(&mut out, head.correlation_id, resp_header_v);
     codec::encode_struct_fields(&entry.response.fields, api_version, flexible, &resp_value_value(&resp_value), &mut out)?;
-    let total = out.len() as i32;
-    let mut framed = BytesMut::with_capacity(out.len() + 4);
-    framed.extend_from_slice(&total.to_be_bytes());
-    framed.extend_from_slice(&out);
-    Ok(if acks_none { None } else { Some(framed.to_vec()) })
+    let total = (out.len() - 4) as i32;
+    out[0..4].copy_from_slice(&total.to_be_bytes());
+    Ok(if acks_none { None } else { Some(out.freeze()) })
 }
 
 fn resp_value_value(v: &Value) -> &Struct {

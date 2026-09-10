@@ -518,50 +518,51 @@ impl<D: DiskIo> Log<D> {
         }
         let seg = self.segment_for(from_offset);
         let start_pos = seg.locate(from_offset);
-        let mut out = pool.acquire(max_bytes.min(1024 * 1024));
-        let mut pos = start_pos;
+        // perf #1：单次大读——将 [start_pos, start_pos+want) 一次读入内存，
+        // 逐批解析筛选。消除每批 2 次 pread 与 resize 零填充。
+        // want 上界：max_bytes + 索引间隔（from_offset 前跳批窗口）+ 批头，
+        // 封顶段剩余。（SemDisk/StdDisk 的 read_at 均按 effective 长度截断。）
+        let remaining = seg.bytes.saturating_sub(start_pos);
+        let want = (max_bytes as u64 + INDEX_INTERVAL_BYTES + RECORD_BATCH_HEADER_LEN as u64)
+            .min(remaining) as usize;
+        let mut raw = pool.acquire(want);
+        raw.resize(want, 0);
+        let got = self.disk.read_at(&seg.path, start_pos, &mut raw)?;
+        raw.truncate(got);
+
+        let mut out = pool.acquire(max_bytes.min(1024 * 1024) as usize);
+        let mut pos: usize = 0;
         let mut first_offset: Option<i64> = None;
         let mut budget: i64 = max_bytes as i64;
 
         loop {
-            if pos + RECORD_BATCH_HEADER_LEN as u64 > seg.bytes {
+            if pos + RECORD_BATCH_HEADER_LEN > raw.len() {
                 break;
             }
-            let mut hdr = [0u8; RECORD_BATCH_HEADER_LEN];
-            let n = self.disk.read_at(&seg.path, pos, &mut hdr)?;
-            if n < RECORD_BATCH_HEADER_LEN {
-                break;
-            }
-            let Some(h) = BatchHeader::parse(&hdr) else { break };
-            let total = h.total_len();
-            if total == 0 || pos + total as u64 > seg.bytes {
+            let Some(h) = BatchHeader::parse(&raw[pos..]) else { break };
+            let total = h.total_len() as usize;
+            if total == 0 || pos + total > raw.len() {
                 break;
             }
             // 消费读不得越过 HW（未提交数据不可见）
-            if cap == ReadCap::HighWatermark && h.base_offset >= upper {
+            if cap == ReadCap::HighWatermark && (h.base_offset as i64) >= upper {
                 break;
             }
             // 整批粒度：预算不足但已读到数据 → 停；首批即便超预算也带上（Kafka 同义）
             if budget <= 0 && !out.is_empty() {
                 break;
             }
-            let batch_last = h.base_offset + h.record_count as i64 - 1;
+            let batch_last = h.base_offset as i64 + h.record_count as i64 - 1;
             if batch_last < from_offset {
-                pos += total as u64;
+                pos += total;
                 continue;
             }
-            let old_len = out.len();
-            out.resize(old_len + total, 0);
-            let got = self.disk.read_at(&seg.path, pos, &mut out.as_mut()[old_len..])?;
-            if got < total {
-                out.truncate(old_len);
-                break;
-            }
+            out.extend_from_slice(&raw[pos..pos + total]);
             if first_offset.is_none() {
                 first_offset = Some(h.base_offset);
             }
             budget -= total as i64;
-            pos += total as u64;
+            pos += total;
         }
 
         Ok(ReadResult {

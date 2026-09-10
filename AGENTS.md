@@ -64,5 +64,6 @@ code review agent（发现缺陷/语义澄清）
 
 - 验证总纲与账本：docs/VERIFICATION.md（§12 缺陷→机制矩阵）
 - 规约验证指南（人类可读）：spec/VERIFICATION-GUIDE.md
-- 评审任务书范例：docs/review-storage-c7-20260909.md
+- 评审任务书：docs/review-storage-c7-20260909.md（三轮）、docs/review-adr14-pool-20260910.md（四轮）、
+  docs/review-invariants-20260910.md（不变式评审+突变对照登记）——新评审以最新一份为格式范例
 - opfuzz WIP 复现序列：storage/tests/opfuzz.rs 注释

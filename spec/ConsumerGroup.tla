@@ -68,6 +68,16 @@ define
   \* generation 只增
   InvGenHistoryBounded == Cardinality(hist) <= MaxRounds
 
+  \* C9 收敛性（活性，公平性实验）：PreparingRebalance 在 gen 未达上界时
+  \* 必须最终离开（到 Stable 或组空）。需要 fair process 的 WF：
+  \* - Rejoin/全员完成加入 持续可用则最终发生（WF）
+  \* - Sync 持续可用则最终发生（WF）
+  \* 注意：gen = MaxRounds 的 Preparing 允许永久停留（上界守卫），故
+  \* 结论含 gen = MaxRounds 逃生分支。
+  RebalanceCompletes ==
+    []((state = "PreparingRebalance" /\ gen < MaxRounds) =>
+        <>(state \in {"Stable", "Empty"} \/ gen = MaxRounds))
+
 end define
 
 \* 单一 coordinator actor + 成员事件的非确定性选择（镜像无锁 actor 实现）
@@ -140,7 +150,7 @@ begin
 end process ;
 
 end algorithm ; *)
-\* BEGIN TRANSLATION (chksum(pcal) = "6a5609a4" /\ chksum(tla) = "65c3f549")
+\* BEGIN TRANSLATION (chksum(pcal) = "aab8c01d" /\ chksum(tla) = "eab8da7d")
 VARIABLES state, gen, members, ready, assignment, hist
 
 (* define statement *)
@@ -171,6 +181,16 @@ InvReadySubset == ready \subseteq members
 
 
 InvGenHistoryBounded == Cardinality(hist) <= MaxRounds
+
+
+
+
+
+
+
+RebalanceCompletes ==
+  []((state = "PreparingRebalance" /\ gen < MaxRounds) =>
+      <>(state \in {"Stable", "Empty"} \/ gen = MaxRounds))
 
 
 vars == << state, gen, members, ready, assignment, hist >>
@@ -233,6 +253,10 @@ Coordinator == \/ /\ \E m \in MemberIds \ members:
 Next == Coordinator
 
 Spec == Init /\ [][Next]_vars
+
+\* 活性实验（C9 收敛性）：对 Next 的弱公平——Preparing 下任一 Next 步
+\* 都单调推进 ready/成员状态，排纯 Stuttering；配合 RebalanceCompletes。
+FairSpec == Spec /\ WF_vars(Next)
 
 \* END TRANSLATION 
 ================================================================================

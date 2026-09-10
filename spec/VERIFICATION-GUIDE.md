@@ -10,7 +10,7 @@
 | 规约 | 一句话业务承诺 | 复跑命令 | 期望结果 |
 |---|---|---|---|
 | `BasaltDataPlane.tla` | 任意崩溃/断网/切主序列之后：**已 ack 的消息永远不丢，消费者永远读不到没被承诺的数据，每个 epoch 只有一个有权写的主** | `make check` | 全绿（8890 万状态，TLC2 2026.09.09.014814） |
-| 同上（阴性对照） | 跳过继任规则 = 必然丢数据，检查器能抓到 | `make demo-eager` | **必须红**（InvLeaderHasCommitted 反例） |
+| 同上（阴性对照） | 跳过继任规则 = 必然丢数据，检查器能抓到 | `make demo-eager` | **必须红**（实测先爆 InvCurrentLeaderHasCommitted，5,587 状态；单留 InvLeaderHasCommitted 亦可检出，19,877 状态——C3 实质成立） |
 | 同上（实验） | 控制器 fencing 全失效时，follower 侧 fencing + 继任规则自足 | `make splitbrain` / `splitbrain-cepoch` | 双绿 |
 | `ConsumerGroup.tla` | 成员任意来去之后，只要组进入 Stable，**每个分区恰好有一个负责人，且是活着的成员** | `make consumer-group` | 全绿 |
 | 同上（阴性对照） | "部分就绪即 Sync"= Stable 中出现没报到的 owner，检查器能抓到 | `make consumer-group-demo` | **必须红**（InvStableWellFormed 反例） |
@@ -18,7 +18,7 @@
 两条纪律：
 
 1. **设计变更门禁**：改复制协议、rebalance 状态机、或 `coordinator/src/lib.rs` / 未来 partition actor 的对应逻辑，必须重跑全部 6 个目标（4 数据面 + 2 消费组）。阴性对照变绿 = 检查器失去判别力，比阳性变红更严重。
-2. **规约层只验安全性**。所有"有限时间内收敛"（failover <2s、rebalance 时限、心跳超时）不在这两个规约里，归 L2 仿真 + 混沌长跑（T-Q.4）。原因见 §6。
+2. **规约层以安全性为主**；活性仅一处且为**已证明的负结果**——`ConsumerGroupLiveness.tla` 四级公平性二分（2026-09-10）实证 `RebalanceCompletes` 在任何 coordinator 侧公平性下均不可满足（成员无限 churn 使收口永非持续可用），`consumer-group-liveness.cfg` 保留为已知红阴性对照。现实收敛性归 L2 仿真 + 混沌长跑（T-Q.4）。
 
 ---
 
@@ -88,7 +88,7 @@
 
 | 开关 | 改了什么 | 结果 | 证明了什么 |
 |---|---|---|---|
-| `EagerLeader=TRUE`（`make demo-eager`） | 新主跳过继任接管（CatchUp）直接服务 | **红**：InvLeaderHasCommitted 反例（新主拿空/短日志 Push，把持有 acked 数据的 follower 截断掉） | 继任规则（取多数派中 (lastEpoch, len) 字典序最大者）是 C1 的**必要**设计。TASK.md T-M2.3 的"继任者预计算"不可省、不可简化 |
+| `EagerLeader=TRUE`（`make demo-eager`） | 新主跳过继任接管（CatchUp）直接服务 | **红**：实测先爆 InvCurrentLeaderHasCommitted（5,587 状态——新主持有分叉短日志即违 C1b）；单验 InvLeaderHasCommitted 也红（19,877 状态——新主拿空/短日志 Push，把持有 acked 数据的 follower 截断掉） | 继任规则（取多数派中 (lastEpoch, len) 字典序最大者）是 C1 的**必要**设计。TASK.md T-M2.3 的"继任者预计算"不可省、不可简化 |
 | `SplitBrain=TRUE`（`make splitbrain`） | 控制器 fencing 失效：旧主永远不知道自己被替换，与新旧主并发服务（且提交不校验视图） | 绿 | follower 侧 epoch fencing（只接受不晚于自身 view 的 epoch）+ 继任规则的 epoch 支配，**在没有控制器兜底时依然保住 C1/C2/C4**。旧主无限期僵尸化不破坏安全 |
 | `CommitChecksEpoch=TRUE`（`make splitbrain-cepoch`） | 在上一场景基础上，commit 的多数派还需视图与主一致 | 绿 | `CommitChecksEpoch` 对安全性**非必需**（C4'）：它不是 C1 成立的隐藏前提，可作纵深防御保留。注意 `check.cfg` 名义场景默认开它——若未来改动使 splitbrain 变红，说明改动隐式依赖了这个防线 |
 
@@ -155,7 +155,7 @@ make consumer-group-demo # 阴性对照（SyncRequiresFull=FALSE）：必须检�
 | P1-4 | **"无双消费（fencing）"完全未建模**：模型没有消费动作和 offset 提交；跨代僵尸（旧代成员继续消费/提交）是验收不变式 5 的另一半 | 账本 C9 只覆盖安全性上半；generation fencing 的客户端语义（`IllegalGeneration`，实现已有）无规约依据 | v0.2 加：offset 提交动作带 (generation, member_id)，coordinator 拒绝旧代；不变式 = 已提交 offset 只被当代 owner 推进且单调不减。可选：僵尸继续消费的动作 + "消费位置合并不回退" |
 | P1-5 | **活性零验证**：failover 终有新主、rebalance 终达 Stable、produce 后终 commit——全部押在仿真层 | 收敛性 bug（活锁、饥饿）设计层不设防 | ConsumerGroup 可直接在规约层补（状态空间小）：cfg 加 `FAIRNESS WF_vars(完成加入) /\ WF_vars(SyncGroup) /\ SF_vars(新成员到达)` + `PROPERTY` leadsto（PreparingRebalance ⇒ 最终 Stable/Empty）。数据面用最小参数（日志长 1、单值、epoch 3）+ `WF_vars(AssignLeader)` / `WF_vars(CatchUp)` / `SF_vars(Restart, Heal)`（即"崩溃停止发生"）验"崩溃后有主、写入终被提交"。时限性指标（<2s）永远归仿真/混沌 |
 | P2-6 | **view 持久化是理想化**：Restart 精确保留崩溃前的 view；真实 leader-epoch checkpoint 异步落盘，可能滞后甚至回退 | 方向性分析表明 view 回退大概率无害（回退只让 follower 接受更多合法 Push、且 ThinksLeader 需要最新 epoch），但"大概率无害"未被机器检查 | 便宜实验：Restart 恢复到某个 ≤ 崩溃前值的 view（TLC 会穷举选择），跑一遍 check。绿了就消掉这条假设 |
-| P2-7 | **结构性不变式应如实标注**：`InvOneLeaderPerEpoch`、`InvGenAssignmentUnique`、`InvGenHistoryBounded`、`InvReadySubset` 在当前动作定义下构造恒真（epoch/gen 每次严格 +1、守卫直接保证子集关系），防回归有价值但不承载结论 | 新人可能高估绿的数量 | 在 .tla 注释与账本里标"结构性"；真正承载结论的是 InvLeaderHasCommitted / InvCurrentLeaderHasCommitted / InvLogMatching / InvConsumed* 与 InvStableWellFormed |
+| P2-7 | **结构性不变式应如实标注**：`InvOneLeaderPerEpoch`、`InvGenAssignmentUnique`、`InvGenHistoryBounded`、`InvReadySubset` 在当前动作定义下构造恒真（epoch/gen 每次严格 +1、守卫直接保证子集关系），防回归有价值但不承载结论 | 新人可能高估绿的数量 | 已落地（2026-09-10）：.tla 注释标注完成；另据不变式评审 MUT-B/C 判别——InvConsumedBounded 曾为结构性恒真（consume 直读 committed 变量），v0.2 已改为主日志 fetch（MUT-B 变红有判别力）；InvCommitHasOwner 曾零 fencing 内容（MUT-C 全绿），v0.3 以审计位监控 InvCommitFencedMon 取代（MUT-C/E 变红） |
 | P2-8 | **ThinksLeader 读全局 `curLeader`**：broker 守卫里出现全局变量（全知性）。由于指派原子广播给全部未分区节点，该合据可证冗余 | 模型比现实强：现实中 broker 只知本地 view | 删掉 `curLeader = n` 合取重跑 4 个场景；绿则模型更贴近实现 |
 | P2-9 | **ConsumerGroup 两个动作语义存疑**："JoinGroup 完成"（从 ready 移除，m 仍在 members）在现实协议中无对应物——若想表达 rebalance 超时踢除，应同时移出 members；Leave 不重置其余成员的 ready，意味着"离开触发的 rebalance 无需他人重新报到"，与 Kafka Classic 语义相左 | 规约与 `coordinator/src/lib.rs` 可能各说各话（精化桥断裂） | 逐动作与实现对表：给出精确现实对应或删除；Leave 语义与 lib.rs 对齐后二选一并写进注释 |
 | P2-10 | **网络模型粗粒度**：Push 原子化（fetch+截断+append+ack 一步）；`parted` 是节点级单 bit（无单向分区、无消息丢失/乱序/延迟）；控制器永不崩溃（其 HA 靠 openraft，ADR-2 外包）、指派原子广播 | 时序窗口类 bug（半复制状态、延迟到达的旧请求）不设防；安全方向这些抽象是保守的 | 保持现状 + 明示；链路级故障归 turmoil 仿真（§3 标准场景"网络分区""in-flight 重排"） |

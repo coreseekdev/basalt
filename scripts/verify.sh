@@ -21,6 +21,7 @@ echo "== Verus record 切片（账本 C5/C6/C6a）=="
 echo "== Kani L1 无 panic 门禁（账本 C13'）=="
 if [ -n "${KANI:-}" ]; then
     PATH="$HOME/.kani/kani-0.67.0/bin:$PATH" kani verification/kani/record_l1.rs
+    PATH="$HOME/.kani/kani-0.67.0/bin:$PATH" kani verification/kani/batch_header.rs
 else
     echo "跳过（KANI 未设置）"
 fi

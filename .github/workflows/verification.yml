@@ -1,0 +1,54 @@
+# 形式化验证与测试门禁（docs/VERIFICATION.md §6 CI 分层）
+# 工具版本锁定见 verification/*/README.md 与账本。
+name: verification
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+  schedule:
+    - cron: "0 3 * * *" # 每日夜间：种子扫描全量 + 阴性对照
+
+jobs:
+  tests:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - run: cargo test --workspace
+
+  spec-tlc:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-java@v4
+        with: { distribution: temurin, java-version: "17" }
+      - name: 名义场景（C1/C2/C4）
+        run: make -C spec check
+      - name: 阴性对照——EagerLeader 反例必须被检出（C3，判别力门禁）
+        run: |
+          if make -C spec demo-eager; then
+            echo "::error::EagerLeader 反例未检出——检查器判别力丢失，规约或不变式可能空洞"
+            exit 1
+          fi
+
+  kani-l1:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - run: cargo install --locked kani-verifier && cargo kani setup
+      - name: L1 无 panic 门禁（C13'/C10）
+        run: |
+          export PATH="$HOME/.kani/kani-0.67.0/bin:$PATH"
+          kani verification/kani/record_l1.rs
+          kani verification/kani/batch_header.rs
+
+  perf-nightly:
+    if: github.event_name == 'schedule'
+    runs-on: ubuntu-latest
+    continue-on-error: true
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - run: cargo bench -p basalt-storage 2>&1 | tail -40

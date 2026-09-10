@@ -33,7 +33,8 @@ CONSTANTS Brokers,            \* broker 节点集合
           MaxLogLen,          \* 单副本日志长度上界
           EagerLeader,        \* TRUE = 新 leader 跳过继任规则（反例演示）
           SplitBrain,         \* TRUE = 控制器 fencing 失效（旧主继续服务）
-          CommitChecksEpoch   \* TRUE = commit 多数派校验成员视图
+          CommitChecksEpoch,  \* TRUE = commit 多数派校验成员视图
+          ViewRollback        \* TRUE = Restart 载入过期 view 检查点（C14⑤ 实验）
 
 NoLeader == "NoLeader"
 
@@ -64,6 +65,8 @@ variables
   log        = [n \in Brokers |-> <<>>] ;
   committed  = <<>> ;
   consumed   = <<>> ;
+  synced     = [n \in Brokers |-> 0] ;
+  lease      = [n \in Brokers |-> FALSE] ;
 
 define
   Majors == { q \in SUBSET Brokers :
@@ -89,8 +92,12 @@ define
          \/ /\ LastEpoch(log[j]) = LastEpoch(log[r])
             /\ Len(log[j]) >= Len(log[r])
 
-  \* n 自认为主（SplitBrain=TRUE 时旧主在失联后仍自认为主）
+  \* n 自认为主（SplitBrain=TRUE 时失联旧主凭**仍有效的租约**继续服务——
+  \* 分区不撤销租约；crash 撤销租约且 SplitBrain 下控制器不可重授——
+  \* v0.3 修复：无租约的崩溃旧主不得以原 epoch 自恢复（否则同 epoch 重写
+  \* 分叉日志，InvLogMatching 红，见 docs/review-invariants-20260910.md））
   ThinksLeader(n) == /\ up[n]
+                     /\ lease[n]
                      /\ view[n].leader = n
                      /\ (\/ SplitBrain
                          \/ /\ curLeader = n
@@ -113,6 +120,8 @@ define
           Seq({<<e, v>> : e \in 1..MaxEpochs, v \in Values})]
     /\ committed \in Seq(Values)
     /\ consumed \in Seq(Values)
+    /\ synced \in [Brokers -> 0..MaxLogLen]
+    /\ lease \in [Brokers -> BOOLEAN]
 
   \* C2a：每个 epoch 至多一个被指派的 leader
   \* 【结构性标注·不变式评审 P1-3】epoch 由构造严格 +1 入 hist——机制锁
@@ -143,6 +152,13 @@ define
       (curLeader = n /\ view[n].leader = n /\ view[n].epoch = curEpoch
        /\ caughtUp[n]) => IsValsPrefix(committed, log[n])
 
+  \* C1d（commit ⇒ 多数派已持久，C14①）：已提交长度不超过任一多数派中
+  \* 至少一个成员的持久化水位——多数派相交 ⇒ 提交数据在任意 Surviving
+  \* 多数派中至少有一份 fsync 过的完整副本。这是 §3 故障模型（crash 截断
+  \* 到 synced）下"不丢"的持久性支柱。
+  InvCommittedDurable ==
+    \A q \in Majors : \E r \in q : Len(committed) <= synced[r]
+
   \* C4（游标有界）：消费者只读已提交前缀。
   \* v0.2：Consume 改为向现任主 fetch（值取自主的日志，长度以已提交
   \* 前缀为界）——本不变式不再由构造保证，而依赖 C1b（主持有已提交
@@ -169,6 +185,7 @@ begin
         await curEpoch < MaxEpochs ;
         curEpoch := curEpoch + 1 ;
         curLeader := n ;
+        lease := [lease EXCEPT ![n] = TRUE] ;
         leaderHist := leaderHist \cup {<<curEpoch, n>>} ;
         caughtUp := [caughtUp EXCEPT ![n] = EagerLeader] ;
         view := [n2 \in Brokers |->
@@ -180,15 +197,34 @@ begin
       with n \in Brokers do
         await up[n] ;
         up := [up EXCEPT ![n] = FALSE] ;
+        \* crash 丢失未持久尾部（§3 故障模型：已 sync 存活、未 sync 消失）
+        log := [log EXCEPT ![n] = IF synced[n] >= Len(log[n]) THEN log[n] ELSE IF synced[n] = 0 THEN <<>> ELSE SubSeq(log[n], 1, synced[n])] ;
+        \* 重启后需重新继任接管（恢复扫描 + 与多数派比对）
+        caughtUp := [caughtUp EXCEPT ![n] = FALSE] ;
+        \* 租约随进程死亡失效（ADR-10：重授仅经控制器——SplitBrain 下
+        \* 控制器不可达 ⇒ 崩溃旧主永久失去服务资格）
+        lease := [lease EXCEPT ![n] = FALSE] ;
         if curLeader = n then
           curLeader := NoLeader
         end if
       end with ;
     or
-      \* Restart：view/log 依 leader-epoch checkpoint 假设持久保留
+      \* Persist：fsync 边界——把日志尾部推进持久化水位（ADR-14 写/持久边界）
+      with n \in Brokers do
+        await up[n] ;
+        await synced[n] < Len(log[n]) ;
+        synced := [synced EXCEPT ![n] = Len(log[n])]
+      end with ;
+    or
+      \* Restart：磁盘数据（synced 前缀）与 view 持久保留；
+      \* ViewRollback=TRUE 时载入过期 checkpoint（C14⑤ 实验：回退方向）
       with n \in Brokers do
         await ~up[n] ;
-        up := [up EXCEPT ![n] = TRUE]
+        up := [up EXCEPT ![n] = TRUE] ;
+        if ViewRollback /\ view[n].epoch > 0 then
+          view := [view EXCEPT ![n] =
+                     [epoch |-> view[n].epoch - 1, leader |-> view[n].leader]]
+        end if
       end with ;
     or
       \* Partition：与控制器失联
@@ -260,6 +296,7 @@ begin
         await /\ Serving(self)
               /\ IsValsPrefix(committed, log[self])
               /\ \A r \in q :
+                   /\ L <= synced[r]          \* 持久化边界（C14①）
                    /\ SameVals(log[r], log[self], L)
                    /\ (\/ ~CommitChecksEpoch
                        \/ /\ view[r].epoch = view[self].epoch
@@ -285,9 +322,9 @@ begin
 end process ;
 
 end algorithm ; *)
-\* BEGIN TRANSLATION (chksum(pcal) = "3279ab02" /\ chksum(tla) = "6dd0a850")
+\* BEGIN TRANSLATION (chksum(pcal) = "b7555bef" /\ chksum(tla) = "9ab6cb93")
 VARIABLES up, parted, curEpoch, curLeader, view, caughtUp, leaderHist, log, 
-          committed, consumed
+          committed, consumed, synced, lease
 
 (* define statement *)
 Majors == { q \in SUBSET Brokers :
@@ -314,7 +351,11 @@ SuccessorOf(q, j) == \A r \in q :
           /\ Len(log[j]) >= Len(log[r])
 
 
+
+
+
 ThinksLeader(n) == /\ up[n]
+                   /\ lease[n]
                    /\ view[n].leader = n
                    /\ (\/ SplitBrain
                        \/ /\ curLeader = n
@@ -337,6 +378,8 @@ TypeOK ==
         Seq({<<e, v>> : e \in 1..MaxEpochs, v \in Values})]
   /\ committed \in Seq(Values)
   /\ consumed \in Seq(Values)
+  /\ synced \in [Brokers -> 0..MaxLogLen]
+  /\ lease \in [Brokers -> BOOLEAN]
 
 
 
@@ -371,6 +414,13 @@ InvCurrentLeaderHasCommitted ==
 
 
 
+InvCommittedDurable ==
+  \A q \in Majors : \E r \in q : Len(committed) <= synced[r]
+
+
+
+
+
 InvConsumedBounded == IsPrefix(consumed, committed)
 
 
@@ -382,7 +432,7 @@ InvConsumedOnLeader ==
 
 
 vars == << up, parted, curEpoch, curLeader, view, caughtUp, leaderHist, log, 
-           committed, consumed >>
+           committed, consumed, synced, lease >>
 
 ProcSet == {"ctrl"} \cup (Brokers)
 
@@ -397,40 +447,56 @@ Init == (* Global variables *)
         /\ log = [n \in Brokers |-> <<>>]
         /\ committed = <<>>
         /\ consumed = <<>>
+        /\ synced = [n \in Brokers |-> 0]
+        /\ lease = [n \in Brokers |-> FALSE]
 
 Controller == /\ \/ /\ \E n \in Brokers:
                          /\ curEpoch < MaxEpochs
                          /\ curEpoch' = curEpoch + 1
                          /\ curLeader' = n
+                         /\ lease' = [lease EXCEPT ![n] = TRUE]
                          /\ leaderHist' = (leaderHist \cup {<<curEpoch', n>>})
                          /\ caughtUp' = [caughtUp EXCEPT ![n] = EagerLeader]
                          /\ view' = [n2 \in Brokers |->
                                        IF parted[n2] THEN view[n2]
                                        ELSE [epoch |-> curEpoch', leader |-> n]]
-                    /\ UNCHANGED <<up, parted>>
+                    /\ UNCHANGED <<up, parted, log, synced>>
                  \/ /\ \E n \in Brokers:
                          /\ up[n]
                          /\ up' = [up EXCEPT ![n] = FALSE]
+                         /\ log' = [log EXCEPT ![n] = IF synced[n] >= Len(log[n]) THEN log[n] ELSE IF synced[n] = 0 THEN <<>> ELSE SubSeq(log[n], 1, synced[n])]
+                         /\ caughtUp' = [caughtUp EXCEPT ![n] = FALSE]
+                         /\ lease' = [lease EXCEPT ![n] = FALSE]
                          /\ IF curLeader = n
                                THEN /\ curLeader' = NoLeader
                                ELSE /\ TRUE
                                     /\ UNCHANGED curLeader
-                    /\ UNCHANGED <<parted, curEpoch, view, caughtUp, leaderHist>>
+                    /\ UNCHANGED <<parted, curEpoch, view, leaderHist, synced>>
+                 \/ /\ \E n \in Brokers:
+                         /\ up[n]
+                         /\ synced[n] < Len(log[n])
+                         /\ synced' = [synced EXCEPT ![n] = Len(log[n])]
+                    /\ UNCHANGED <<up, parted, curEpoch, curLeader, view, caughtUp, leaderHist, log, lease>>
                  \/ /\ \E n \in Brokers:
                          /\ ~up[n]
                          /\ up' = [up EXCEPT ![n] = TRUE]
-                    /\ UNCHANGED <<parted, curEpoch, curLeader, view, caughtUp, leaderHist>>
+                         /\ IF ViewRollback /\ view[n].epoch > 0
+                               THEN /\ view' = [view EXCEPT ![n] =
+                                                  [epoch |-> view[n].epoch - 1, leader |-> view[n].leader]]
+                               ELSE /\ TRUE
+                                    /\ view' = view
+                    /\ UNCHANGED <<parted, curEpoch, curLeader, caughtUp, leaderHist, log, synced, lease>>
                  \/ /\ \E n \in Brokers:
                          /\ ~parted[n]
                          /\ parted' = [parted EXCEPT ![n] = TRUE]
-                    /\ UNCHANGED <<up, curEpoch, curLeader, view, caughtUp, leaderHist>>
+                    /\ UNCHANGED <<up, curEpoch, curLeader, view, caughtUp, leaderHist, log, synced, lease>>
                  \/ /\ \E n \in Brokers:
                          /\ parted[n]
                          /\ parted' = [parted EXCEPT ![n] = FALSE]
                          /\ view' = [view EXCEPT ![n] =
                                        [epoch |-> curEpoch, leader |-> curLeader]]
-                    /\ UNCHANGED <<up, curEpoch, curLeader, caughtUp, leaderHist>>
-              /\ UNCHANGED << log, committed, consumed >>
+                    /\ UNCHANGED <<up, curEpoch, curLeader, caughtUp, leaderHist, log, synced, lease>>
+              /\ UNCHANGED << committed, consumed >>
 
 Broker(self) == /\ \/ /\ \E q \in Majors:
                            \E j \in q:
@@ -469,6 +535,7 @@ Broker(self) == /\ \/ /\ \E q \in Majors:
                              /\ /\ Serving(self)
                                 /\ IsValsPrefix(committed, log[self])
                                 /\ \A r \in q :
+                                     /\ L <= synced[r]
                                      /\ SameVals(log[r], log[self], L)
                                      /\ (\/ ~CommitChecksEpoch
                                          \/ /\ view[r].epoch = view[self].epoch
@@ -484,7 +551,8 @@ Broker(self) == /\ \/ /\ \E q \in Majors:
                               /\ Len(consumed) < Len(committed)
                            /\ consumed' = Append(consumed, log[r][Len(consumed)+1][2])
                       /\ UNCHANGED <<view, caughtUp, log, committed>>
-                /\ UNCHANGED << up, parted, curEpoch, curLeader, leaderHist >>
+                /\ UNCHANGED << up, parted, curEpoch, curLeader, leaderHist, 
+                                synced, lease >>
 
 Next == Controller
            \/ (\E self \in Brokers: Broker(self))

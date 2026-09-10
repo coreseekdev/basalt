@@ -30,6 +30,35 @@
 | MUT-D | 删"JoinGroup 完成"动作 | liveness 仍红（churn 循环） | 红（Join↔Leave 循环） |
 | MUT-E | 去代令牌 fencing（旧代提交放行） | InvCommitFencedMon 红 | **红**（v0.3 新增判别力） |
 
+## 后续处置（同日，C14①⑤ 落地时的规约层新发现）
+
+### C14① synced 崩溃边界——已落地，并暴露规约缺陷⑯
+按 P1-4 处方实现：`synced[n]` 持久水位 + Persist 动作（fsync 边界）+ Crash
+截断到 synced + CommitAdvance 多数派校验改为持久前缀（`L <= synced[r]`）+
+新不变式 `InvCommittedDurable`（commit ⇒ 任一多数派含 fsync 完整副本——
+机器检查"commit ⇒ 多数派已持久"）。
+
+**新发现（缺陷⑯，规约层）**：synced 边界使 SplitBrain 场景 InvLogMatching
+变红——反例：旧主 push `<<1,v1>>` 给 n2（未持久）→ 旧主 crash 丢失该尾部 →
+重启后凭持久 view 在**同一 epoch** 自恢复并重写 index 1（`<<1,v2>>`）→
+n2/n3 同 epoch 同 index 不同值。根因：模型允许 broker 自我指派（违背
+ADR-10"broker 不得自我指派"）；follower 侧 fencing 无法吸收同 epoch 重写。
+**修复**：引入控制器租约 `lease[n]`——AssignLeader 授予、Crash 即失效、
+SplitBrain（控制器不可达）下不可重授；SplitBrain 语义修正为"分区不撤销
+租约的旧主继续服务"（其本意），自恢复路径被协议规则正确封死。
+终局复核（2026-09-10）：check 全空间 **1.27 亿状态绿**（45 分钟 8 worker）、
+splitbrain / splitbrain-cepoch 双绿、demo-eager 红（判别力保持）、
+view 回退实验绿。
+**教训**：环境模型过强（crash 全量持久）会掩盖真实协议缺口——这正是
+评审 P1-4 称其为"唯一危险侧缺口"的原因；M2 实现必须实现"租约随进程
+死亡失效"（failover 后旧主不得凭持久 view 复写）。
+
+### C14⑤ view 回退方向实验——已闭合（安全性不敏感，正结果）
+`ViewRollback=TRUE`（Restart 载入过期 view 检查点，epoch-1）：约 600 万
+状态全空间绿。结论：view 回退不破坏安全性——Push 的 epoch 比较 fencing、
+crash 后强制重新继任接管、继任规则三者兜底。与缺陷⑯对照：**危险方向不是
+view 陈旧，而是"崩溃后以原 epoch 自恢复服务"**——租约语义封死的正是后者。
+
 ## 残留边界（如实入账）
 
 1. C14① synced 崩溃边界未闭合（M2 前置门禁）。

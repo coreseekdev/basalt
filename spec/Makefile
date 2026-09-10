@@ -21,5 +21,11 @@ cg-liveness-l0: ; $(TLC) -config consumer-group-l0.cfg ConsumerGroupLiveness.tla
 cg-liveness-l2: ; $(TLC) -config consumer-group-l2.cfg ConsumerGroupLiveness.tla
 cg-liveness-l3: ; $(TLC) -config consumer-group-l3.cfg ConsumerGroupLiveness.tla
 
+# 数据面活性（P2-2 闭合）：稳定变体期望绿；churn 变体期望红（负结果已入账）
+dp-liveness-stable: ; $(TLC) -deadlock -config dp-liveness-stable.cfg BasaltDataPlaneLiveness.tla
+dp-liveness:         ; $(TLC) -deadlock -config dp-liveness.cfg BasaltDataPlaneLiveness.tla
+
+.PHONY: dp-liveness-stable dp-liveness
+
 .PHONY: consumer-group consumer-group-demo consumer-group-liveness
 .PHONY: cg-liveness-l0 cg-liveness-l2 cg-liveness-l3

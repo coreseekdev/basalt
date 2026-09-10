@@ -16,7 +16,7 @@
 | P1-3 | 结构性恒真共 6 项（InvOneLeaderPerEpoch/InvViewEpochSane/InvGenAssignmentUnique/InvReadySubset/InvGenHistoryBounded/InvCommitTypeOK 死支）；但 MUT-A 证明它们是**机制锁**非定义空洞 | MUT-A（epoch 回绕）34 状态红 | ✅ .tla 注释 + 账本 C2 行 + 指南 P2-7 三处标注落地；MUT-A/B/C/E 登记为期望红突变对照 |
 | P1-4 | Crash 全量持久与 §3 故障模型（"已 sync 存活、未 sync 消失"）矛盾——"ack 前未 fsync"类缺陷在规约层不可表达 | 读码 | ⬜ C14① 维持 open，**M2 前必须闭合**（synced[n] ≤ Len(log[n]) 边界） |
 | P2-1 | RebalanceCompletes 现状红；逐动作公平性救不了（MUT-D 删"完成加入"动作仍红：Join↔Leave 纯 churn 循环） | 复跑 + MUT-D | ✅ 已按负结果入账：四级公平性二分（CONSUMERGROUP-LIVENESS.md），liveness cfg 转已知红阴性对照 |
-| P2-2 | 数据面活性零覆盖 | 清单 | ⬜ 最小参数方案（日志长 1、单值）留 C14⑤ 同批 |
+| P2-2 | 数据面活性零覆盖 | 清单 | ✅ 已闭合（2026-09-10，最小参数实验 `BasaltDataPlaneLiveness.tla` + dp-liveness*.cfg）：**稳定环境**（无崩溃/分区）三性质全绿——终有可服务主、写入终被提交、提交终被消费（机器已证）；**无限 churn 下负结果**——WF(AssignLeader) 尽快烧完 epoch horizon，horizon 耗尽后一次主崩溃（租约失效，缺陷⑯修复的设计内代价）⇒ 永久不可服务。真实系统 epoch 为 64 位计数器实际不可耗尽；可用性/时限归 T-Q.4 仿真 |
 | P2-3 | 文档漂移 5 项（demo-eager 实际先爆 InvCurrentLeaderHasCommitted；纪律 2 与活性实验矛盾；Makefile 无 liveness 目标；C9 行旧口径；C8 行 L2 半边为空） | 实测 | ✅ 全部落地（指南/Makefile/账本） |
 | P2-4 | MaxRounds 逃生分支：gen 达上界后组永久无法回 Stable | 读码 | ✅ .tla 注释明示（已知取舍） |
 

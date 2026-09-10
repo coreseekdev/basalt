@@ -10,7 +10,7 @@ LOG=$(mktemp /tmp/basalt-e2e-log-XXXX)
 OLD=$(ss -tlnp 2>/dev/null | grep ":$PORT " | grep -oP 'pid=\K[0-9]+' | head -1)
 [ -n "$OLD" ] && kill -9 "$OLD" 2>/dev/null && sleep 0.5
 
-BASALT_DATA_DIR="$DATA" BASALT_PORT="$PORT" BASALT_NUM_PARTITIONS="${BASALT_NUM_PARTITIONS:-2}" \
+BASALT_DATA_DIR="$DATA" BASALT_PORT="$PORT" BASALT_NUM_PARTITIONS="${BASALT_NUM_PARTITIONS:-2}" BASALT_METRICS_PORT="${BASALT_METRICS_PORT:-0}" \
   BASALT_LOG_LEVEL="${BASALT_LOG_LEVEL:-info}" \
   ./target/debug/basalt-server > "$LOG" 2>&1 &
 PID=$!

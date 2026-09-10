@@ -84,11 +84,11 @@ Basalt：Rust 版 Kafka 兼容消息流平台
 |---|---|---|---|---|---|---|
 | T-M2.1 | ⬜ | openraft 接入 + 单写者控制器 | 控制器事件循环；controller log；MetadataImage/Delta；broker 心跳与存活判定（心跳协议预留 L2 健康位图/stall 上报字段——ADR-10） | 控制器故障切换单测（MockRaftClient 式）；image 快照重放一致 | T-M1 全部 | [Kafka §4](../docs/01-apache-kafka.md) |
 | T-M2.2 | ⬜ | 多 broker 拓扑与元数据广播 | Metadata 增量广播、broker 侧 MetadataCache、请求转发（shard/分区归属表） | 3 节点 docker 集群起停/扩容；客户端任意节点可 bootstrap | T-M2.1 | [Redpanda §1](../docs/02-redpanda.md) |
-| T-M2.3 | ⬜ | ISR 形态复制协议 + leader epoch（ADR-10） | 控制器指派 leader + epoch fencing + follower-pull 多数派 append；HW/LSO/log start 三水位；leader-epoch checkpoint；OffsetForLeaderEpoch；继任者预计算与变更批量化（failover L1） | 仿真：切主后 follower 截断对齐、消费不重复不跳变；崩溃 failover <2s、计划内交接毫秒级 | T-M2.1 | [Kafka §3](../docs/01-apache-kafka.md)（KIP-966/951） |
+| T-M2.3 | ⬜ | ISR 形态复制协议 + leader epoch（ADR-10） | 控制器指派 leader + epoch fencing + follower-pull 多数派 append；HW/LSO/log start 三水位；leader-epoch checkpoint；OffsetForLeaderEpoch；继任者预计算与变更批量化（failover L1）。**规约侧 M2 义务（缺陷⑯/C14①，2026-09-10）**：控制器租约随 broker 进程死亡失效（崩溃旧主不得凭持久 view 以原 epoch 自恢复复写——规约已证其破坏日志匹配）；acks=all 提交条件钉死为 ack 数 ≥ 多数派（ISR 收缩只损失可用性；unclean election=false 写进 C1 条款） | 仿真：切主后 follower 截断对齐、消费不重复不跳变；崩溃 failover <2s、计划内交接毫秒级 | T-M2.1 | [Kafka §3](../docs/01-apache-kafka.md)（KIP-966/951） |
 | T-M2.4 | ⬜ | 复制调优 | 按 follower 聚批、落后副本批量追赶+全局限流、共用心跳 RPC | 3 副本 acks=all 吞吐基线达标；追赶不影响前台 P99（基准） | T-M2.3 | [Redpanda §3](../docs/02-redpanda.md) |
 | T-M2.5 🔬 | ⬜ | 集群仿真场景 | 切主/分区/追赶/hold 重排/in-flight 重复投递五场景接入 harness | 每场景 ≥500 seeds 不丢不重 | T-M2.3 | [测试 §3.2](../docs/11-testing-strategy.md) |
 | T-M2.6 🔬 | ⬜ | ducktape 式混沌 v1 | bounce 矩阵（clean/hard）+ 网络分区注入 + 随机节点操作（1h 档） | 24 种注入组合下不变式全绿 | T-M2.5 | [测试 §7](../docs/11-testing-strategy.md) |
-| T-Q.2 | ✅ | TLA+ 规约 v1 | 单写者、fencing、epoch 单调、多数派 commit、游标有界不变式的 PlusCal 模型（覆盖 ADR-10 数据面协议） | TLC 模型检查通过并入库（设计变更时重跑） | T-M2.1 | [Walrus §6](../docs/07-walrus.md) |
+| T-Q.2 | ✅ | TLA+ 规约 v0.3（数据面+消费组+活性） | 数据面：ADR-10 协议 + synced 崩溃边界（C14①）+ 控制器租约（缺陷⑯）+ 副本读消费；消费组：v0.3 generation fencing + 审计位监控（MUT-C/E 判别力实证）；活性：数据面稳定环境三性质绿 + 消费组二分负结果。全矩阵 TLC（含 1.27 亿状态全空间）+ 5 组突变对照（账本 C1-C14） | ✅ TLC 全绿/阴性对照红并入库（设计变更时重跑）；六场景门禁在 scripts/verify.sh | T-M2.1 | [Walrus §6](../docs/07-walrus.md) |
 
 ## M3 高级语义
 
@@ -116,9 +116,9 @@ Basalt：Rust 版 Kafka 兼容消息流平台
 
 | ID | 状态 | 任务 | 产出物 | 验收标准 | 依赖 | 参考 |
 |---|---|---|---|---|---|---|
-| T-Q.1 🔬 | ⬜ | 存储 opfuzz | DiskIo 层随机操作序列 fuzzer（append/flush/roll/truncate/recover 交错） | 任意序列后 recover 恒合法；CI 每次 PR 跑 10^4 序列 | T-M0.3 | [Redpanda §8](../docs/02-redpanda.md) |
-| T-Q.2 | ⬜ | TLA+ 规约（条目列于 M2 表） | — | — | — | [测试 §9](../docs/11-testing-strategy.md) |
-| T-Q.3 🔬 | ⬜ | 基准报表 | criterion+e2e 基准进 CI 报表；关键路径 P99/吞吐阈值告警 | 报表趋势可查；回归>15% 触发告警 | T-M4.4 | [测试 §8](../docs/11-testing-strategy.md) |
+| T-Q.1 🔬 | 🟨 | 存储 opfuzz | DiskIo 层随机操作序列 fuzzer（append/flush/roll/truncate/recover 交错）——**已建**：四档（clean/chaos × 标准/batch_io）80 种子全绿，累计抓出 7 个真实缺陷（账本 C7'）；SimDisk 故障注入含确定性开关 | 任意序列后 recover 恒合法 ✅；CI 每次 PR 跑 10^4 序列 ⬜（CI 流水线未建，T-0.4） | T-M0.3 | [Redpanda §8](../docs/02-redpanda.md) |
+| T-Q.2 | ✅ | TLA+ 规约（条目列于 M2 表） | 现状见 M2 表 T-Q.2 行：数据面/消费组/活性全闭合，缺陷⑩-⑯ 均有机器证据 | 全绿 + 阴性对照红（verify.sh 门禁） | T-M2.1 | [测试 §9](../docs/11-testing-strategy.md) |
+| T-Q.3 🔬 | 🟨 | 基准报表 | **已建（手工档）**：BENCHMARKS.md——vs Redpanda 同机对比 + 三客户端档（kafka-python/librdkafka/franz-go）；CI 报表与阈值告警 ⬜ | 报表趋势可查；回归>15% 触发告警 | T-M4.4 | [测试 §8](../docs/11-testing-strategy.md) |
 | T-Q.4 🔬 | ⬜ | 混沌长跑 | 每周 24h 随机节点操作+分区+磁盘故障长跑 | 不变式零违反；失败自动产出种子/操作序列 | T-M2.6 | [测试 §7](../docs/11-testing-strategy.md) |
 
 ---

@@ -393,8 +393,16 @@ fn repro_seed1_minimal() {
 /// next_offset 与盘面在 batch_io 下背离（非 batch_io 路径同序列通过）。
 /// 疑点：truncate_to 清 batch_staging 后 fast path（batch_staging.is_empty()
 /// 条件）与 staging 分支的簿记分流。复现：seed=1570935，ops 见 panic 输出。
+/// WIP（不计入账本）：batch_io LEO 复活根因未闭合——单线程时间线已捕获
+/// （见 CI 日志 /tmp/bio2.log 方法）：truncate(9) 后 LEO=6 → append →
+/// LEO=8 → roll（flush 写盘 210B）→ crash → 重开 LEO=10：恢复扫描收养了
+/// 2 条超出截断点 LEO 的记录。疑点集中在 truncate_to 的 promotion 路径
+/// （段提升后 base/locate 与 staging 的交互）。修复方向：
+/// promotion 截断后重建 base 对齐（同 truncate_to active 路径的
+/// empty_misaligned 处理），或 delete/truncate 后强制下一段 append 走
+/// 全量校验慢路径。
 #[test]
-#[ignore = "WIP: batch_io LEO 簿记背离——需专项根因"]
+#[ignore = "WIP: batch_io LEO 复活——promotion 路径嫌疑，转储方法就位"]
 fn opfuzz_batch_io_seeds() {
     // P0-2 回归档：batch_io=true 的 roll/staging 交互（code review 二轮实证
     // 旧实现此处 ack 丢失）。clean 无故障 + SyncEach 语义经 flush 修正。

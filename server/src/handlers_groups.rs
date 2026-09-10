@@ -215,42 +215,100 @@ pub async fn offset_commit(req: &basalt_protocol::value::Struct, ctx: &Ctx) -> V
     s([("ThrottleTimeMs", Value::I32(0)), ("Topics", Value::Array(responses))])
 }
 
-pub async fn offset_fetch(req: &basalt_protocol::value::Struct, ctx: &Ctx) -> Value {
-    let group = req.get("GroupId").map(|v| v.as_str().to_string()).unwrap_or_default();
-    let mut requested: Option<Vec<String>> = None;
-    if let Some(Value::Array(topics)) = req.get("Topics") {
-        let mut names = Vec::new();
-        for t in topics {
-            let Value::Struct(ts) = t else { continue };
-            names.push(ts.get("Name").map(|v| v.as_str().to_string()).unwrap_or_default());
+pub async fn offset_fetch(req: &basalt_protocol::value::Struct, version: i16, ctx: &Ctx) -> Value {
+    // v0-7：顶层 GroupId/Topics；v8+（librdkafka 等新客户端协商到此）：Groups[] 多组布局
+    let mut groups_req: Vec<(String, Option<Vec<(String, Option<Vec<i32>>)>>)> = Vec::new();
+    if version >= 8 {
+        if let Some(Value::Array(gs)) = req.get("Groups") {
+            for g in gs {
+                let Value::Struct(g) = g else { continue };
+                let gid = g.get("GroupId").map(|v| v.as_str().to_string()).unwrap_or_default();
+                groups_req.push((gid, parse_fetch_topic_filter(g.get("Topics"))));
+            }
         }
-        requested = Some(names);
+    } else {
+        let gid = req.get("GroupId").map(|v| v.as_str().to_string()).unwrap_or_default();
+        groups_req.push((gid, parse_fetch_topic_filter(req.get("Topics"))));
     }
-    tracing::info!(api="OffsetFetch", %group, topics=?requested, "fetch");
-    let (tx, rx) = oneshot::channel();
-    ctx.group_tx.send(GroupCmd::FetchOffsets { group, topics: requested.clone(), reply: tx }).await.ok();
-    let committed = rx.await.unwrap_or_default();
-    tracing::info!(api="OffsetFetch-reply", n=committed.len(), "fetch reply");
 
     // 已知 topic 全集（供 null 请求展开）
     let all_topics: Vec<String> = ctx.routes().iter_all_topics();
-    let topics = requested.unwrap_or(all_topics);
 
-    let mut responses = Vec::new();
-    for name in topics {
-        let mut pvals = Vec::new();
-        for o in committed.iter().filter(|o| o.topic == name) {
-            pvals.push(s([
-                ("PartitionIndex", Value::I32(o.partition)),
-                ("CommittedOffset", Value::I64(o.offset)),
-                ("CommittedLeaderEpoch", Value::I32(-1)),
-                ("Metadata", Value::str(o.metadata.clone())),
+    let mut group_vals: Vec<Value> = Vec::new();
+    let mut legacy_topics: Option<Vec<Value>> = None;
+    for (group, topic_filter) in &groups_req {
+        let names = topic_filter.as_ref().map(|ts| ts.iter().map(|(n, _)| n.clone()).collect());
+        let (tx, rx) = oneshot::channel();
+        ctx.group_tx.send(GroupCmd::FetchOffsets { group: group.clone(), topics: names, reply: tx }).await.ok();
+        let committed = rx.await.unwrap_or_default();
+        tracing::info!(api="OffsetFetch-reply", %group, n=committed.len(), "fetch reply");
+
+        let topics: Vec<(String, Option<Vec<i32>>)> = match topic_filter {
+            Some(ts) => ts.clone(),
+            None => all_topics.iter().map(|n| (n.clone(), None)).collect(),
+        };
+        let mut tvals = Vec::new();
+        for (name, parts) in &topics {
+            let mut owned: Vec<_> = committed.iter().filter(|o| &o.topic == name).collect();
+            owned.sort_by_key(|o| o.partition);
+            let pvals = match parts {
+                // 显式分区清单：每分区一条，未提交的回 -1（Kafka 语义）
+                Some(idx) => idx.iter().map(|p| match owned.iter().find(|o| o.partition == *p) {
+                    Some(o) => offset_entry(o.partition, o.offset, Some(o.metadata.as_str())),
+                    None => offset_entry(*p, -1, None),
+                }).collect(),
+                None => owned.iter().map(|o| offset_entry(o.partition, o.offset, Some(o.metadata.as_str()))).collect(),
+            };
+            tvals.push(s([("Name", Value::str(name.clone())), ("Partitions", Value::Array(pvals))]));
+        }
+        if version >= 8 {
+            group_vals.push(s([
+                ("GroupId", Value::str(group.clone())),
+                ("Topics", Value::Array(tvals)),
                 ("ErrorCode", Value::I16(ErrorCode::None as i16)),
             ]));
+        } else {
+            legacy_topics = Some(tvals);
         }
-        responses.push(s([("Name", Value::str(name)), ("Partitions", Value::Array(pvals))]));
     }
-    s([("ThrottleTimeMs", Value::I32(0)), ("Topics", Value::Array(responses))])
+    if version >= 8 {
+        s([("ThrottleTimeMs", Value::I32(0)), ("Groups", Value::Array(group_vals))])
+    } else {
+        s([("ThrottleTimeMs", Value::I32(0)), ("Topics", Value::Array(legacy_topics.unwrap_or_default()))])
+    }
+}
+
+/// 统一解析 v0-7 / v8+ 的 topic 过滤。None = 该组全部 topic；
+/// 元素 = (topic 名, 分区过滤：None = 该 topic 全部分区)。
+fn parse_fetch_topic_filter(v: Option<&Value>) -> Option<Vec<(String, Option<Vec<i32>>)>> {
+    let Value::Array(ts) = v? else { return None };
+    let mut out = Vec::new();
+    for t in ts {
+        let Value::Struct(t) = t else { continue };
+        let name = t.get("Name").map(|x| x.as_str().to_string()).unwrap_or_default();
+        let parts = match t.get("PartitionIndexes") {
+            Some(Value::Array(a)) => {
+                let idx: Vec<i32> = a.iter().map(|x| x.as_i32()).collect();
+                if idx.is_empty() { None } else { Some(idx) }
+            }
+            _ => None,
+        };
+        out.push((name, parts));
+    }
+    if out.is_empty() { None } else { Some(out) }
+}
+
+fn offset_entry(partition: i32, offset: i64, metadata: Option<&str>) -> Value {
+    s([
+        ("PartitionIndex", Value::I32(partition)),
+        ("CommittedOffset", Value::I64(offset)),
+        ("CommittedLeaderEpoch", Value::I32(-1)),
+        ("Metadata", match metadata {
+            Some(m) => Value::str(m),
+            None => Value::Null,
+        }),
+        ("ErrorCode", Value::I16(ErrorCode::None as i16)),
+    ])
 }
 
 // ---------- CreateTopics / DeleteTopics ----------

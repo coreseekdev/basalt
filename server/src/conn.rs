@@ -207,7 +207,7 @@ async fn dispatch(frame_bytes: Bytes, ctx: &Ctx) -> Result<Option<Bytes>, Dispat
         key::HEARTBEAT => (handlers_groups::heartbeat(&req, ctx).await, false),
         key::LEAVE_GROUP => (handlers_groups::leave_group(&req, ctx).await, false),
         key::OFFSET_COMMIT => (handlers_groups::offset_commit(&req, ctx).await, false),
-        key::OFFSET_FETCH => (handlers_groups::offset_fetch(&req, ctx).await, false),
+        key::OFFSET_FETCH => (handlers_groups::offset_fetch(&req, api_version, ctx).await, false),
         key::CREATE_TOPICS => (handlers_groups::create_topics(&req, ctx).await, false),
         key::DELETE_TOPICS => (handlers_groups::delete_topics(&req, ctx).await, false),
         key::DELETE_RECORDS => (handlers_groups::delete_records_handler(&req, ctx).await, false),

@@ -25,6 +25,8 @@ pub struct Ctx {
     pub group_tx: tokio::sync::mpsc::Sender<GroupCmd>,
     pub routes_rx: tokio::sync::watch::Receiver<crate::meta::RoutingTable>,
     pub brokers_cache: std::sync::Mutex<Option<Vec<basalt_metadata::cluster::BrokerInfo>>>,
+    /// 读缓冲池（perf #2：writer 归还 + actor 读复用共享同一池）
+    pub pool: std::sync::Arc<basalt_storage::pool::BufferPool>,
 }
 
 impl Ctx {
@@ -38,6 +40,7 @@ impl Ctx {
             meta_tx: self.meta_tx.clone(),
             group_tx: self.group_tx.clone(),
             routes_rx: self.routes_rx.clone(),
+            pool: self.pool.clone(),
             brokers_cache: std::sync::Mutex::new(self.brokers_cache.lock().unwrap().clone()),
         }
     }

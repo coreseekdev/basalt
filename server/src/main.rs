@@ -13,6 +13,7 @@ mod internal;
 mod meta;
 mod partition;
 
+use basalt_storage::pool::BufferPool;
 use config::Config;
 use std::sync::OnceLock;
 
@@ -189,6 +190,7 @@ async fn async_main(cfg: Config) {
         }
     });
 
+    let pool: std::sync::Arc<BufferPool> = std::sync::Arc::new(BufferPool::new());
     let ctx = handlers::Ctx {
         node_id: cfg.node_id,
         host: cfg.host.clone(),
@@ -198,6 +200,7 @@ async fn async_main(cfg: Config) {
         group_tx: group_tx.clone(),
         routes_rx: routes_rx.clone(),
         brokers_cache: std::sync::Mutex::new(None),
+        pool: pool.clone(),
     };
     CTX.set(ctx).ok();
 
@@ -215,8 +218,9 @@ async fn async_main(cfg: Config) {
                         group_tx: ctx_ref.group_tx.clone(),
                         routes_rx: ctx_ref.routes_rx.clone(),
                         brokers_cache: std::sync::Mutex::new(ctx_ref.brokers_cache.lock().unwrap().clone()),
+                        pool: pool.clone(),
                     };
-                    tokio::spawn(conn::serve_connection(sock, peer, ctx));
+                    tokio::spawn(conn::serve_connection(sock, peer, ctx, pool.clone()));
                 }
                 Err(e) => tracing::warn!(error = %e, "accept failed"),
             }

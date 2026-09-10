@@ -118,7 +118,7 @@ pub struct PartitionActor {
     pub index: i32,
     node_id: i32,
     log: Log<StdDisk>,
-    pool: BufferPool,
+    pool: std::sync::Arc<BufferPool>,
     rx: mpsc::Receiver<PartitionCmd>,
     pending: Vec<PendingFetch>,
     role: Role,
@@ -141,6 +141,7 @@ impl PartitionActor {
         dir: std::path::PathBuf,
         opts: LogOptions,
         repl: ReplicaConfig,
+        pool: std::sync::Arc<BufferPool>,
     ) -> std::io::Result<mpsc::Sender<PartitionCmd>> {
         let (tx, rx) = mpsc::channel(1024);
         // Log::open 是阻塞 IO：专用线程打开后移交 actor task
@@ -159,7 +160,7 @@ impl PartitionActor {
             index,
             node_id,
             log,
-            pool: BufferPool::new(),
+            pool,
             rx,
             pending: Vec::new(),
             role: Role::Follower,

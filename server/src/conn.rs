@@ -19,17 +19,24 @@ pub async fn serve_connection(
     sock: tokio::net::TcpStream,
     peer: std::net::SocketAddr,
     ctx: Ctx,
+    pool: std::sync::Arc<basalt_storage::pool::BufferPool>,
 ) {
     // 读半 + 写半分离：请求处理可并发（消除队头阻塞——长轮询 fetch 不再拖死同连接
     // 的 offset commit/heartbeat），响应经写通道串行化回写（保留单一写者）
     let (mut rd, mut wr) = sock.into_split();
     let (resp_tx, mut resp_rx) = tokio::sync::mpsc::channel::<Bytes>(256);
 
-    // 写任务：唯一写者
+    // 写任务：唯一写者；写完后归还读缓冲到池（perf #2，ADR-14 范围外）
+    let writer_pool = pool.clone();
     let writer = tokio::spawn(async move {
         while let Some(resp) = resp_rx.recv().await {
             if wr.write_all(&resp).await.is_err() {
                 break;
+            }
+            // 归还唯一所有的读缓冲（Bytes 唯一 → BytesMut → 池）
+            if let Ok(mut bm) = Bytes::try_into_mut(resp) {
+                use basalt_storage::pool::BufferPool;
+                BufferPool::release(&writer_pool, bm);
             }
         }
     });

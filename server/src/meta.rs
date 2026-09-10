@@ -7,6 +7,7 @@ use crate::config::Config;
 use crate::partition::{PartitionActor, PartitionCmd};
 use basalt_metadata::cluster::{BrokerInfo, ClusterState};
 use basalt_metadata::TopicMeta;
+use basalt_storage::pool::BufferPool;
 use basalt_storage::log::{FsyncSchedule, LogOptions};
 use std::collections::HashMap;
 use std::path::PathBuf;
@@ -284,7 +285,7 @@ impl MetaService {
                     retention_ms: 7 * 24 * 3600 * 1000,
                     retention_max_bytes: 0,
                 };
-                match PartitionActor::spawn(a.topic.clone(), a.partition, self.cfg.node_id, dir, opts, self.cfg.replica_config()) {
+                match PartitionActor::spawn(a.topic.clone(), a.partition, self.cfg.node_id, dir, opts, self.cfg.replica_config(), std::sync::Arc::new(BufferPool::new())) {
                     Ok(tx) => {
                         entry.1.insert(a.partition);
                         let route = Route { tx: tx.clone(), leader: a.leader, epoch: a.epoch };

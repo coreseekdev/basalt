@@ -536,25 +536,31 @@ impl<D: DiskIo> Log<D> {
         let mut budget: i64 = max_bytes as i64;
 
         loop {
-            if pos + RECORD_BATCH_HEADER_LEN > raw.len() {
-                // 读窗口耗尽：若段仍有数据且尚未返回任何批，补充读窗口至段尾
-                // ——保持旧实现"首批即便超预算/超窗口也整批带上"的语义，
-                // 否则消费端对 HW 内位点立即重取形成活锁（三轮 review P1）。
-                if out.is_empty() && (pos as u64) < seg.bytes {
-                    let more = (seg.bytes - pos as u64) as usize;
-                    raw.resize(raw.len() + more, 0);
-                    let got = self
-                        .disk
-                        .read_at(&seg.path, pos as u64, &mut raw[pos..])
-                        .unwrap_or(0);
-                    raw.truncate(pos + got);
-                    continue;
-                }
-                break;
+            // 窗口放不下下一个批头，且段仍有数据：扩窗至段尾
+            // （注意绝对偏移 = start_pos + pos；raw 是窗口相对缓冲——
+            //  三轮 review P2-1：相对偏移直读文件会读错区域）
+            if pos + RECORD_BATCH_HEADER_LEN > raw.len()
+                && out.is_empty()
+                && start_pos + (pos as u64) < seg.bytes
+            {
+                let abs = start_pos + (pos as u64);
+                let more = (seg.bytes - abs) as usize;
+                raw.resize(raw.len() + more, 0);
+                let got = self.disk.read_at(&seg.path, abs, &mut raw[pos..]).unwrap_or(0);
+                raw.truncate(pos + got);
             }
             let Some(h) = BatchHeader::parse(&raw[pos..]) else { break };
             let total = h.total_len() as usize;
             if total == 0 || pos + total > raw.len() {
+                // 批体越窗且尚未返回任何批：补读批体（保持旧实现
+                // "首批即便超预算/超窗口也整批带上"，防消费活锁——三轮 P1-1）
+                if out.is_empty() && start_pos + ((pos as u64) + (total as u64)) <= seg.bytes {
+                    let abs = start_pos + (pos as u64);
+                    let need = total - (raw.len() - pos);
+                    raw.resize(raw.len() + need, 0);
+                    let got = self.disk.read_at(&seg.path, abs, &mut raw[pos..]).unwrap_or(0);
+                    raw.truncate(pos + got);
+                }
                 break;
             }
             // 消费读不得越过 HW（未提交数据不可见）
@@ -689,6 +695,8 @@ impl<D: DiskIo> Log<D> {
             }
         }
         self.log_start_offset = offset;
+        // P2-2：先持久化 start（含 fsync）再删段文件——反向 crash 窗口内
+        // 遗留段被 log_start 过滤、链连续，无副作用
         self.persist_checkpoint();
         tracing::info!(offset, removed_segments = removed, "delete_records");
         Ok(())
@@ -803,7 +811,9 @@ impl<D: DiskIo> Log<D> {
                 self.active = seg;
             }
         }
-        // 清空批量合并缓冲：截断后旧 staging 写入会流错位（P2）
+        // 清空批量合并缓冲：截断后旧 staging 写入会流错位（P2）。
+        // 窗口内 deferred produce 的失效结算由 server 层在截断前处理
+        // （ADR-14：storage 层不感知应答类型）。
         self.batch_staging.clear();
         // 3) active 内批对齐截断：**从段首扫描**，保留完整位于 offset 之前的
         //    批，在首个跨线批处截断。不得用 locate(offset) 作扫描起点——

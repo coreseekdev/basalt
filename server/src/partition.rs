@@ -436,6 +436,17 @@ impl PartitionActor {
                     let _ = reply.send(self.log.next_offset);
                 }
                 PartitionCmd::TruncateTo { offset, reply } => {
+                    // ADR-14：截断使窗口内 deferred produce（offset >= 截断点）
+                    // 的数据失效——先按错误结算，再执行截断，杜绝
+                    // "ack 成功但数据被截掉"（code review 三轮 P1-2）。
+                    let deferred = std::mem::take(&mut self.deferred_produce);
+                    for (reply, mut outcome) in deferred {
+                        if outcome.error.is_none() && outcome.last_offset >= offset {
+                            outcome.base_offset = -1;
+                            outcome.error = Some(StorageError::Other("truncated by failover".into()));
+                        }
+                        let _ = reply.send(outcome);
+                    }
                     let _ = reply.send(self.log.truncate_to(offset));
                 }
                 PartitionCmd::DeleteRecords { offset, reply } => {

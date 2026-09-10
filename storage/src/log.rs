@@ -656,6 +656,9 @@ impl<D: DiskIo> Log<D> {
             budget -= total as i64;
             pos += total;
         }
+        // 窗口缓冲数据已全部拷入 out，归还池（review 四轮 P2-1：原先随
+        // drop 逃逸，读路径稳态每次 fetch 净增一次窗口类分配）
+        pool.release(raw);
 
         Ok(ReadResult {
             data: out.freeze(),

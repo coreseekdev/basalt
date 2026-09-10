@@ -227,7 +227,9 @@ async fn dispatch(frame_bytes: Bytes, ctx: &Ctx) -> Result<Option<Bytes>, Dispat
 
     // 响应编码（perf #3）：预留 4B 长度前缀占位，编码后回填——消除
     // framed 中间缓冲与 to_vec 的两次整响应拷贝；freeze 后零拷贝进写通道。
-    let mut out = BytesMut::with_capacity(4 + 512);
+    // 缓冲取自共享池：writer 发送后按唯一所有权归还（review 四轮 P2-1
+    // ——此前 with_capacity 新建、writer 归还的是从未入池的缓冲，闭环空转）
+    let mut out = ctx.pool.acquire(4 + 512);
     out.extend_from_slice(&[0u8; 4]); // 长度前缀占位
     let resp_header_v = frame::response_header_version(api_key, flexible);
     frame::write_response_header(&mut out, head.correlation_id, resp_header_v);

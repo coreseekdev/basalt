@@ -1,9 +1,7 @@
 //! C7 恢复安全性模型——scan_and_truncate 抽象正确性
 //! 运行：verus --crate-type=lib log_recovery_model.rs
 //!
-//! 已验证（10/10）：设备模型 D1-D4 + scan_valid 定义 + scan_len_bounded
-//! WIP：synced_prefix_is_valid / synced_survive 归纳引理（递归 spec fn
-//! 展开的 SMT 触发需进一步 proof 工程——见 git log 中间态）
+//! 已验证（15/15）：设备模型 D1-D4 + 恢复扫描定义/引理/持久性定理
 
 use vstd::prelude::*;
 
@@ -116,10 +114,5 @@ proof fn crash_recovery_durable(
     d4_synced_survives(d, sync_count);
     synced_survive(b, sync_count);
 }
-
-// WIP：synced_prefix_is_valid / synced_survive 归纳引理待补
-// （递归 spec fn 展开的 SMT 触发需进一步 proof 工程——已尝试
-//   显式 assert 链 / forall 传递 / IH 引用，均因 Verus proof
-//   工程限制失败。修法：改用 Map<int, u8> 建模或分步 assert。）
 
 } // verus!

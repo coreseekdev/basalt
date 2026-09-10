@@ -293,6 +293,12 @@ fn run_seed_io(seed: u64, torn: f64, batch_io: bool) {
 /// WIP（不计入账本）：发现 ③ 已窄化——delete/truncate 后段布局存在空洞时，
 /// Log::open 的孤儿段跳过（base != next_offset → continue）会把后续有数据的
 /// 段整段丢弃，重开 LEO 停在 log_start（seed=1 clean：leo=27/start=14 → 重开 14）。
+/// 本轮新证据（单线程时间线，PRE34 前后）：truncate(9)（promotion，9<active.base18）
+/// 批对齐截断 LEO→6 → append[6,7]→LEO8 → roll flush 写 base6→210B → crash
+/// 重开 LEO=10（收养 base2 6rec + base6 4rec）——盘面与 truncate 语义不一致。
+/// 嫌疑：truncate_to 的 promotion 路径下 locate/rel_kept 的段内 rel 计算错位，
+/// 或 rescan 后 index 与文件截断点错位。修复：promotion 后按 kept_end 重建
+/// 段 base 对齐，或 truncate 前先做段链规整。
 /// 修复方向：delete/truncate 保证剩余段链连续，或恢复扫描按 log_start 预热
 /// next_offset。含两处已修复的真实缺陷（SimDisk::len、truncate_to 批对齐）
 /// 与一处已修复的反向删除（truncate_to_front 保留/删除颠倒——均已入库）。

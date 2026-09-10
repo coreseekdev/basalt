@@ -373,7 +373,10 @@ fn repro_seed1_minimal() {
 /// 疑 batch_staging 与 truncate_to 的清理时序（truncate 只在 target 路径
 /// clear，truncate_to_front/promotion 路径未清）或 fast path 直写与
 /// staging 的交错。复现序列见 panic 输出 ops=...。
-/// WIP + 设计决策项：batch_io × SyncEach 组合的持久化点未定案——
+/// batch_io 档（ADR-14 已定案）：持久化点 = drain 窗口末 flush + sync。
+/// append 进 staging（不落盘），sync() 排空 staging 后 fsync——
+/// crash 只丢最后一个未 flush/sync 的窗口，断言 LEO ≥ synced_upto。
+/// 原 WIP 两项义务已随 ADR-14 采纳与 roll/rescan 修复闭合。
 /// batch_io 下 append 进 batch_staging（不落盘），SyncEach 的 sync_file
 /// 只 fsync 已写文件（staging 未写入）→ "已 ack 不持久"。
 /// 三个候选语义（需 ADR 决策，性能 review #8 同一问题）：
@@ -381,8 +384,12 @@ fn repro_seed1_minimal() {
 ///   (b) sync() 内先排空 staging 再 fsync（sync() 改 &mut，语义=立即持久）；
 ///   (c) 文档化"batch_io 仅限 Os 调度"并断言拒绝其他组合。
 /// 修复后解除 ignore（当前断言按 SyncEach 精确保留语义，对该组合必红）。
+/// WIP（不计入账本）：batch_io LEO 背离仍未闭合——rescan_segment 恢复后
+/// 仍复现：truncate(9) 批对齐截断（LEO→8）→ append[8,9]（LEO→10）→ roll →
+/// crash 重开 LEO=10 > 8。PRE 逐步转储已就位（dump 条件含 1570935），
+/// 下一轮直接读转储定位截断/append/roll 的簿记交互。
 #[test]
-#[ignore = "WIP: batch_io×SyncEach 持久化点未定案——需 ADR 决策（见函数注释）"]
+#[ignore = "WIP: batch_io LEO 背离根因——PRE 转储已就位（1570935）"]
 fn opfuzz_batch_io_seeds() {
     // P0-2 回归档：batch_io=true 的 roll/staging 交互（code review 二轮实证
     // 旧实现此处 ack 丢失）。clean 无故障 + SyncEach 语义经 flush 修正。

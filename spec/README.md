@@ -6,7 +6,7 @@
 ## 运行
 
 ```sh
-wget -P . https://github.com/tlaplus/tlaplus/releases/latest/download/tla2tools.jar
+jar 已版本锁定入库（spec/tools/）；升级需同步账本工具版本
 make check                # 名义协议：全部不变式应通过
 make demo-eager           # EagerLeader=TRUE：应检出 InvLeaderHasCommitted 反例
 make splitbrain           # 控制器 fencing 失效 + 提交不校验视图：实验性

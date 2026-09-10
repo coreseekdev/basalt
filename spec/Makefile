@@ -1,7 +1,7 @@
 # Basalt 数据面规约验证（docs/VERIFICATION.md C1-C4）
 # 依赖：JDK 11+；tla2tools.jar 放本目录或用 TLATOOLS 指定路径。
 #   wget -P . https://github.com/tlaplus/tlaplus/releases/latest/download/tla2tools.jar
-TLATOOLS ?= tla2tools.jar
+TLATOOLS ?= $(CURDIR)/tools/tla2tools.jar
 TLC = java -Xmx8g -cp $(TLATOOLS) tlc2.TLC -workers 8 -deadlock -cleanup
 
 check:            ; $(TLC) -config check.cfg BasaltDataPlane.tla

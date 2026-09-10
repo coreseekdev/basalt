@@ -61,6 +61,13 @@ torn write: sync 时按概率只落前半块（block 粒度截断）
 | T-Q.1 opfuzz | 随机交错 append/flush/roll/truncate/recover，`recover()` 恒合法 |
 | turmoil-fs（L2 仿真） | `block_size`（torn write）、`crash()`、ENOSPC —— 语义同上 |
 | Verus storage 证明 | `recover` 的前置条件 = "输入是任意符合本模型的操作序列后的盘面" |
+**持久化点契约（ADR-14，I/O 实现无关）**：
+- `DiskIo::append` = 写边界（StdDisk：page cache；未来 DirectDisk：设备写）；
+- `DiskIo::sync_file` = 持久边界（fsync / FLUSH CACHE）；
+- Log 保证"无 ack 而未写文件"：batch_io 窗口应答在 flush 后统一发放（deferred_produce）；
+- `sync()` 先排空 staging 再 fsync——**sync 即持久**，禁止调用顺序陷阱；
+- 该契约对缓冲写与 O_DIRECT 同构（SimDisk pending/committed ≡ 设备易失/非易失），direct IO 不得破坏（M4）。
+| log.rs truncate_to/delete_records | kept_end 批对齐、log_start 推进（§12 ②③⑤） |
 
 **变更纪律**：改 `sim_disk.rs` 语义 → 必须同 PR 更新本节、TLA+ 环境动作、opfuzz 参数，并重跑 TLC（设计变更门禁）。
 

@@ -486,7 +486,13 @@ impl<D: DiskIo> Log<D> {
         self.batch_staging.clear();
     }
 
-    pub fn sync(&self) -> Result<()> {
+    /// 持久化点（ADR-14）：排空 staging 后 fsync——调用后本日志全部已
+    /// append 数据对掉电持久。本契约与 DiskIo 实现无关：
+    /// StdDisk（缓冲写）= page cache 写入 + fsync；
+    /// DirectDisk（O_DIRECT，M4 预留）= 设备写 + FLUSH CACHE。
+    /// 禁止假设缓冲 I/O 特有行为（如"未 fsync 仍可读"作为持久性依据）。
+    pub fn sync(&mut self) -> Result<()> {
+        self.flush_batch()?;
         self.disk.sync_file(&self.active.path)
     }
 

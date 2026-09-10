@@ -127,6 +127,9 @@ pub struct PartitionActor {
     /// follower → (LEO, 最近一次上报时刻)
     follower_leos: HashMap<i32, (i64, Instant)>,
     parked_acks: Vec<ParkedAck>,
+    /// batch_io 窗口内的 produce 应答（ADR-14）：flush 成功后才发放；
+    /// flush 失败改发错误——杜绝"ack 而未写文件"（持久化点纪律）。
+    deferred_produce: Vec<(oneshot::Sender<ProduceOutcome>, ProduceOutcome)>,
     repl: ReplicaConfig,
 }
 
@@ -164,6 +167,7 @@ impl PartitionActor {
             replicas: Vec::new(),
             follower_leos: HashMap::new(),
             parked_acks: Vec::new(),
+            deferred_produce: Vec::new(),
             repl,
         };
         tokio::spawn(actor.run());
@@ -178,17 +182,16 @@ impl PartitionActor {
                 group.push(cmd);
             }
             // IO 批量合并：同轮 drain 的多个 produce 累积到 batch_staging，一次 write。
-            // flush 失败必须传播：batch_staging 里的数据尚未落盘，ack 了就是
-            // 虚假持久化（opfuzz/code review P0-2 同族）。
+            // ADR-14：flush 在组内应答发放之前（batch_io 窗口的持久化写盘点）；
+            // flush 失败 → 窗口内 produce 全部按存储错误应答。
             self.log.batch_io = true;
             self.process(group);
             let flush_result = self.log.flush_batch();
             self.log.batch_io = false;
-            if let Err(e) = flush_result {
-                tracing::error!(error = %e, "batch flush failed: 组内 ack 状态与磁盘不一致，需要回查");
-                // 组内各 produce 的应答在 process 内已按 append 结果决定；
-                // flush 失败时数据未落盘，此处以错误日志暴露而非静默。
+            if let Err(e) = &flush_result {
+                tracing::error!(error = %e, "batch flush failed: 窗口内 produce 按错误应答");
             }
+            self.settle_deferred_produce(flush_result.is_ok());
             self.on_deadline();
             self.serve_pending();
             // 唤醒时机：fetch 截止 / ack 停等超时，二者取最近
@@ -209,8 +212,9 @@ impl PartitionActor {
                             }
                             self.log.batch_io = true;
                             self.process(group);
-                            let _ = self.log.flush_batch();
+                            let flush_ok = self.log.flush_batch().is_ok();
                             self.log.batch_io = false;
+                            self.settle_deferred_produce(flush_ok);
                             self.on_deadline();
                             self.serve_pending();
                         }
@@ -263,6 +267,18 @@ impl PartitionActor {
             .filter(|(_, (_, t))| now.duration_since(*t) <= self.repl.isr_lag)
             .map(|(k, _)| *k)
             .collect()
+    }
+
+    /// ADR-14：batch_io 窗口收口——flush 结果决定延后应答的最终状态。
+    fn settle_deferred_produce(&mut self, flush_ok: bool) {
+        let deferred = std::mem::take(&mut self.deferred_produce);
+        for (reply, mut outcome) in deferred {
+            if !flush_ok && outcome.error.is_none() {
+                outcome.base_offset = -1;
+                outcome.error = Some(StorageError::Other("batch flush failed".into()));
+            }
+            let _ = reply.send(outcome);
+        }
     }
 
     fn process(&mut self, group: Vec<PartitionCmd>) {
@@ -350,7 +366,13 @@ impl PartitionActor {
                         self.release_acks();
                         continue;
                     }
-                    let _ = reply.send(outcome);
+                    // ADR-14：batch_io 窗口内应答延后到 flush 之后（flush 失败
+                    // 改发错误）——杜绝"ack 而未写文件"。
+                    if self.log.batch_io {
+                        self.deferred_produce.push((reply, outcome));
+                    } else {
+                        let _ = reply.send(outcome);
+                    }
                 }
                 PartitionCmd::Fetch { offset, max_bytes, deadline, reply } => {
                     crate::partition::metrics().fetch_requests.fetch_add(1, std::sync::atomic::Ordering::Relaxed);

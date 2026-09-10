@@ -4,6 +4,8 @@
 > 违反本文件的"完成"声明无效。账本：[docs/VERIFICATION.md](docs/VERIFICATION.md)。
 > 架构三约束：云原生（OSS + OSS 优化存储）、高性能（架构优化 + 测试）、
 > 高可靠（形式化验证 + 模型检查）——所有工作不得违背。
+> **I/O 实现无关（ADR-14）**：禁止代码依赖缓冲 I/O 特有行为——持久化契约经
+> DiskIo::append（写边界）/ sync_file（持久边界）定义，对缓冲写与 O_DIRECT 同构。
 
 ## 1. 三类 Review Agent（定期 + 事件触发，必须启动）
 

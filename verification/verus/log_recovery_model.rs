@@ -1,5 +1,9 @@
 //! C7 恢复安全性模型——scan_and_truncate 抽象正确性
 //! 运行：verus --crate-type=lib log_recovery_model.rs
+//!
+//! 已验证（10/10）：设备模型 D1-D4 + scan_valid 定义 + scan_len_bounded
+//! WIP：synced_prefix_is_valid / synced_survive 归纳引理（递归 spec fn
+//! 展开的 SMT 触发需进一步 proof 工程——见 git log 中间态）
 
 use vstd::prelude::*;
 
@@ -24,9 +28,6 @@ proof fn d3_crash_keeps_synced(d: Device) requires device_inv(d) ensures device_
 proof fn d4_synced_survives(d: Device, s: int) requires device_inv(d), s <= d.synced_len ensures s <= device_crash(d).synced_len { d3_crash_keeps_synced(d); }
 
 // ===== 恢复扫描模型 =====
-// WIP：scan_valid 的归纳引理（synced_survive/intact_run）待补——
-// 递归 spec fn 展开的 SMT 触发需进一步 Verus proof 工程。
-
 
 pub open spec fn scan_valid(b: Seq<Entry>, start: int) -> int
     decreases b.len() - start
@@ -44,5 +45,9 @@ proof fn scan_len_bounded(b: Seq<Entry>, start: int)
     if start < b.len() { scan_len_bounded(b, start + 1); }
 }
 
+// WIP：synced_prefix_is_valid / synced_survive 归纳引理待补
+// （递归 spec fn 展开的 SMT 触发需进一步 proof 工程——已尝试
+//   显式 assert 链 / forall 传递 / IH 引用，均因 Verus proof
+//   工程限制失败。修法：改用 Map<int, u8> 建模或分步 assert。）
 
 } // verus!

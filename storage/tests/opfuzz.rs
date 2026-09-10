@@ -175,11 +175,21 @@ fn run_seed(seed: u64, torn: f64) {
     let _ = log.sync();
     drop(log);
     let log = Log::open(disk.clone(), dir.clone(), opts.clone()).unwrap();
+    for name in disk.list(&dir).unwrap() {
+        let len = disk.len(&dir.join(&name)).unwrap();
+        eprintln!("DIAG file {name} len={len}");
+    }
+    eprintln!("DIAG reopen: leo={} start={} synced_upto={}", log.next_offset, log.log_start_offset(), synced_upto);
 
     if !chaos && !tracked.is_empty() {
-        assert!(log.next_offset >= synced_upto, "收尾：已 sync 数据丢失");
+        assert!(log.next_offset >= synced_upto, "收尾：已 sync 数据丢失（seed={seed}, synced_upto={synced_upto}, reopen_leo={}, start={}, ops={ops:?})", log.next_offset, log.log_start_offset());
     }
 
+    for name in disk.list(&dir).unwrap() {
+        let len = disk.len(&dir.join(&name)).unwrap();
+        eprintln!("DIAG file {name} len={len}");
+    }
+    eprintln!("DIAG reopen: leo={} start={} synced_upto={} chaos={chaos}", log.next_offset, log.log_start_offset(), synced_upto);
     if !chaos && !tracked.is_empty() {
         // 发现③签名检测：有未核对数据时 LEO 不得停在 log_start
         assert!(log.next_offset > log.log_start_offset(),
@@ -244,8 +254,14 @@ fn run_seed(seed: u64, torn: f64) {
 ///    内容错位，或 straddler base 未随前缀删除 rebase。
 /// 修复方向：delete/truncate 后统一 rebase 段（base 对齐 log_start）并禁用
 /// 该状态的 checkpoint 快速路径；或恢复扫描按批头 base 校验连续性。
+/// WIP（不计入账本）。新证据（DIAG 转储已入测试）：seed=1 clean 重开盘面
+/// 仅存 base-0.index(8B)/base-0.timeindex(12B) 而 base-0.log 缺失——
+/// delete(2) 删除整段文件后，仍有路径重建其索引文件（疑 roll 的
+/// persist_indexes 与段删除时序，或 rescan 重建），恢复扫描因 .log 缺失
+/// 跳过该段 → LEO 0。下一步：delete(2) 后立即断言 base-0 三文件不存在，
+/// 二分定位重建者；或段删除时同时清除真实 fs 的 recovery.checkpoint。
 #[test]
-#[ignore = "WIP: delete/truncate/roll/crash 交互 2 项——见函数注释"]
+#[ignore = "WIP: 索引文件复活 + LEO=0——见函数注释"]
 fn opfuzz_clean_seeds() {
     for seed in 1..=40u64 {
         run_seed(seed, 0.0);
@@ -253,7 +269,7 @@ fn opfuzz_clean_seeds() {
 }
 
 #[test]
-#[ignore = "WIP: LEO 复活——见 clean 注释义务 2"]
+
 fn opfuzz_chaos_seeds() {
     for seed in 1..=20u64 {
         let torn = if seed % 2 == 0 { 0.05 } else { 0.15 };

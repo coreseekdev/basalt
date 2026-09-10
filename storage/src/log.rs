@@ -173,16 +173,26 @@ impl<D: DiskIo> Log<D> {
             }
             scan_and_truncate(&disk, seg, next_offset)?;
             if seg.next_rel == 0 && seg.bytes == 0 && !sealed.is_empty() {
-                continue; // 空段且有前驱：保留文件但不入列表
+                // 空段且有前驱：不入列表。文件必须删除——保留会让后续恢复
+                // 重新收养（opfuzz 实证 LEO 复活）。
+                let _ = disk.remove(&seg.path);
+                let _ = disk.remove(&seg.index_path);
+                let _ = disk.remove(&seg.time_path);
+                continue;
             }
             if !sealed.is_empty() && seg.base_offset != next_offset {
                 tracing::error!(
                     path = %seg.path.display(),
                     expect = next_offset,
                     got = seg.base_offset,
-                    "segment gap detected: skipping orphan segment"
+                    "segment gap detected: removing orphan segment"
                 );
-                continue; // 段间空洞：拒绝（复制路径以此为真相源）
+                // 段间空洞：拒绝并删除文件——保留会让后续恢复重新收养，
+                // 被截断/删除的记录复活（opfuzz 实证）。
+                let _ = disk.remove(&seg.path);
+                let _ = disk.remove(&seg.index_path);
+                let _ = disk.remove(&seg.time_path);
+                continue;
             }
             next_offset = seg.base_offset + seg.next_rel;
             sealed.push(seg.clone());
@@ -612,11 +622,11 @@ impl<D: DiskIo> Log<D> {
 
     /// 删除 < offset 的记录（DeleteRecords 语义，Kafka 同型）：
     /// - 整段位于 offset 之前的段整体删除；
-    /// - 包含 offset 的段文件不动（读取按 log_start_offset 过滤，
-    ///   ReadResult 整批返回由客户端过滤）；
+    /// - 包含 offset 的段**文件原样保留**——批打包格式下物理删前缀必须
+    ///   整文件重写 + 段 rebase，否则恢复按位置重排 offset（opfuzz C7'
+    ///   两次实证：LEO 复活 / 客户端可见漂移）。读取按 log_start_offset
+    ///   过滤，ReadResult 整批返回由客户端过滤；
     /// - log_start_offset 持久化于 recovery.checkpoint（P1-1）。
-    /// （opfuzz C7' 实证：文件 truncate 无法删前缀，此前"保留前缀截掉后缀"
-    ///   的实现精确反向——整段删除语义下该问题不再存在。）
     fn truncate_to_front(&mut self, offset: i64) -> Result<()> {
         let mut removed = 0usize;
         while let Some(seg) = self.sealed.first() {

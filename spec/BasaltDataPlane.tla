@@ -115,11 +115,14 @@ define
     /\ consumed \in Seq(Values)
 
   \* C2a：每个 epoch 至多一个被指派的 leader
+  \* 【结构性标注·不变式评审 P1-3】epoch 由构造严格 +1 入 hist——机制锁
+  \* （防回归 tripwire）而非承载约束；MUT-A（epoch 回绕）可使其变红。
   InvOneLeaderPerEpoch ==
     \A e \in 1..MaxEpochs :
       Cardinality({n \in Brokers : <<e, n>> \in leaderHist}) <= 1
 
-  \* 无人知晓"未来"的 epoch
+  \* 无人知晓"未来"的 epoch【结构性标注·不变式评审 P1-3】无动作写
+  \* view[n].epoch > curEpoch——机制锁性质。
   InvViewEpochSane == \A n \in Brokers : view[n].epoch <= curEpoch
 
   \* 日志匹配：同 index 同写入 epoch 的条目值相同（Raft Log Matching 的
@@ -140,10 +143,16 @@ define
       (curLeader = n /\ view[n].leader = n /\ view[n].epoch = curEpoch
        /\ caughtUp[n]) => IsValsPrefix(committed, log[n])
 
-  \* C4（游标有界）：消费者只读已提交前缀
+  \* C4（游标有界）：消费者只读已提交前缀。
+  \* v0.2：Consume 改为向现任主 fetch（值取自主的日志，长度以已提交
+  \* 前缀为界）——本不变式不再由构造保证，而依赖 C1b（主持有已提交
+  \* 前缀）+ 日志匹配。幻读（脏主/分叉日志可被消费）在此显式变红。
   InvConsumedBounded == IsPrefix(consumed, committed)
 
-  \* C4'（端到端形态）：消费者读到的每条都能从任一多数派中恢复
+  \* C4'（端到端形态）：消费者读到的每条都能从任一多数派中恢复。
+  \* 【推理闭包标注·不变式评审 P1-2】由 InvConsumedBounded + 
+  \* InvLeaderHasCommitted 传递可得——规约语义恒真（定理），保留其
+  \* 文档价值，不作为独立防线。
   InvConsumedOnLeader ==
     \A q \in Majors : \E r \in q : IsPrefix(consumed, Vals(log[r]))
 
@@ -258,15 +267,25 @@ begin
         committed := [i \in 1..L |-> log[self][i][2]]
       end with ;
     or
-      \* Consume：消费已提交前缀的下一项（游标有界）
-      await Len(consumed) < Len(committed) ;
-      consumed := Append(consumed, committed[Len(consumed)+1])
+      \* Consume：消费 fetch 打到现任主，读其日志第 i+1 项。
+      \* 长度以已提交前缀为界（HW 过滤）；值取自主的日志而非 committed
+      \* 变量——幻读检测点：该位置若主日志与已提交值分叉（EagerLeader/
+      \* 脏主形态），InvConsumedBounded 变红（不变式评审 P1-1 处置 (a)）
+      with r \in Brokers do
+        await /\ curLeader = r
+              /\ view[r].leader = r
+              /\ view[r].epoch = curEpoch
+              /\ caughtUp[r]
+              /\ Len(consumed) < Len(log[r])
+              /\ Len(consumed) < Len(committed) ;
+        consumed := Append(consumed, log[r][Len(consumed)+1][2])
+      end with
     end either ;
   end while ;
 end process ;
 
 end algorithm ; *)
-\* BEGIN TRANSLATION (chksum(pcal) = "132b50a9" /\ chksum(tla) = "34e14889")
+\* BEGIN TRANSLATION (chksum(pcal) = "3279ab02" /\ chksum(tla) = "6dd0a850")
 VARIABLES up, parted, curEpoch, curLeader, view, caughtUp, leaderHist, log, 
           committed, consumed
 
@@ -320,9 +339,12 @@ TypeOK ==
   /\ consumed \in Seq(Values)
 
 
+
+
 InvOneLeaderPerEpoch ==
   \A e \in 1..MaxEpochs :
     Cardinality({n \in Brokers : <<e, n>> \in leaderHist}) <= 1
+
 
 
 InvViewEpochSane == \A n \in Brokers : view[n].epoch <= curEpoch
@@ -346,7 +368,13 @@ InvCurrentLeaderHasCommitted ==
      /\ caughtUp[n]) => IsValsPrefix(committed, log[n])
 
 
+
+
+
 InvConsumedBounded == IsPrefix(consumed, committed)
+
+
+
 
 
 InvConsumedOnLeader ==
@@ -447,8 +475,14 @@ Broker(self) == /\ \/ /\ \E q \in Majors:
                                             /\ view[r].leader = self)
                              /\ committed' = [i \in 1..L |-> log[self][i][2]]
                       /\ UNCHANGED <<view, caughtUp, log, consumed>>
-                   \/ /\ Len(consumed) < Len(committed)
-                      /\ consumed' = Append(consumed, committed[Len(consumed)+1])
+                   \/ /\ \E r \in Brokers:
+                           /\ /\ curLeader = r
+                              /\ view[r].leader = r
+                              /\ view[r].epoch = curEpoch
+                              /\ caughtUp[r]
+                              /\ Len(consumed) < Len(log[r])
+                              /\ Len(consumed) < Len(committed)
+                           /\ consumed' = Append(consumed, log[r][Len(consumed)+1][2])
                       /\ UNCHANGED <<view, caughtUp, log, committed>>
                 /\ UNCHANGED << up, parted, curEpoch, curLeader, leaderHist >>
 

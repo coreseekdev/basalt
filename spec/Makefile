@@ -1,4 +1,4 @@
-# Basalt 数据面规约验证（docs/VERIFICATION.md C1-C4）
+# Basalt 数据面规约验证（docs/VERIFICATION.md C1-C4/C9）
 # 依赖：JDK 11+；tla2tools.jar 放本目录或用 TLATOOLS 指定路径。
 #   wget -P . https://github.com/tlaplus/tlaplus/releases/latest/download/tla2tools.jar
 TLATOOLS ?= $(CURDIR)/tools/tla2tools.jar
@@ -13,5 +13,13 @@ splitbrain-cepoch:; $(TLC) -config splitbrain-cepoch.cfg BasaltDataPlane.tla
 
 consumer-group:        ; $(TLC) -config consumer-group.cfg ConsumerGroup.tla
 consumer-group-demo:   ; $(TLC) -config consumer-group-demo.cfg ConsumerGroup.tla
+consumer-group-liveness: ; $(TLC) -config consumer-group-liveness.cfg ConsumerGroup.tla
 
-.PHONY: consumer-group consumer-group-demo
+# 活性二分实验（C9 收敛性，CONSUMERGROUP-LIVENESS-WIP.md）：
+#   cg-liveness-l0/l2/l3 全部期望红——已证明的负结果（四级公平性均不可满足）
+cg-liveness-l0: ; $(TLC) -config consumer-group-l0.cfg ConsumerGroupLiveness.tla
+cg-liveness-l2: ; $(TLC) -config consumer-group-l2.cfg ConsumerGroupLiveness.tla
+cg-liveness-l3: ; $(TLC) -config consumer-group-l3.cfg ConsumerGroupLiveness.tla
+
+.PHONY: consumer-group consumer-group-demo consumer-group-liveness
+.PHONY: cg-liveness-l0 cg-liveness-l2 cg-liveness-l3

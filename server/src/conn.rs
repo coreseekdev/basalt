@@ -34,7 +34,7 @@ pub async fn serve_connection(
                 break;
             }
             // 归还唯一所有的读缓冲（Bytes 唯一 → BytesMut → 池）
-            if let Ok(mut bm) = Bytes::try_into_mut(resp) {
+            if let Ok(bm) = Bytes::try_into_mut(resp) {
                 use basalt_storage::pool::BufferPool;
                 BufferPool::release(&writer_pool, bm);
             }

@@ -455,7 +455,7 @@ impl PartitionActor {
                     // 四轮 review P1-2：parked_acks 中 last_offset >= offset 的
                     // 也按错误结算（防止 offset 复用别名放行）
                     let parked = std::mem::take(&mut self.parked_acks);
-                    for mut p in parked {
+                    for p in parked {
                         if p.last_offset >= offset {
                             p.reply.send(ProduceOutcome {
                                 base_offset: -1, last_offset: p.last_offset,

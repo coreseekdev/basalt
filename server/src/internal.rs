@@ -19,6 +19,18 @@ pub const MSG_HEARTBEAT: u8 = 2;
 pub const MSG_META_SYNC: u8 = 3;
 pub const MSG_CREATE_TOPIC: u8 = 4;
 pub const MSG_FETCH_SLICE: u8 = 5;
+pub const MSG_TRANSFER: u8 = 6;
+
+/// 分区注入（T-M2.5）：本节点拒绝与之通信的对端集合（双向断边）。
+/// BASALT_BLOCK_PEERS="1,2" —— 心跳/元数据/FetchSlice 全部断开。
+pub fn blocked_peers() -> &'static std::collections::HashSet<i32> {
+    static BLOCKED: std::sync::OnceLock<std::collections::HashSet<i32>> = std::sync::OnceLock::new();
+    BLOCKED.get_or_init(|| {
+        std::env::var("BASALT_BLOCK_PEERS")
+            .map(|v| v.split(',').filter_map(|x| x.trim().parse().ok()).collect())
+            .unwrap_or_default()
+    })
+}
 
 #[derive(Debug, Clone)]
 #[allow(dead_code)]
@@ -118,6 +130,9 @@ pub enum ControllerCmd {
     Sync { version: u64, reply: oneshot::Sender<Option<Vec<u8>>> },
     CreateTopic { name: String, partitions: i32, rf: i32, reply: oneshot::Sender<()> },
     ApplySnapshot { state: ClusterState },
+    /// 计划内交接（M2 L1：目标为副本成员，epoch+1 走 LeaderChange——
+    /// 数据已在副本集内同步，交接窗口 = 元数据广播周期，无数据迁移）
+    TransferLeader { topic: String, partition: i32, to: i32, reply: oneshot::Sender<Result<(), String>> },
 }
 
 /// 控制器 actor（独占 ClusterState；最小 node id 的 broker 进程内运行）。
@@ -180,6 +195,30 @@ impl Controller {
             }
             ControllerCmd::ApplySnapshot { state } => {
                 self.state = state;
+            }
+            ControllerCmd::TransferLeader { topic, partition, to, reply } => {
+                // 先按不可变借用校验资格，再取独立信息调用 apply_and_persist
+                let cur = self.state.assignments.iter().find(|a| a.topic == topic && a.partition == partition);
+                let alive = self.last_heartbeat.get(&to)
+                    .map(|t| t.elapsed() <= self.heartbeat_timeout)
+                    .unwrap_or(to == self.node_id); // 控制器自身免死
+                let r = match cur {
+                    Some(a) if a.replicas.contains(&to) && a.leader != to && alive => {
+                        let epoch = a.epoch + 1;
+                        let rec = ClusterRecord::LeaderChange {
+                            topic: topic.clone(),
+                            partition,
+                            leader: to,
+                            epoch,
+                        };
+                        self.apply_and_persist(&rec);
+                        tracing::info!(topic=%topic, partition, to, epoch, "TRANSFER");
+                        Ok(())
+                    }
+                    Some(_) => Err("transfer target not eligible".into()),
+                    None => Err("assignment not found".into()),
+                };
+                let _ = reply.send(r);
             }
         }
     }
@@ -452,6 +491,30 @@ async fn handle_internal_conn(
                 }
                 Bytes::from(out)
             }
+            MSG_TRANSFER => {
+                // payload: u16 topic_len | topic | i32 partition | i32 to
+                let bad = || Bytes::from(1i16.to_be_bytes().to_vec());
+                if payload.len() < 2 {
+                    sock.write_all(&bad()).await?;
+                    return Ok(());
+                }
+                let n = i16::from_be_bytes(payload[0..2].try_into().unwrap()) as usize;
+                if payload.len() < 2 + n + 8 {
+                    sock.write_all(&bad()).await?;
+                    return Ok(());
+                }
+                let topic = String::from_utf8_lossy(&payload[2..2 + n]).into_owned();
+                let partition = i32::from_be_bytes(payload[2 + n..6 + n].try_into().unwrap());
+                let to = i32::from_be_bytes(payload[6 + n..10 + n].try_into().unwrap());
+                let r = if let Some(tx) = &ctx.controller_tx {
+                    let (txr, rxr) = tokio::sync::oneshot::channel();
+                    let _ = tx.send(ControllerCmd::TransferLeader { topic, partition, to, reply: txr }).await;
+                    rxr.await.unwrap_or_else(|_| Err("controller dropped".into()))
+                } else {
+                    Err("not controller".into())
+                };
+                Bytes::from(r.map(|_| 0i16).unwrap_or(-1i16).to_be_bytes().to_vec())
+            }
             MSG_CREATE_TOPIC => {
                 let Ok((name, partitions, rf)) = parse_create(payload) else {
                     sock.write_all(&short_frame()).await?;
@@ -469,6 +532,11 @@ async fn handle_internal_conn(
                     sock.write_all(&short_frame()).await?;
                     return Ok(());
                 };
+                if blocked_peers().contains(&follower_id) {
+                    // 分区注入：leader 拒绝为被断边的 follower 服务
+                    sock.write_all(&short_frame()).await?;
+                    return Ok(());
+                }
                 let route = {
                     let routes = ctx.routes_rx.borrow();
                     routes.find(&topic, partition).cloned()

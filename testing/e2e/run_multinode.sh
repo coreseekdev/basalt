@@ -4,7 +4,14 @@ set -u
 BASE_PORT=9092
 PID_DIR=$(mktemp -d /tmp/basalt-mn-XXXX)
 DATA_DIR=$(mktemp -d /tmp/basalt-mn-data-XXXX)
-export PID_DIR
+export PID_DIR DATA_DIR
+
+# 清理遗留 broker（三端口 + 内部端口）
+for PORT in 9092 9102 9112 9093 9103 9113; do
+  OLD=$(fuser $PORT/tcp 2>/dev/null)
+  [ -n "$OLD" ] && kill -9 $OLD 2>/dev/null
+done
+sleep 0.5
 
 cleanup() {
   for f in "$PID_DIR"/*; do
@@ -28,8 +35,9 @@ for i in 0 1 2; do
 done
 sleep 2
 
+SCENARIO="${1:-multinode_failover.py}"
 KILL_BY_PORT=1 BROKERS="localhost:9092,localhost:9102,localhost:9112" \
-  python3 testing/e2e/multinode_failover.py
+  python3 "testing/e2e/$SCENARIO"
 RC=$?
 
 echo "--- node logs (WARN/ERROR/FAILOVER) ---"

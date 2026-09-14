@@ -389,6 +389,11 @@ struct FollowerPull {
 
 impl FollowerPull {
     async fn run(self) {
+        // 分区注入：leader 在断边集内则不拉取（追赶场景的注入点）
+        if crate::internal::blocked_peers().contains(&self.leader) {
+            tracing::warn!(topic=%self.topic, leader=self.leader, "follower pull: leader blocked (partition injection)");
+            return;
+        }
         let client = crate::internal::InternalClient::new(self.leader_addr.clone());
         // 启动 LEO：从本地 actor 查询真实日志末尾（重启/带数据重启场景不能从 0 开始）
         let Some(mut next_offset) = self.local_leo().await else {

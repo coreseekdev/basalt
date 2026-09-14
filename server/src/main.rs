@@ -59,7 +59,7 @@ async fn async_main(cfg: Config) {
             cfg.node_id,
             std::path::Path::new(&cfg.data_dir).join("__controller.log"),
             std::time::Duration::from_millis(
-                std::env::var("BASALT_HEARTBEAT_TIMEOUT_MS").ok().and_then(|v| v.parse().ok()).unwrap_or(4000),
+                std::env::var("BASALT_HEARTBEAT_TIMEOUT_MS").ok().and_then(|v| v.parse().ok()).unwrap_or(1000),
             ),
         ))
     } else {
@@ -158,10 +158,15 @@ async fn async_main(cfg: Config) {
             let _ = client.register(sync_cfg.node_id, &sync_cfg.host, sync_cfg.port).await;
             let hb_client = internal::InternalClient::new(ctrl_addr.clone());
             let hb_node = sync_cfg.node_id;
+            // L1 failover <2s：心跳 400ms + 超时 1200ms → 最坏 1.6s 检出
+            let hb_ms: u64 = std::env::var("BASALT_HEARTBEAT_MS").ok().and_then(|v| v.parse().ok()).unwrap_or(300);
             tokio::spawn(async move {
                 loop {
-                    tokio::time::sleep(std::time::Duration::from_millis(1000)).await;
-                    let _ = hb_client.heartbeat(hb_node).await;
+                    // 分区注入：对端在断边集内则不发送
+                    if !internal::blocked_peers().contains(&ctrl_id) {
+                        let _ = hb_client.heartbeat(hb_node).await;
+                    }
+                    tokio::time::sleep(std::time::Duration::from_millis(hb_ms)).await;
                 }
             });
         } else if let Some(tx) = &controller_tx_sync {
@@ -184,6 +189,11 @@ async fn async_main(cfg: Config) {
         let mut last_version = 0u64;
         let meta_tx = meta_tx_sync;
         loop {
+            // 分区注入：控制器在断边集内则跳过元数据轮询
+            if internal::blocked_peers().contains(&ctrl_id) {
+                tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+                continue;
+            }
             if let Ok(resp) = client.meta_sync(last_version).await {
                 if resp.len() >= 1 && resp[0] == 1 {
                     if let Some(state) = basalt_metadata::cluster::ClusterState::decode(&resp[1..]) {
@@ -192,7 +202,8 @@ async fn async_main(cfg: Config) {
                     }
                 }
             }
-            tokio::time::sleep(std::time::Duration::from_millis(400)).await;
+            // L1：元数据收敛 ≤200ms（failover 检出 1.3s + 0.2s ≈ 1.5s < 2s）
+            tokio::time::sleep(std::time::Duration::from_millis(200)).await;
         }
     });
 

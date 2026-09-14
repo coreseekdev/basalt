@@ -36,6 +36,7 @@ Basalt：Rust 版 Kafka 兼容消息流平台
 | M0 | rdkafka/franz-go 冒烟通过（Produce/Fetch/acks=1）；turmoil 单机崩溃持久性种子扫描绿 |
 | M1 | librdkafka + franz-go + kafka-clients report card ≥ 90%；仿真种子扫描无丢重 |
 | M2 | 仿真切主/分区/追赶场景不丢不重；ducktape 式 bounce 测试通过；failover L1：崩溃 <2s、计划内交接毫秒级（ADR-10） |
+|   | **验收进度（2026-09-14）**：切主/分区/追赶 ✅（multinode 五场景不丢不重）；bounce ✅（v1 六轮零丢失）；failover L1 ✅（崩溃实测 1063ms <2s）、计划内交接 ✅（153-279ms）。**未闭合**：控制器多副本（openraft，T-M2.1 产出物）——现役单控制器为 SPOF（v1 接受：控制器故障 = 元数据不可恢复性风险，数据面不受影响），openraft 接入为 M2 完整闭合的最后一项 |
 | M3 | RisingWave/Vector/Bento 式真实负载 e2e 通过；事务 marker 语义专项通过 |
 | M4 | 基准对标报表产出；混沌长跑 24h 无不变式违反 |
 
@@ -84,10 +85,10 @@ Basalt：Rust 版 Kafka 兼容消息流平台
 |---|---|---|---|---|---|---|
 | T-M2.1 | ⬜ | openraft 接入 + 单写者控制器 | 控制器事件循环；controller log；MetadataImage/Delta；broker 心跳与存活判定（心跳协议预留 L2 健康位图/stall 上报字段——ADR-10） | 控制器故障切换单测（MockRaftClient 式）；image 快照重放一致 | T-M1 全部 | [Kafka §4](../docs/01-apache-kafka.md) |
 | T-M2.2 | ⬜ | 多 broker 拓扑与元数据广播 | Metadata 增量广播、broker 侧 MetadataCache、请求转发（shard/分区归属表） | 3 节点 docker 集群起停/扩容；客户端任意节点可 bootstrap | T-M2.1 | [Redpanda §1](../docs/02-redpanda.md) |
-| T-M2.3 | ⬜ | ISR 形态复制协议 + leader epoch（ADR-10） | 控制器指派 leader + epoch fencing + follower-pull 多数派 append；HW/LSO/log start 三水位；leader-epoch checkpoint；OffsetForLeaderEpoch；继任者预计算与变更批量化（failover L1）。**规约侧 M2 义务（缺陷⑯/C14①，2026-09-10）**：控制器租约随 broker 进程死亡失效（崩溃旧主不得凭持久 view 以原 epoch 自恢复复写——规约已证其破坏日志匹配）；acks=all 提交条件钉死为 ack 数 ≥ 多数派（ISR 收缩只损失可用性；unclean election=false 写进 C1 条款） | 仿真：切主后 follower 截断对齐、消费不重复不跳变；崩溃 failover <2s、计划内交接毫秒级 | T-M2.1 | [Kafka §3](../docs/01-apache-kafka.md)（KIP-966/951） |
+| T-M2.3 | 🟨 | ISR 形态复制协议 + leader epoch（ADR-10） | 控制器指派 leader + epoch fencing + follower-pull 多数派 append + HW 水位 + leader-epoch checkpoint；**规约义务已履行（缺陷⑯/C14①）**：租约随进程死亡失效（actor 重启默认 Follower）+ acks=all 下限钉死 max(min.insync, 多数派)（回归测试锁定）。**L1 已度量（2026-09-14）**：崩溃 failover 1063ms（<2s 门禁）、计划内交接 TransferLeader 153-279ms（epoch+1 走 LeaderChange）| 切主/分区/追赶/bounce 场景 e2e 全绿（multinode_*.py 五场景）；LSO/事务位未建模（M3） | T-M2.1 | [Kafka §3](../docs/01-apache-kafka.md)（KIP-966/951） |
 | T-M2.4 | ⬜ | 复制调优 | 按 follower 聚批、落后副本批量追赶+全局限流、共用心跳 RPC | 3 副本 acks=all 吞吐基线达标；追赶不影响前台 P99（基准） | T-M2.3 | [Redpanda §3](../docs/02-redpanda.md) |
-| T-M2.5 🔬 | ⬜ | 集群仿真场景 | 切主/分区/追赶/hold 重排/in-flight 重复投递五场景接入 harness | 每场景 ≥500 seeds 不丢不重 | T-M2.3 | [测试 §3.2](../docs/11-testing-strategy.md) |
-| T-M2.6 🔬 | ⬜ | ducktape 式混沌 v1 | bounce 矩阵（clean/hard）+ 网络分区注入 + 随机节点操作（1h 档） | 24 种注入组合下不变式全绿 | T-M2.5 | [测试 §7](../docs/11-testing-strategy.md) |
+| T-M2.5 🔬 | 🟨 | 集群仿真场景 | 切主（multinode_failover）、分区+追赶（multinode_partition，BASALT_BLOCK_PEERS 双向断边）、bounce（multinode_bounce）已接入 harness；hold 重排/in-flight 重复投递两场景 ⬜ | 每场景 ≥500 seeds 不丢不重（当前每场景 1 组合 v1） | T-M2.3 | [测试 §3.2](../docs/11-testing-strategy.md) |
+| T-M2.6 🔬 | 🟨 | ducktape 式混沌 v1 | bounce 矩阵 v1 已建（multinode_bounce.py：hard/clean × node1/node2 六轮，零丢失；dup=at-least-once 重试属 T-M3.1 幂等）。分区注入 BASALT_BLOCK_PEERS。1h 档与随机操作序列 ⬜ | 24 种注入组合下不变式全绿（当前 6 轮 v1） | T-M2.5 | [测试 §7](../docs/11-testing-strategy.md) |
 | T-Q.2 | ✅ | TLA+ 规约 v0.3（数据面+消费组+活性） | 数据面：ADR-10 协议 + synced 崩溃边界（C14①）+ 控制器租约（缺陷⑯）+ 副本读消费；消费组：v0.3 generation fencing + 审计位监控（MUT-C/E 判别力实证）；活性：数据面稳定环境三性质绿 + 消费组二分负结果。全矩阵 TLC（含 1.27 亿状态全空间）+ 5 组突变对照（账本 C1-C14） | ✅ TLC 全绿/阴性对照红并入库（设计变更时重跑）；六场景门禁在 scripts/verify.sh | T-M2.1 | [Walrus §6](../docs/07-walrus.md) |
 
 ## M3 高级语义

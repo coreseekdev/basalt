@@ -102,6 +102,11 @@ jobs:
             bash testing/e2e/run_e2e.sh "$t"
           done
           bash testing/e2e/run_franzgo.sh
+      - name: 多节点 M2 场景（failover/L1<2s/计划内交接/分区追赶/bounce v1）
+        run: |
+          for s in multinode_failover.py multinode_l1.py multinode_transfer.py multinode_partition.py multinode_bounce.py; do
+            bash testing/e2e/run_multinode.sh "$s"
+          done
 
   opfuzz-nightly:
     if: github.event_name == 'schedule' # ⑱⑲⑳ 修复后转阻塞门禁

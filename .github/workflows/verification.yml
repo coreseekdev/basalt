@@ -104,8 +104,7 @@ jobs:
           bash testing/e2e/run_franzgo.sh
 
   opfuzz-nightly:
-    if: github.event_name == 'schedule'
-    continue-on-error: true # 扫雷模式：chaos seed=879009 WIP 期间不阻塞
+    if: github.event_name == 'schedule' # ⑱⑲⑳ 修复后转阻塞门禁
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4

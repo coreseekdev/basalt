@@ -1,0 +1,1406 @@
+   Compiling basalt-storage v0.1.0 (/home/nzinfo/src.db/stream-db/basalt/storage)
+warning: function `assert_batch_stream` is never used
+  --> storage/tests/opfuzz.rs:62:4
+   |
+62 | fn assert_batch_stream(data: &[u8]) {
+   |    ^^^^^^^^^^^^^^^^^^^
+   |
+   = note: `#[warn(dead_code)]` (part of `#[warn(unused)]`) on by default
+
+warning: `basalt-storage` (test "opfuzz") generated 1 warning
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 0.25s
+     Running tests/opfuzz.rs (target/debug/deps/opfuzz-4ea556b50bb09c36)
+
+running 1 test
+test opfuzz_chaos_seeds ... FAILED
+
+failures:
+
+---- opfuzz_chaos_seeds stdout ----
+DIAG file 00000000000000000000.index len=8
+DIAG file 00000000000000000000.log len=99
+DIAG file 00000000000000000000.timeindex len=12
+DIAG file 00000000000000000002.index len=8
+DIAG file 00000000000000000002.log len=297
+DIAG file 00000000000000000002.timeindex len=12
+DIAG file 00000000000000000008.log len=99
+DIAG reopen: leo=10 start=0 synced_upto=2 segs=[(0, 99, 2), (2, 297, 6), (8, 99, 2)]
+DIAG file 00000000000000000000.index len=8
+DIAG file 00000000000000000000.log len=99
+DIAG file 00000000000000000000.timeindex len=12
+DIAG file 00000000000000000002.index len=8
+DIAG file 00000000000000000002.log len=297
+DIAG file 00000000000000000002.timeindex len=12
+DIAG file 00000000000000000008.log len=99
+DIAG reopen: leo=10 start=0 synced_upto=2 chaos=true
+DIAG file 00000000000000000008.index len=8
+DIAG file 00000000000000000008.log len=202
+DIAG file 00000000000000000008.timeindex len=12
+DIAG file 00000000000000000012.index len=8
+DIAG file 00000000000000000012.log len=202
+DIAG file 00000000000000000012.timeindex len=12
+DIAG file 00000000000000000016.index len=8
+DIAG file 00000000000000000016.log len=202
+DIAG file 00000000000000000016.timeindex len=12
+DIAG file 00000000000000000020.index len=8
+DIAG file 00000000000000000020.log len=202
+DIAG file 00000000000000000020.timeindex len=12
+DIAG file 00000000000000000024.log len=202
+DIAG reopen: leo=28 start=10 synced_upto=10 segs=[(8, 202, 4), (12, 202, 4), (16, 202, 4), (20, 202, 4), (24, 202, 4)]
+DIAG file 00000000000000000008.index len=8
+DIAG file 00000000000000000008.log len=202
+DIAG file 00000000000000000008.timeindex len=12
+DIAG file 00000000000000000012.index len=8
+DIAG file 00000000000000000012.log len=202
+DIAG file 00000000000000000012.timeindex len=12
+DIAG file 00000000000000000016.index len=8
+DIAG file 00000000000000000016.log len=202
+DIAG file 00000000000000000016.timeindex len=12
+DIAG file 00000000000000000020.index len=8
+DIAG file 00000000000000000020.log len=202
+DIAG file 00000000000000000020.timeindex len=12
+DIAG file 00000000000000000024.log len=202
+DIAG reopen: leo=28 start=10 synced_upto=10 chaos=true
+DIAG file 00000000000000000000.index len=16
+DIAG file 00000000000000000000.log len=202
+DIAG file 00000000000000000000.timeindex len=12
+DIAG reopen: leo=4 start=0 synced_upto=2 segs=[(0, 202, 4)]
+DIAG file 00000000000000000000.index len=16
+DIAG file 00000000000000000000.log len=202
+DIAG file 00000000000000000000.timeindex len=12
+DIAG reopen: leo=4 start=0 synced_upto=2 chaos=true
+DIAG file 00000000000000000000.index len=16
+DIAG file 00000000000000000000.log len=202
+DIAG file 00000000000000000000.timeindex len=12
+DIAG reopen: leo=4 start=0 synced_upto=2 segs=[(0, 202, 4)]
+DIAG file 00000000000000000000.index len=16
+DIAG file 00000000000000000000.log len=202
+DIAG file 00000000000000000000.timeindex len=12
+DIAG reopen: leo=4 start=0 synced_upto=2 chaos=true
+DIAG reopen: leo=2 start=2 synced_upto=2 segs=[(2, 0, 0)]
+DIAG reopen: leo=2 start=2 synced_upto=2 chaos=true
+DIAG file 00000000000000000000.index len=16
+DIAG file 00000000000000000000.log len=202
+DIAG file 00000000000000000000.timeindex len=12
+DIAG file 00000000000000000004.index len=8
+DIAG file 00000000000000000004.log len=202
+DIAG file 00000000000000000004.timeindex len=12
+DIAG file 00000000000000000008.log len=101
+DIAG reopen: leo=10 start=0 synced_upto=2 segs=[(0, 202, 4), (4, 202, 4), (8, 101, 2)]
+DIAG file 00000000000000000000.index len=16
+DIAG file 00000000000000000000.log len=202
+DIAG file 00000000000000000000.timeindex len=12
+DIAG file 00000000000000000004.index len=8
+DIAG file 00000000000000000004.log len=202
+DIAG file 00000000000000000004.timeindex len=12
+DIAG file 00000000000000000008.log len=101
+DIAG reopen: leo=10 start=0 synced_upto=2 chaos=true
+DIAG file 00000000000000000000.index len=8
+DIAG file 00000000000000000000.log len=101
+DIAG file 00000000000000000000.timeindex len=12
+DIAG reopen: leo=2 start=0 synced_upto=0 segs=[(0, 101, 2)]
+DIAG file 00000000000000000000.index len=8
+DIAG file 00000000000000000000.log len=101
+DIAG file 00000000000000000000.timeindex len=12
+DIAG reopen: leo=2 start=0 synced_upto=0 chaos=true
+DIAG file 00000000000000000000.log len=202
+DIAG reopen: leo=4 start=0 synced_upto=4 segs=[(0, 202, 4)]
+DIAG file 00000000000000000000.log len=202
+DIAG reopen: leo=4 start=0 synced_upto=4 chaos=true
+DIAG file 00000000000000000000.index len=8
+DIAG file 00000000000000000000.log len=202
+DIAG file 00000000000000000000.timeindex len=12
+DIAG file 00000000000000000004.log len=101
+DIAG reopen: leo=6 start=0 synced_upto=2 segs=[(0, 202, 4), (4, 101, 2)]
+DIAG file 00000000000000000000.index len=8
+DIAG file 00000000000000000000.log len=202
+DIAG file 00000000000000000000.timeindex len=12
+DIAG file 00000000000000000004.log len=101
+DIAG reopen: leo=6 start=0 synced_upto=2 chaos=true
+DIAG file 00000000000000000013.index len=16
+DIAG file 00000000000000000013.log len=202
+DIAG file 00000000000000000013.timeindex len=12
+DIAG file 00000000000000000017.log len=202
+DIAG reopen: leo=21 start=13 synced_upto=15 segs=[(13, 202, 4), (17, 202, 4)]
+DIAG file 00000000000000000013.index len=16
+DIAG file 00000000000000000013.log len=202
+DIAG file 00000000000000000013.timeindex len=12
+DIAG file 00000000000000000017.log len=202
+DIAG reopen: leo=21 start=13 synced_upto=15 chaos=true
+DIAG file 00000000000000000002.index len=8
+DIAG file 00000000000000000002.log len=101
+DIAG file 00000000000000000002.timeindex len=12
+DIAG file 00000000000000000004.index len=8
+DIAG file 00000000000000000004.log len=202
+DIAG file 00000000000000000004.timeindex len=12
+DIAG file 00000000000000000008.index len=8
+DIAG file 00000000000000000008.log len=202
+DIAG file 00000000000000000008.timeindex len=12
+DIAG file 00000000000000000012.log len=101
+DIAG reopen: leo=14 start=2 synced_upto=2 segs=[(2, 101, 2), (4, 202, 4), (8, 202, 4), (12, 101, 2)]
+DIAG file 00000000000000000002.index len=8
+DIAG file 00000000000000000002.log len=101
+DIAG file 00000000000000000002.timeindex len=12
+DIAG file 00000000000000000004.index len=8
+DIAG file 00000000000000000004.log len=202
+DIAG file 00000000000000000004.timeindex len=12
+DIAG file 00000000000000000008.index len=8
+DIAG file 00000000000000000008.log len=202
+DIAG file 00000000000000000008.timeindex len=12
+DIAG file 00000000000000000012.log len=101
+DIAG reopen: leo=14 start=2 synced_upto=2 chaos=true
+DIAG file 00000000000000000009.index len=8
+DIAG file 00000000000000000009.log len=202
+DIAG file 00000000000000000009.timeindex len=12
+DIAG reopen: leo=13 start=9 synced_upto=11 segs=[(9, 202, 4)]
+DIAG file 00000000000000000009.index len=8
+DIAG file 00000000000000000009.log len=202
+DIAG file 00000000000000000009.timeindex len=12
+DIAG reopen: leo=13 start=9 synced_upto=11 chaos=true
+DIAG file 00000000000000000000.index len=16
+DIAG file 00000000000000000000.log len=103
+DIAG file 00000000000000000000.timeindex len=6
+DIAG reopen: leo=2 start=1 synced_upto=2 segs=[(0, 103, 2)]
+DIAG file 00000000000000000000.index len=16
+DIAG file 00000000000000000000.log len=103
+DIAG file 00000000000000000000.timeindex len=6
+DIAG reopen: leo=2 start=1 synced_upto=2 chaos=true
+DIAG file 00000000000000000000.index len=8
+DIAG file 00000000000000000000.log len=103
+DIAG file 00000000000000000000.timeindex len=12
+DIAG reopen: leo=2 start=0 synced_upto=2 segs=[(0, 103, 2)]
+DIAG file 00000000000000000000.index len=8
+DIAG file 00000000000000000000.log len=103
+DIAG file 00000000000000000000.timeindex len=12
+DIAG reopen: leo=2 start=0 synced_upto=2 chaos=true
+DIAG file 00000000000000000003.index len=8
+DIAG file 00000000000000000003.log len=103
+DIAG file 00000000000000000003.timeindex len=12
+DIAG file 00000000000000000005.log len=206
+DIAG reopen: leo=9 start=3 synced_upto=3 segs=[(3, 103, 2), (5, 206, 4)]
+DIAG file 00000000000000000003.index len=8
+DIAG file 00000000000000000003.log len=103
+DIAG file 00000000000000000003.timeindex len=12
+DIAG file 00000000000000000005.log len=206
+DIAG reopen: leo=9 start=3 synced_upto=3 chaos=true
+DIAG file 00000000000000000000.log len=0
+DIAG reopen: leo=0 start=0 synced_upto=0 segs=[(0, 0, 0)]
+DIAG file 00000000000000000000.log len=0
+DIAG reopen: leo=0 start=0 synced_upto=0 chaos=true
+DIAG file 00000000000000000014.index len=8
+DIAG file 00000000000000000014.log len=206
+DIAG file 00000000000000000014.timeindex len=12
+DIAG file 00000000000000000018.index len=8
+DIAG file 00000000000000000018.log len=103
+DIAG file 00000000000000000018.timeindex len=12
+DIAG file 00000000000000000020.index len=8
+DIAG file 00000000000000000020.log len=206
+DIAG file 00000000000000000020.timeindex len=12
+DIAG reopen: leo=24 start=15 synced_upto=20 segs=[(14, 206, 4), (18, 103, 2), (20, 206, 4)]
+DIAG file 00000000000000000014.index len=8
+DIAG file 00000000000000000014.log len=206
+DIAG file 00000000000000000014.timeindex len=12
+DIAG file 00000000000000000018.index len=8
+DIAG file 00000000000000000018.log len=103
+DIAG file 00000000000000000018.timeindex len=12
+DIAG file 00000000000000000020.index len=8
+DIAG file 00000000000000000020.log len=206
+DIAG file 00000000000000000020.timeindex len=12
+DIAG reopen: leo=24 start=15 synced_upto=20 chaos=true
+DIAG file 00000000000000000021.log len=206
+DIAG reopen: leo=25 start=22 synced_upto=22 segs=[(21, 206, 4)]
+DIAG file 00000000000000000021.log len=206
+DIAG reopen: leo=25 start=22 synced_upto=22 chaos=true
+DIAG file 00000000000000000004.index len=8
+DIAG file 00000000000000000004.log len=103
+DIAG file 00000000000000000004.timeindex len=12
+DIAG file 00000000000000000006.log len=103
+DIAG reopen: leo=8 start=4 synced_upto=6 segs=[(4, 103, 2), (6, 103, 2)]
+DIAG file 00000000000000000004.index len=8
+DIAG file 00000000000000000004.log len=103
+DIAG file 00000000000000000004.timeindex len=12
+DIAG file 00000000000000000006.log len=103
+DIAG reopen: leo=8 start=4 synced_upto=6 chaos=true
+DIAG file 00000000000000000014.index len=8
+DIAG file 00000000000000000014.log len=206
+DIAG file 00000000000000000014.timeindex len=12
+DIAG file 00000000000000000018.index len=8
+DIAG file 00000000000000000018.log len=206
+DIAG file 00000000000000000018.timeindex len=12
+DIAG file 00000000000000000022.log len=103
+DIAG reopen: leo=24 start=14 synced_upto=16 segs=[(14, 206, 4), (18, 206, 4), (22, 103, 2)]
+DIAG file 00000000000000000014.index len=8
+DIAG file 00000000000000000014.log len=206
+DIAG file 00000000000000000014.timeindex len=12
+DIAG file 00000000000000000018.index len=8
+DIAG file 00000000000000000018.log len=206
+DIAG file 00000000000000000018.timeindex len=12
+DIAG file 00000000000000000022.log len=103
+DIAG reopen: leo=24 start=14 synced_upto=16 chaos=true
+DIAG file 00000000000000000000.index len=8
+DIAG file 00000000000000000000.log len=206
+DIAG file 00000000000000000000.timeindex len=6
+DIAG reopen: leo=4 start=0 synced_upto=0 segs=[(0, 206, 4)]
+DIAG file 00000000000000000000.index len=8
+DIAG file 00000000000000000000.log len=206
+DIAG file 00000000000000000000.timeindex len=6
+DIAG reopen: leo=4 start=0 synced_upto=0 chaos=true
+DIAG file 00000000000000000008.index len=8
+DIAG file 00000000000000000008.log len=206
+DIAG file 00000000000000000008.timeindex len=12
+DIAG file 00000000000000000012.index len=8
+DIAG file 00000000000000000012.log len=206
+DIAG file 00000000000000000012.timeindex len=12
+DIAG file 00000000000000000016.index len=8
+DIAG file 00000000000000000016.log len=206
+DIAG file 00000000000000000016.timeindex len=12
+DIAG file 00000000000000000020.log len=103
+DIAG reopen: leo=22 start=9 synced_upto=12 segs=[(8, 206, 4), (12, 206, 4), (16, 206, 4), (20, 103, 2)]
+DIAG file 00000000000000000008.index len=8
+DIAG file 00000000000000000008.log len=206
+DIAG file 00000000000000000008.timeindex len=12
+DIAG file 00000000000000000012.index len=8
+DIAG file 00000000000000000012.log len=206
+DIAG file 00000000000000000012.timeindex len=12
+DIAG file 00000000000000000016.index len=8
+DIAG file 00000000000000000016.log len=206
+DIAG file 00000000000000000016.timeindex len=12
+DIAG file 00000000000000000020.log len=103
+DIAG reopen: leo=22 start=9 synced_upto=12 chaos=true
+DIAG reopen: leo=2 start=2 synced_upto=2 segs=[(2, 0, 0)]
+DIAG reopen: leo=2 start=2 synced_upto=2 chaos=true
+DIAG file 00000000000000000014.log len=206
+DIAG reopen: leo=18 start=14 synced_upto=14 segs=[(14, 206, 4)]
+DIAG file 00000000000000000014.log len=206
+DIAG reopen: leo=18 start=14 synced_upto=14 chaos=true
+DIAG file 00000000000000000007.index len=16
+DIAG file 00000000000000000007.log len=206
+DIAG file 00000000000000000007.timeindex len=12
+DIAG file 00000000000000000011.index len=8
+DIAG file 00000000000000000011.log len=103
+DIAG file 00000000000000000011.timeindex len=12
+DIAG file 00000000000000000013.log len=206
+DIAG reopen: leo=17 start=7 synced_upto=9 segs=[(7, 206, 4), (11, 103, 2), (13, 206, 4)]
+DIAG file 00000000000000000007.index len=16
+DIAG file 00000000000000000007.log len=206
+DIAG file 00000000000000000007.timeindex len=12
+DIAG file 00000000000000000011.index len=8
+DIAG file 00000000000000000011.log len=103
+DIAG file 00000000000000000011.timeindex len=12
+DIAG file 00000000000000000013.log len=206
+DIAG reopen: leo=17 start=7 synced_upto=9 chaos=true
+DIAG file 00000000000000000021.index len=8
+DIAG file 00000000000000000021.log len=206
+DIAG file 00000000000000000021.timeindex len=12
+DIAG file 00000000000000000025.index len=8
+DIAG file 00000000000000000025.log len=103
+DIAG file 00000000000000000025.timeindex len=12
+DIAG file 00000000000000000027.log len=206
+DIAG reopen: leo=31 start=24 synced_upto=25 segs=[(21, 206, 4), (25, 103, 2), (27, 206, 4)]
+DIAG file 00000000000000000021.index len=8
+DIAG file 00000000000000000021.log len=206
+DIAG file 00000000000000000021.timeindex len=12
+DIAG file 00000000000000000025.index len=8
+DIAG file 00000000000000000025.log len=103
+DIAG file 00000000000000000025.timeindex len=12
+DIAG file 00000000000000000027.log len=206
+DIAG reopen: leo=31 start=24 synced_upto=25 chaos=true
+DIAG file 00000000000000000000.log len=103
+DIAG reopen: leo=2 start=1 synced_upto=1 segs=[(0, 103, 2)]
+DIAG file 00000000000000000000.log len=103
+DIAG reopen: leo=2 start=1 synced_upto=1 chaos=true
+DIAG file 00000000000000000012.index len=8
+DIAG file 00000000000000000012.log len=206
+DIAG file 00000000000000000012.timeindex len=12
+DIAG file 00000000000000000016.index len=8
+DIAG file 00000000000000000016.log len=103
+DIAG file 00000000000000000016.timeindex len=12
+DIAG reopen: leo=18 start=13 synced_upto=16 segs=[(12, 206, 4), (16, 103, 2)]
+DIAG file 00000000000000000012.index len=8
+DIAG file 00000000000000000012.log len=206
+DIAG file 00000000000000000012.timeindex len=12
+DIAG file 00000000000000000016.index len=8
+DIAG file 00000000000000000016.log len=103
+DIAG file 00000000000000000016.timeindex len=12
+DIAG reopen: leo=18 start=13 synced_upto=16 chaos=true
+DIAG file 00000000000000000000.index len=8
+DIAG file 00000000000000000000.log len=103
+DIAG file 00000000000000000000.timeindex len=12
+DIAG reopen: leo=2 start=0 synced_upto=2 segs=[(0, 103, 2)]
+DIAG file 00000000000000000000.index len=8
+DIAG file 00000000000000000000.log len=103
+DIAG file 00000000000000000000.timeindex len=12
+DIAG reopen: leo=2 start=0 synced_upto=2 chaos=true
+DIAG file 00000000000000000000.index len=8
+DIAG file 00000000000000000000.log len=206
+DIAG file 00000000000000000000.timeindex len=12
+DIAG reopen: leo=4 start=0 synced_upto=0 segs=[(0, 206, 4)]
+DIAG file 00000000000000000000.index len=8
+DIAG file 00000000000000000000.log len=206
+DIAG file 00000000000000000000.timeindex len=12
+DIAG reopen: leo=4 start=0 synced_upto=0 chaos=true
+DIAG file 00000000000000000000.index len=8
+DIAG file 00000000000000000000.log len=103
+DIAG file 00000000000000000000.timeindex len=12
+DIAG file 00000000000000000002.index len=8
+DIAG file 00000000000000000002.log len=206
+DIAG file 00000000000000000002.timeindex len=12
+DIAG file 00000000000000000006.index len=8
+DIAG file 00000000000000000006.log len=206
+DIAG file 00000000000000000006.timeindex len=12
+DIAG file 00000000000000000010.log len=206
+DIAG reopen: leo=14 start=0 synced_upto=2 segs=[(0, 103, 2), (2, 206, 4), (6, 206, 4), (10, 206, 4)]
+DIAG file 00000000000000000000.index len=8
+DIAG file 00000000000000000000.log len=103
+DIAG file 00000000000000000000.timeindex len=12
+DIAG file 00000000000000000002.index len=8
+DIAG file 00000000000000000002.log len=206
+DIAG file 00000000000000000002.timeindex len=12
+DIAG file 00000000000000000006.index len=8
+DIAG file 00000000000000000006.log len=206
+DIAG file 00000000000000000006.timeindex len=12
+DIAG file 00000000000000000010.log len=206
+DIAG reopen: leo=14 start=0 synced_upto=2 chaos=true
+DIAG file 00000000000000000000.index len=8
+DIAG file 00000000000000000000.log len=206
+DIAG file 00000000000000000000.timeindex len=12
+DIAG file 00000000000000000004.index len=8
+DIAG file 00000000000000000004.log len=103
+DIAG file 00000000000000000004.timeindex len=12
+DIAG reopen: leo=6 start=2 synced_upto=8 segs=[(0, 206, 4), (4, 103, 2)]
+DIAG file 00000000000000000000.index len=8
+DIAG file 00000000000000000000.log len=206
+DIAG file 00000000000000000000.timeindex len=12
+DIAG file 00000000000000000004.index len=8
+DIAG file 00000000000000000004.log len=103
+DIAG file 00000000000000000004.timeindex len=12
+DIAG reopen: leo=6 start=2 synced_upto=8 chaos=true
+DIAG file 00000000000000000000.index len=8
+DIAG file 00000000000000000000.log len=0
+DIAG file 00000000000000000000.timeindex len=12
+DIAG reopen: leo=0 start=0 synced_upto=0 segs=[(0, 0, 0)]
+DIAG file 00000000000000000000.index len=8
+DIAG file 00000000000000000000.log len=0
+DIAG file 00000000000000000000.timeindex len=12
+DIAG reopen: leo=0 start=0 synced_upto=0 chaos=true
+DIAG file 00000000000000000000.index len=8
+DIAG file 00000000000000000000.log len=206
+DIAG file 00000000000000000000.timeindex len=12
+DIAG file 00000000000000000004.index len=8
+DIAG file 00000000000000000004.log len=206
+DIAG file 00000000000000000004.timeindex len=12
+DIAG file 00000000000000000008.index len=8
+DIAG file 00000000000000000008.log len=206
+DIAG file 00000000000000000008.timeindex len=12
+DIAG file 00000000000000000012.index len=8
+DIAG file 00000000000000000012.log len=206
+DIAG file 00000000000000000012.timeindex len=12
+DIAG file 00000000000000000016.log len=206
+DIAG reopen: leo=20 start=0 synced_upto=0 segs=[(0, 206, 4), (4, 206, 4), (8, 206, 4), (12, 206, 4), (16, 206, 4)]
+DIAG file 00000000000000000000.index len=8
+DIAG file 00000000000000000000.log len=206
+DIAG file 00000000000000000000.timeindex len=12
+DIAG file 00000000000000000004.index len=8
+DIAG file 00000000000000000004.log len=206
+DIAG file 00000000000000000004.timeindex len=12
+DIAG file 00000000000000000008.index len=8
+DIAG file 00000000000000000008.log len=206
+DIAG file 00000000000000000008.timeindex len=12
+DIAG file 00000000000000000012.index len=8
+DIAG file 00000000000000000012.log len=206
+DIAG file 00000000000000000012.timeindex len=12
+DIAG file 00000000000000000016.log len=206
+DIAG reopen: leo=20 start=0 synced_upto=0 chaos=true
+DIAG file 00000000000000000000.index len=8
+DIAG file 00000000000000000000.log len=202
+DIAG file 00000000000000000000.timeindex len=12
+DIAG file 00000000000000000004.index len=8
+DIAG file 00000000000000000004.log len=206
+DIAG file 00000000000000000004.timeindex len=12
+DIAG file 00000000000000000008.index len=8
+DIAG file 00000000000000000008.log len=206
+DIAG file 00000000000000000008.timeindex len=12
+DIAG file 00000000000000000012.index len=8
+DIAG file 00000000000000000012.log len=206
+DIAG file 00000000000000000012.timeindex len=12
+DIAG file 00000000000000000016.log len=103
+DIAG reopen: leo=18 start=2 synced_upto=12 segs=[(0, 202, 4), (4, 206, 4), (8, 206, 4), (12, 206, 4), (16, 103, 2)]
+DIAG file 00000000000000000000.index len=8
+DIAG file 00000000000000000000.log len=202
+DIAG file 00000000000000000000.timeindex len=12
+DIAG file 00000000000000000004.index len=8
+DIAG file 00000000000000000004.log len=206
+DIAG file 00000000000000000004.timeindex len=12
+DIAG file 00000000000000000008.index len=8
+DIAG file 00000000000000000008.log len=206
+DIAG file 00000000000000000008.timeindex len=12
+DIAG file 00000000000000000012.index len=8
+DIAG file 00000000000000000012.log len=206
+DIAG file 00000000000000000012.timeindex len=12
+DIAG file 00000000000000000016.log len=103
+DIAG reopen: leo=18 start=2 synced_upto=12 chaos=true
+DIAG file 00000000000000000016.index len=8
+DIAG file 00000000000000000016.log len=206
+DIAG file 00000000000000000016.timeindex len=12
+DIAG reopen: leo=20 start=16 synced_upto=20 segs=[(16, 206, 4)]
+DIAG file 00000000000000000016.index len=8
+DIAG file 00000000000000000016.log len=206
+DIAG file 00000000000000000016.timeindex len=12
+DIAG reopen: leo=20 start=16 synced_upto=20 chaos=true
+DIAG file 00000000000000000000.index len=8
+DIAG file 00000000000000000000.log len=204
+DIAG file 00000000000000000000.timeindex len=12
+DIAG file 00000000000000000004.index len=8
+DIAG file 00000000000000000004.log len=206
+DIAG file 00000000000000000004.timeindex len=12
+DIAG file 00000000000000000008.index len=8
+DIAG file 00000000000000000008.log len=206
+DIAG file 00000000000000000008.timeindex len=12
+DIAG file 00000000000000000012.index len=8
+DIAG file 00000000000000000012.log len=206
+DIAG file 00000000000000000012.timeindex len=12
+DIAG file 00000000000000000016.index len=8
+DIAG file 00000000000000000016.log len=206
+DIAG file 00000000000000000016.timeindex len=12
+DIAG file 00000000000000000020.index len=8
+DIAG file 00000000000000000020.log len=206
+DIAG file 00000000000000000020.timeindex len=12
+DIAG reopen: leo=24 start=1 synced_upto=28 segs=[(0, 204, 4), (4, 206, 4), (8, 206, 4), (12, 206, 4), (16, 206, 4), (20, 206, 4)]
+DIAG file 00000000000000000000.index len=8
+DIAG file 00000000000000000000.log len=204
+DIAG file 00000000000000000000.timeindex len=12
+DIAG file 00000000000000000004.index len=8
+DIAG file 00000000000000000004.log len=206
+DIAG file 00000000000000000004.timeindex len=12
+DIAG file 00000000000000000008.index len=8
+DIAG file 00000000000000000008.log len=206
+DIAG file 00000000000000000008.timeindex len=12
+DIAG file 00000000000000000012.index len=8
+DIAG file 00000000000000000012.log len=206
+DIAG file 00000000000000000012.timeindex len=12
+DIAG file 00000000000000000016.index len=8
+DIAG file 00000000000000000016.log len=206
+DIAG file 00000000000000000016.timeindex len=12
+DIAG file 00000000000000000020.index len=8
+DIAG file 00000000000000000020.log len=206
+DIAG file 00000000000000000020.timeindex len=12
+DIAG reopen: leo=24 start=1 synced_upto=28 chaos=true
+DIAG file 00000000000000000011.index len=8
+DIAG file 00000000000000000011.log len=206
+DIAG file 00000000000000000011.timeindex len=12
+DIAG file 00000000000000000015.index len=8
+DIAG file 00000000000000000015.log len=206
+DIAG file 00000000000000000015.timeindex len=12
+DIAG file 00000000000000000019.index len=8
+DIAG file 00000000000000000019.log len=103
+DIAG file 00000000000000000019.timeindex len=12
+DIAG reopen: leo=21 start=11 synced_upto=35 segs=[(11, 206, 4), (15, 206, 4), (19, 103, 2)]
+DIAG file 00000000000000000011.index len=8
+DIAG file 00000000000000000011.log len=206
+DIAG file 00000000000000000011.timeindex len=12
+DIAG file 00000000000000000015.index len=8
+DIAG file 00000000000000000015.log len=206
+DIAG file 00000000000000000015.timeindex len=12
+DIAG file 00000000000000000019.index len=8
+DIAG file 00000000000000000019.log len=103
+DIAG file 00000000000000000019.timeindex len=12
+DIAG reopen: leo=21 start=11 synced_upto=35 chaos=true
+DIAG file 00000000000000000006.index len=8
+DIAG file 00000000000000000006.log len=206
+DIAG file 00000000000000000006.timeindex len=12
+DIAG file 00000000000000000010.index len=0
+DIAG file 00000000000000000010.log len=206
+DIAG file 00000000000000000010.timeindex len=0
+DIAG file 00000000000000000014.log len=206
+DIAG reopen: leo=18 start=8 synced_upto=10 segs=[(6, 206, 4), (10, 206, 4), (14, 206, 4)]
+DIAG file 00000000000000000006.index len=8
+DIAG file 00000000000000000006.log len=206
+DIAG file 00000000000000000006.timeindex len=12
+DIAG file 00000000000000000010.index len=0
+DIAG file 00000000000000000010.log len=206
+DIAG file 00000000000000000010.timeindex len=0
+DIAG file 00000000000000000014.log len=206
+DIAG reopen: leo=18 start=8 synced_upto=10 chaos=true
+DIAG file 00000000000000000014.index len=8
+DIAG file 00000000000000000014.log len=206
+DIAG file 00000000000000000014.timeindex len=12
+DIAG file 00000000000000000018.index len=8
+DIAG file 00000000000000000018.log len=206
+DIAG file 00000000000000000018.timeindex len=12
+DIAG file 00000000000000000022.log len=103
+DIAG reopen: leo=24 start=14 synced_upto=22 segs=[(14, 206, 4), (18, 206, 4), (22, 103, 2)]
+DIAG file 00000000000000000014.index len=8
+DIAG file 00000000000000000014.log len=206
+DIAG file 00000000000000000014.timeindex len=12
+DIAG file 00000000000000000018.index len=8
+DIAG file 00000000000000000018.log len=206
+DIAG file 00000000000000000018.timeindex len=12
+DIAG file 00000000000000000022.log len=103
+DIAG reopen: leo=24 start=14 synced_upto=22 chaos=true
+DIAG file 00000000000000000000.index len=0
+DIAG file 00000000000000000000.log len=206
+DIAG file 00000000000000000000.timeindex len=0
+DIAG reopen: leo=4 start=0 synced_upto=0 segs=[(0, 206, 4)]
+DIAG file 00000000000000000000.index len=0
+DIAG file 00000000000000000000.log len=206
+DIAG file 00000000000000000000.timeindex len=0
+DIAG reopen: leo=4 start=0 synced_upto=0 chaos=true
+DIAG file 00000000000000000000.index len=16
+DIAG file 00000000000000000000.log len=206
+DIAG file 00000000000000000000.timeindex len=12
+DIAG file 00000000000000000004.index len=8
+DIAG file 00000000000000000004.log len=206
+DIAG file 00000000000000000004.timeindex len=12
+DIAG file 00000000000000000008.log len=103
+DIAG reopen: leo=10 start=0 synced_upto=2 segs=[(0, 206, 4), (4, 206, 4), (8, 103, 2)]
+DIAG file 00000000000000000000.index len=16
+DIAG file 00000000000000000000.log len=206
+DIAG file 00000000000000000000.timeindex len=12
+DIAG file 00000000000000000004.index len=8
+DIAG file 00000000000000000004.log len=206
+DIAG file 00000000000000000004.timeindex len=12
+DIAG file 00000000000000000008.log len=103
+DIAG reopen: leo=10 start=0 synced_upto=2 chaos=true
+DIAG file 00000000000000000004.index len=8
+DIAG file 00000000000000000004.log len=206
+DIAG file 00000000000000000004.timeindex len=12
+DIAG file 00000000000000000008.log len=103
+DIAG reopen: leo=10 start=4 synced_upto=10 segs=[(4, 206, 4), (8, 103, 2)]
+DIAG file 00000000000000000004.index len=8
+DIAG file 00000000000000000004.log len=206
+DIAG file 00000000000000000004.timeindex len=12
+DIAG file 00000000000000000008.log len=103
+DIAG reopen: leo=10 start=4 synced_upto=10 chaos=true
+DIAG file 00000000000000000000.index len=0
+DIAG file 00000000000000000000.log len=206
+DIAG file 00000000000000000000.timeindex len=0
+DIAG reopen: leo=4 start=0 synced_upto=0 segs=[(0, 206, 4)]
+DIAG file 00000000000000000000.index len=0
+DIAG file 00000000000000000000.log len=206
+DIAG file 00000000000000000000.timeindex len=0
+DIAG reopen: leo=4 start=0 synced_upto=0 chaos=true
+DIAG file 00000000000000000000.log len=206
+DIAG reopen: leo=4 start=0 synced_upto=0 segs=[(0, 206, 4)]
+DIAG file 00000000000000000000.log len=206
+DIAG reopen: leo=4 start=0 synced_upto=0 chaos=true
+DIAG file 00000000000000000000.index len=8
+DIAG file 00000000000000000000.log len=206
+DIAG file 00000000000000000000.timeindex len=12
+DIAG reopen: leo=4 start=0 synced_upto=0 segs=[(0, 206, 4)]
+DIAG file 00000000000000000000.index len=8
+DIAG file 00000000000000000000.log len=206
+DIAG file 00000000000000000000.timeindex len=12
+DIAG reopen: leo=4 start=0 synced_upto=0 chaos=true
+DIAG file 00000000000000000000.index len=8
+DIAG file 00000000000000000000.log len=206
+DIAG file 00000000000000000000.timeindex len=12
+DIAG reopen: leo=4 start=0 synced_upto=0 segs=[(0, 206, 4)]
+DIAG file 00000000000000000000.index len=8
+DIAG file 00000000000000000000.log len=206
+DIAG file 00000000000000000000.timeindex len=12
+DIAG reopen: leo=4 start=0 synced_upto=0 chaos=true
+DIAG file 00000000000000000000.index len=8
+DIAG file 00000000000000000000.log len=206
+DIAG file 00000000000000000000.timeindex len=12
+DIAG file 00000000000000000004.index len=0
+DIAG file 00000000000000000004.log len=103
+DIAG file 00000000000000000004.timeindex len=0
+DIAG file 00000000000000000006.log len=206
+DIAG reopen: leo=10 start=0 synced_upto=4 segs=[(0, 206, 4), (4, 103, 2), (6, 206, 4)]
+DIAG file 00000000000000000000.index len=8
+DIAG file 00000000000000000000.log len=206
+DIAG file 00000000000000000000.timeindex len=12
+DIAG file 00000000000000000004.index len=0
+DIAG file 00000000000000000004.log len=103
+DIAG file 00000000000000000004.timeindex len=0
+DIAG file 00000000000000000006.log len=206
+DIAG reopen: leo=10 start=0 synced_upto=4 chaos=true
+DIAG file 00000000000000000000.index len=8
+DIAG file 00000000000000000000.log len=0
+DIAG file 00000000000000000000.timeindex len=12
+DIAG reopen: leo=0 start=0 synced_upto=0 segs=[(0, 0, 0)]
+DIAG file 00000000000000000000.index len=8
+DIAG file 00000000000000000000.log len=0
+DIAG file 00000000000000000000.timeindex len=12
+DIAG reopen: leo=0 start=0 synced_upto=0 chaos=true
+DIAG file 00000000000000000006.index len=8
+DIAG file 00000000000000000006.log len=206
+DIAG file 00000000000000000006.timeindex len=12
+DIAG reopen: leo=10 start=6 synced_upto=8 segs=[(6, 206, 4)]
+DIAG file 00000000000000000006.index len=8
+DIAG file 00000000000000000006.log len=206
+DIAG file 00000000000000000006.timeindex len=12
+DIAG reopen: leo=10 start=6 synced_upto=8 chaos=true
+DIAG file 00000000000000000000.log len=206
+DIAG reopen: leo=4 start=0 synced_upto=4 segs=[(0, 206, 4)]
+DIAG file 00000000000000000000.log len=206
+DIAG reopen: leo=4 start=0 synced_upto=4 chaos=true
+DIAG file 00000000000000000010.index len=8
+DIAG file 00000000000000000010.log len=206
+DIAG file 00000000000000000010.timeindex len=12
+DIAG file 00000000000000000014.index len=8
+DIAG file 00000000000000000014.log len=103
+DIAG file 00000000000000000014.timeindex len=12
+DIAG reopen: leo=16 start=10 synced_upto=16 segs=[(10, 206, 4), (14, 103, 2)]
+DIAG file 00000000000000000010.index len=8
+DIAG file 00000000000000000010.log len=206
+DIAG file 00000000000000000010.timeindex len=12
+DIAG file 00000000000000000014.index len=8
+DIAG file 00000000000000000014.log len=103
+DIAG file 00000000000000000014.timeindex len=12
+DIAG reopen: leo=16 start=10 synced_upto=16 chaos=true
+DIAG file 00000000000000000000.index len=8
+DIAG file 00000000000000000000.log len=206
+DIAG file 00000000000000000000.timeindex len=12
+DIAG reopen: leo=4 start=0 synced_upto=4 segs=[(0, 206, 4)]
+DIAG file 00000000000000000000.index len=8
+DIAG file 00000000000000000000.log len=206
+DIAG file 00000000000000000000.timeindex len=12
+DIAG reopen: leo=4 start=0 synced_upto=4 chaos=true
+DIAG file 00000000000000000002.index len=8
+DIAG file 00000000000000000002.log len=206
+DIAG file 00000000000000000002.timeindex len=12
+DIAG file 00000000000000000006.index len=8
+DIAG file 00000000000000000006.log len=206
+DIAG file 00000000000000000006.timeindex len=12
+DIAG file 00000000000000000010.index len=8
+DIAG file 00000000000000000010.log len=206
+DIAG file 00000000000000000010.timeindex len=12
+DIAG file 00000000000000000014.index len=8
+DIAG file 00000000000000000014.log len=206
+DIAG file 00000000000000000014.timeindex len=12
+DIAG file 00000000000000000018.log len=206
+DIAG reopen: leo=22 start=2 synced_upto=6 segs=[(2, 206, 4), (6, 206, 4), (10, 206, 4), (14, 206, 4), (18, 206, 4)]
+DIAG file 00000000000000000002.index len=8
+DIAG file 00000000000000000002.log len=206
+DIAG file 00000000000000000002.timeindex len=12
+DIAG file 00000000000000000006.index len=8
+DIAG file 00000000000000000006.log len=206
+DIAG file 00000000000000000006.timeindex len=12
+DIAG file 00000000000000000010.index len=8
+DIAG file 00000000000000000010.log len=206
+DIAG file 00000000000000000010.timeindex len=12
+DIAG file 00000000000000000014.index len=8
+DIAG file 00000000000000000014.log len=206
+DIAG file 00000000000000000014.timeindex len=12
+DIAG file 00000000000000000018.log len=206
+DIAG reopen: leo=22 start=2 synced_upto=6 chaos=true
+DIAG file 00000000000000000003.index len=8
+DIAG file 00000000000000000003.log len=103
+DIAG file 00000000000000000003.timeindex len=12
+DIAG file 00000000000000000005.log len=103
+DIAG reopen: leo=7 start=3 synced_upto=3 segs=[(3, 103, 2), (5, 103, 2)]
+DIAG file 00000000000000000003.index len=8
+DIAG file 00000000000000000003.log len=103
+DIAG file 00000000000000000003.timeindex len=12
+DIAG file 00000000000000000005.log len=103
+DIAG reopen: leo=7 start=3 synced_upto=3 chaos=true
+DIAG reopen: leo=21 start=21 synced_upto=21 segs=[(21, 0, 0)]
+DIAG reopen: leo=21 start=21 synced_upto=21 chaos=true
+DIAG file 00000000000000000009.index len=8
+DIAG file 00000000000000000009.log len=103
+DIAG file 00000000000000000009.timeindex len=12
+DIAG file 00000000000000000011.index len=8
+DIAG file 00000000000000000011.log len=206
+DIAG file 00000000000000000011.timeindex len=12
+DIAG file 00000000000000000015.index len=8
+DIAG file 00000000000000000015.log len=206
+DIAG file 00000000000000000015.timeindex len=12
+DIAG file 00000000000000000019.index len=8
+DIAG file 00000000000000000019.log len=206
+DIAG file 00000000000000000019.timeindex len=12
+DIAG file 00000000000000000023.index len=8
+DIAG file 00000000000000000023.log len=206
+DIAG file 00000000000000000023.timeindex len=12
+DIAG reopen: leo=27 start=9 synced_upto=15 segs=[(9, 103, 2), (11, 206, 4), (15, 206, 4), (19, 206, 4), (23, 206, 4)]
+DIAG file 00000000000000000009.index len=8
+DIAG file 00000000000000000009.log len=103
+DIAG file 00000000000000000009.timeindex len=12
+DIAG file 00000000000000000011.index len=8
+DIAG file 00000000000000000011.log len=206
+DIAG file 00000000000000000011.timeindex len=12
+DIAG file 00000000000000000015.index len=8
+DIAG file 00000000000000000015.log len=206
+DIAG file 00000000000000000015.timeindex len=12
+DIAG file 00000000000000000019.index len=8
+DIAG file 00000000000000000019.log len=206
+DIAG file 00000000000000000019.timeindex len=12
+DIAG file 00000000000000000023.index len=8
+DIAG file 00000000000000000023.log len=206
+DIAG file 00000000000000000023.timeindex len=12
+DIAG reopen: leo=27 start=9 synced_upto=15 chaos=true
+DIAG file 00000000000000000000.index len=8
+DIAG file 00000000000000000000.log len=206
+DIAG file 00000000000000000000.timeindex len=12
+DIAG file 00000000000000000004.index len=8
+DIAG file 00000000000000000004.log len=103
+DIAG file 00000000000000000004.timeindex len=12
+DIAG file 00000000000000000006.index len=8
+DIAG file 00000000000000000006.log len=206
+DIAG file 00000000000000000006.timeindex len=12
+DIAG file 00000000000000000010.log len=206
+DIAG reopen: leo=14 start=1 synced_upto=8 segs=[(0, 206, 4), (4, 103, 2), (6, 206, 4), (10, 206, 4)]
+DIAG file 00000000000000000000.index len=8
+DIAG file 00000000000000000000.log len=206
+DIAG file 00000000000000000000.timeindex len=12
+DIAG file 00000000000000000004.index len=8
+DIAG file 00000000000000000004.log len=103
+DIAG file 00000000000000000004.timeindex len=12
+DIAG file 00000000000000000006.index len=8
+DIAG file 00000000000000000006.log len=206
+DIAG file 00000000000000000006.timeindex len=12
+DIAG file 00000000000000000010.log len=206
+DIAG reopen: leo=14 start=1 synced_upto=8 chaos=true
+DIAG file 00000000000000000000.index len=16
+DIAG file 00000000000000000000.log len=103
+DIAG file 00000000000000000000.timeindex len=12
+DIAG reopen: leo=2 start=0 synced_upto=0 segs=[(0, 103, 2)]
+DIAG file 00000000000000000000.index len=16
+DIAG file 00000000000000000000.log len=103
+DIAG file 00000000000000000000.timeindex len=12
+DIAG reopen: leo=2 start=0 synced_upto=0 chaos=true
+DIAG file 00000000000000000002.index len=8
+DIAG file 00000000000000000002.log len=103
+DIAG file 00000000000000000002.timeindex len=12
+DIAG file 00000000000000000004.index len=8
+DIAG file 00000000000000000004.log len=206
+DIAG file 00000000000000000004.timeindex len=12
+DIAG file 00000000000000000008.index len=8
+DIAG file 00000000000000000008.log len=206
+DIAG file 00000000000000000008.timeindex len=12
+DIAG file 00000000000000000012.log len=206
+DIAG reopen: leo=16 start=2 synced_upto=4 segs=[(2, 103, 2), (4, 206, 4), (8, 206, 4), (12, 206, 4)]
+DIAG file 00000000000000000002.index len=8
+DIAG file 00000000000000000002.log len=103
+DIAG file 00000000000000000002.timeindex len=12
+DIAG file 00000000000000000004.index len=8
+DIAG file 00000000000000000004.log len=206
+DIAG file 00000000000000000004.timeindex len=12
+DIAG file 00000000000000000008.index len=8
+DIAG file 00000000000000000008.log len=206
+DIAG file 00000000000000000008.timeindex len=12
+DIAG file 00000000000000000012.log len=206
+DIAG reopen: leo=16 start=2 synced_upto=4 chaos=true
+DIAG reopen: leo=4 start=4 synced_upto=4 segs=[(4, 0, 0)]
+DIAG reopen: leo=4 start=4 synced_upto=4 chaos=true
+DIAG file 00000000000000000000.index len=16
+DIAG file 00000000000000000000.log len=206
+DIAG file 00000000000000000000.timeindex len=12
+DIAG file 00000000000000000004.index len=8
+DIAG file 00000000000000000004.log len=206
+DIAG file 00000000000000000004.timeindex len=12
+DIAG file 00000000000000000008.index len=8
+DIAG file 00000000000000000008.log len=206
+DIAG file 00000000000000000008.timeindex len=12
+DIAG file 00000000000000000012.index len=8
+DIAG file 00000000000000000012.log len=206
+DIAG file 00000000000000000012.timeindex len=12
+DIAG file 00000000000000000016.index len=8
+DIAG file 00000000000000000016.log len=103
+DIAG file 00000000000000000016.timeindex len=12
+DIAG file 00000000000000000018.log len=206
+DIAG reopen: leo=22 start=1 synced_upto=22 segs=[(0, 206, 4), (4, 206, 4), (8, 206, 4), (12, 206, 4), (16, 103, 2), (18, 206, 4)]
+DIAG file 00000000000000000000.index len=16
+DIAG file 00000000000000000000.log len=206
+DIAG file 00000000000000000000.timeindex len=12
+DIAG file 00000000000000000004.index len=8
+DIAG file 00000000000000000004.log len=206
+DIAG file 00000000000000000004.timeindex len=12
+DIAG file 00000000000000000008.index len=8
+DIAG file 00000000000000000008.log len=206
+DIAG file 00000000000000000008.timeindex len=12
+DIAG file 00000000000000000012.index len=8
+DIAG file 00000000000000000012.log len=206
+DIAG file 00000000000000000012.timeindex len=12
+DIAG file 00000000000000000016.index len=8
+DIAG file 00000000000000000016.log len=103
+DIAG file 00000000000000000016.timeindex len=12
+DIAG file 00000000000000000018.log len=206
+DIAG reopen: leo=22 start=1 synced_upto=22 chaos=true
+DIAG file 00000000000000000000.index len=8
+DIAG file 00000000000000000000.log len=0
+DIAG file 00000000000000000000.timeindex len=12
+DIAG reopen: leo=0 start=0 synced_upto=0 segs=[(0, 0, 0)]
+DIAG file 00000000000000000000.index len=8
+DIAG file 00000000000000000000.log len=0
+DIAG file 00000000000000000000.timeindex len=12
+DIAG reopen: leo=0 start=0 synced_upto=0 chaos=true
+DIAG file 00000000000000000005.log len=103
+DIAG reopen: leo=7 start=5 synced_upto=5 segs=[(5, 103, 2)]
+DIAG file 00000000000000000005.log len=103
+DIAG reopen: leo=7 start=5 synced_upto=5 chaos=true
+DIAG reopen: leo=6 start=6 synced_upto=6 segs=[(6, 0, 0)]
+DIAG reopen: leo=6 start=6 synced_upto=6 chaos=true
+DIAG file 00000000000000000000.index len=8
+DIAG file 00000000000000000000.log len=206
+DIAG file 00000000000000000000.timeindex len=12
+DIAG reopen: leo=4 start=1 synced_upto=1 segs=[(0, 206, 4)]
+DIAG file 00000000000000000000.index len=8
+DIAG file 00000000000000000000.log len=206
+DIAG file 00000000000000000000.timeindex len=12
+DIAG reopen: leo=4 start=1 synced_upto=1 chaos=true
+DIAG file 00000000000000000004.index len=8
+DIAG file 00000000000000000004.log len=206
+DIAG file 00000000000000000004.timeindex len=12
+DIAG file 00000000000000000008.log len=103
+DIAG reopen: leo=10 start=4 synced_upto=4 segs=[(4, 206, 4), (8, 103, 2)]
+DIAG file 00000000000000000004.index len=8
+DIAG file 00000000000000000004.log len=206
+DIAG file 00000000000000000004.timeindex len=12
+DIAG file 00000000000000000008.log len=103
+DIAG reopen: leo=10 start=4 synced_upto=4 chaos=true
+DIAG file 00000000000000000000.index len=8
+DIAG file 00000000000000000000.log len=206
+DIAG file 00000000000000000000.timeindex len=12
+DIAG file 00000000000000000004.index len=8
+DIAG file 00000000000000000004.log len=103
+DIAG file 00000000000000000004.timeindex len=12
+DIAG file 00000000000000000006.index len=8
+DIAG file 00000000000000000006.log len=206
+DIAG file 00000000000000000006.timeindex len=12
+DIAG file 00000000000000000010.index len=8
+DIAG file 00000000000000000010.log len=206
+DIAG file 00000000000000000010.timeindex len=12
+DIAG file 00000000000000000014.index len=8
+DIAG file 00000000000000000014.log len=206
+DIAG file 00000000000000000014.timeindex len=12
+DIAG file 00000000000000000018.index len=8
+DIAG file 00000000000000000018.log len=206
+DIAG file 00000000000000000018.timeindex len=12
+DIAG file 00000000000000000022.index len=8
+DIAG file 00000000000000000022.log len=206
+DIAG file 00000000000000000022.timeindex len=12
+DIAG file 00000000000000000026.log len=206
+DIAG reopen: leo=30 start=0 synced_upto=14 segs=[(0, 206, 4), (4, 103, 2), (6, 206, 4), (10, 206, 4), (14, 206, 4), (18, 206, 4), (22, 206, 4), (26, 206, 4)]
+DIAG file 00000000000000000000.index len=8
+DIAG file 00000000000000000000.log len=206
+DIAG file 00000000000000000000.timeindex len=12
+DIAG file 00000000000000000004.index len=8
+DIAG file 00000000000000000004.log len=103
+DIAG file 00000000000000000004.timeindex len=12
+DIAG file 00000000000000000006.index len=8
+DIAG file 00000000000000000006.log len=206
+DIAG file 00000000000000000006.timeindex len=12
+DIAG file 00000000000000000010.index len=8
+DIAG file 00000000000000000010.log len=206
+DIAG file 00000000000000000010.timeindex len=12
+DIAG file 00000000000000000014.index len=8
+DIAG file 00000000000000000014.log len=206
+DIAG file 00000000000000000014.timeindex len=12
+DIAG file 00000000000000000018.index len=8
+DIAG file 00000000000000000018.log len=206
+DIAG file 00000000000000000018.timeindex len=12
+DIAG file 00000000000000000022.index len=8
+DIAG file 00000000000000000022.log len=206
+DIAG file 00000000000000000022.timeindex len=12
+DIAG file 00000000000000000026.log len=206
+DIAG reopen: leo=30 start=0 synced_upto=14 chaos=true
+DIAG file 00000000000000000000.index len=8
+DIAG file 00000000000000000000.log len=0
+DIAG file 00000000000000000000.timeindex len=12
+DIAG reopen: leo=0 start=0 synced_upto=0 segs=[(0, 0, 0)]
+DIAG file 00000000000000000000.index len=8
+DIAG file 00000000000000000000.log len=0
+DIAG file 00000000000000000000.timeindex len=12
+DIAG reopen: leo=0 start=0 synced_upto=0 chaos=true
+DIAG reopen: leo=0 start=0 synced_upto=0 segs=[(0, 0, 0)]
+DIAG reopen: leo=0 start=0 synced_upto=0 chaos=true
+DIAG file 00000000000000000000.log len=103
+DIAG reopen: leo=2 start=0 synced_upto=0 segs=[(0, 103, 2)]
+DIAG file 00000000000000000000.log len=103
+DIAG reopen: leo=2 start=0 synced_upto=0 chaos=true
+DIAG reopen: leo=13 start=13 synced_upto=13 segs=[(13, 0, 0)]
+DIAG reopen: leo=13 start=13 synced_upto=13 chaos=true
+DIAG file 00000000000000000002.index len=0
+DIAG file 00000000000000000002.log len=206
+DIAG file 00000000000000000002.timeindex len=0
+DIAG reopen: leo=6 start=2 synced_upto=14 segs=[(2, 206, 4)]
+DIAG file 00000000000000000002.index len=0
+DIAG file 00000000000000000002.log len=206
+DIAG file 00000000000000000002.timeindex len=0
+DIAG reopen: leo=6 start=2 synced_upto=14 chaos=true
+DIAG file 00000000000000000016.index len=8
+DIAG file 00000000000000000016.log len=206
+DIAG file 00000000000000000016.timeindex len=12
+DIAG file 00000000000000000020.index len=8
+DIAG file 00000000000000000020.log len=206
+DIAG file 00000000000000000020.timeindex len=12
+DIAG reopen: leo=24 start=18 synced_upto=20 segs=[(16, 206, 4), (20, 206, 4)]
+DIAG file 00000000000000000016.index len=8
+DIAG file 00000000000000000016.log len=206
+DIAG file 00000000000000000016.timeindex len=12
+DIAG file 00000000000000000020.index len=8
+DIAG file 00000000000000000020.log len=206
+DIAG file 00000000000000000020.timeindex len=12
+DIAG reopen: leo=24 start=18 synced_upto=20 chaos=true
+DIAG file 00000000000000000004.index len=8
+DIAG file 00000000000000000004.log len=206
+DIAG file 00000000000000000004.timeindex len=12
+DIAG file 00000000000000000008.index len=8
+DIAG file 00000000000000000008.log len=103
+DIAG file 00000000000000000008.timeindex len=12
+DIAG reopen: leo=10 start=6 synced_upto=6 segs=[(4, 206, 4), (8, 103, 2)]
+DIAG file 00000000000000000004.index len=8
+DIAG file 00000000000000000004.log len=206
+DIAG file 00000000000000000004.timeindex len=12
+DIAG file 00000000000000000008.index len=8
+DIAG file 00000000000000000008.log len=103
+DIAG file 00000000000000000008.timeindex len=12
+DIAG reopen: leo=10 start=6 synced_upto=6 chaos=true
+DIAG file 00000000000000000004.index len=16
+DIAG file 00000000000000000004.log len=206
+DIAG file 00000000000000000004.timeindex len=12
+DIAG file 00000000000000000008.index len=8
+DIAG file 00000000000000000008.log len=206
+DIAG file 00000000000000000008.timeindex len=12
+DIAG file 00000000000000000012.log len=103
+DIAG reopen: leo=14 start=5 synced_upto=6 segs=[(4, 206, 4), (8, 206, 4), (12, 103, 2)]
+DIAG file 00000000000000000004.index len=16
+DIAG file 00000000000000000004.log len=206
+DIAG file 00000000000000000004.timeindex len=12
+DIAG file 00000000000000000008.index len=8
+DIAG file 00000000000000000008.log len=206
+DIAG file 00000000000000000008.timeindex len=12
+DIAG file 00000000000000000012.log len=103
+DIAG reopen: leo=14 start=5 synced_upto=6 chaos=true
+DIAG file 00000000000000000000.log len=103
+DIAG reopen: leo=2 start=0 synced_upto=2 segs=[(0, 103, 2)]
+DIAG file 00000000000000000000.log len=103
+DIAG reopen: leo=2 start=0 synced_upto=2 chaos=true
+DIAG file 00000000000000000000.index len=8
+DIAG file 00000000000000000000.log len=103
+DIAG file 00000000000000000000.timeindex len=12
+DIAG file 00000000000000000002.index len=16
+DIAG file 00000000000000000002.log len=206
+DIAG file 00000000000000000002.timeindex len=12
+DIAG file 00000000000000000006.log len=206
+DIAG reopen: leo=10 start=0 synced_upto=4 segs=[(0, 103, 2), (2, 206, 4), (6, 206, 4)]
+DIAG file 00000000000000000000.index len=8
+DIAG file 00000000000000000000.log len=103
+DIAG file 00000000000000000000.timeindex len=12
+DIAG file 00000000000000000002.index len=16
+DIAG file 00000000000000000002.log len=206
+DIAG file 00000000000000000002.timeindex len=12
+DIAG file 00000000000000000006.log len=206
+DIAG reopen: leo=10 start=0 synced_upto=4 chaos=true
+DIAG file 00000000000000000000.index len=16
+DIAG file 00000000000000000000.log len=206
+DIAG file 00000000000000000000.timeindex len=12
+DIAG reopen: leo=4 start=0 synced_upto=2 segs=[(0, 206, 4)]
+DIAG file 00000000000000000000.index len=16
+DIAG file 00000000000000000000.log len=206
+DIAG file 00000000000000000000.timeindex len=12
+DIAG reopen: leo=4 start=0 synced_upto=2 chaos=true
+DIAG file 00000000000000000018.index len=16
+DIAG file 00000000000000000018.log len=206
+DIAG file 00000000000000000018.timeindex len=12
+DIAG file 00000000000000000022.index len=8
+DIAG file 00000000000000000022.log len=206
+DIAG file 00000000000000000022.timeindex len=12
+DIAG reopen: leo=26 start=18 synced_upto=20 segs=[(18, 206, 4), (22, 206, 4)]
+DIAG file 00000000000000000018.index len=16
+DIAG file 00000000000000000018.log len=206
+DIAG file 00000000000000000018.timeindex len=12
+DIAG file 00000000000000000022.index len=8
+DIAG file 00000000000000000022.log len=206
+DIAG file 00000000000000000022.timeindex len=12
+DIAG reopen: leo=26 start=18 synced_upto=20 chaos=true
+DIAG file 00000000000000000003.index len=8
+DIAG file 00000000000000000003.log len=206
+DIAG file 00000000000000000003.timeindex len=12
+DIAG file 00000000000000000007.index len=8
+DIAG file 00000000000000000007.log len=206
+DIAG file 00000000000000000007.timeindex len=12
+DIAG file 00000000000000000011.index len=8
+DIAG file 00000000000000000011.log len=206
+DIAG file 00000000000000000011.timeindex len=12
+DIAG reopen: leo=15 start=3 synced_upto=13 segs=[(3, 206, 4), (7, 206, 4), (11, 206, 4)]
+DIAG file 00000000000000000003.index len=8
+DIAG file 00000000000000000003.log len=206
+DIAG file 00000000000000000003.timeindex len=12
+DIAG file 00000000000000000007.index len=8
+DIAG file 00000000000000000007.log len=206
+DIAG file 00000000000000000007.timeindex len=12
+DIAG file 00000000000000000011.index len=8
+DIAG file 00000000000000000011.log len=206
+DIAG file 00000000000000000011.timeindex len=12
+DIAG reopen: leo=15 start=3 synced_upto=13 chaos=true
+DIAG file 00000000000000000000.index len=8
+DIAG file 00000000000000000000.log len=0
+DIAG file 00000000000000000000.timeindex len=12
+DIAG reopen: leo=0 start=0 synced_upto=0 segs=[(0, 0, 0)]
+DIAG file 00000000000000000000.index len=8
+DIAG file 00000000000000000000.log len=0
+DIAG file 00000000000000000000.timeindex len=12
+DIAG reopen: leo=0 start=0 synced_upto=0 chaos=true
+DIAG file 00000000000000000000.index len=8
+DIAG file 00000000000000000000.log len=206
+DIAG file 00000000000000000000.timeindex len=12
+DIAG reopen: leo=4 start=1 synced_upto=2 segs=[(0, 206, 4)]
+DIAG file 00000000000000000000.index len=8
+DIAG file 00000000000000000000.log len=206
+DIAG file 00000000000000000000.timeindex len=12
+DIAG reopen: leo=4 start=1 synced_upto=2 chaos=true
+DIAG file 00000000000000000002.log len=206
+DIAG reopen: leo=6 start=2 synced_upto=2 segs=[(2, 206, 4)]
+DIAG file 00000000000000000002.log len=206
+DIAG reopen: leo=6 start=2 synced_upto=2 chaos=true
+DIAG file 00000000000000000012.index len=8
+DIAG file 00000000000000000012.log len=206
+DIAG file 00000000000000000012.timeindex len=12
+DIAG file 00000000000000000016.index len=8
+DIAG file 00000000000000000016.log len=103
+DIAG file 00000000000000000016.timeindex len=12
+DIAG reopen: leo=18 start=12 synced_upto=12 segs=[(12, 206, 4), (16, 103, 2)]
+DIAG file 00000000000000000012.index len=8
+DIAG file 00000000000000000012.log len=206
+DIAG file 00000000000000000012.timeindex len=12
+DIAG file 00000000000000000016.index len=8
+DIAG file 00000000000000000016.log len=103
+DIAG file 00000000000000000016.timeindex len=12
+DIAG reopen: leo=18 start=12 synced_upto=12 chaos=true
+DIAG file 00000000000000000004.log len=103
+DIAG reopen: leo=6 start=4 synced_upto=4 segs=[(4, 103, 2)]
+DIAG file 00000000000000000004.log len=103
+DIAG reopen: leo=6 start=4 synced_upto=4 chaos=true
+DIAG file 00000000000000000000.index len=8
+DIAG file 00000000000000000000.log len=103
+DIAG file 00000000000000000000.timeindex len=12
+DIAG reopen: leo=2 start=0 synced_upto=2 segs=[(0, 103, 2)]
+DIAG file 00000000000000000000.index len=8
+DIAG file 00000000000000000000.log len=103
+DIAG file 00000000000000000000.timeindex len=12
+DIAG reopen: leo=2 start=0 synced_upto=2 chaos=true
+DIAG file 00000000000000000006.index len=8
+DIAG file 00000000000000000006.log len=206
+DIAG file 00000000000000000006.timeindex len=12
+DIAG reopen: leo=10 start=6 synced_upto=8 segs=[(6, 206, 4)]
+DIAG file 00000000000000000006.index len=8
+DIAG file 00000000000000000006.log len=206
+DIAG file 00000000000000000006.timeindex len=12
+DIAG reopen: leo=10 start=6 synced_upto=8 chaos=true
+DIAG file 00000000000000000016.index len=8
+DIAG file 00000000000000000016.log len=103
+DIAG file 00000000000000000016.timeindex len=12
+DIAG file 00000000000000000018.index len=8
+DIAG file 00000000000000000018.log len=103
+DIAG file 00000000000000000018.timeindex len=12
+DIAG file 00000000000000000020.log len=206
+DIAG reopen: leo=24 start=17 synced_upto=17 segs=[(16, 103, 2), (18, 103, 2), (20, 206, 4)]
+DIAG file 00000000000000000016.index len=8
+DIAG file 00000000000000000016.log len=103
+DIAG file 00000000000000000016.timeindex len=12
+DIAG file 00000000000000000018.index len=8
+DIAG file 00000000000000000018.log len=103
+DIAG file 00000000000000000018.timeindex len=12
+DIAG file 00000000000000000020.log len=206
+DIAG reopen: leo=24 start=17 synced_upto=17 chaos=true
+DIAG file 00000000000000000000.index len=8
+DIAG file 00000000000000000000.log len=103
+DIAG file 00000000000000000000.timeindex len=12
+DIAG reopen: leo=2 start=0 synced_upto=2 segs=[(0, 103, 2)]
+DIAG file 00000000000000000000.index len=8
+DIAG file 00000000000000000000.log len=103
+DIAG file 00000000000000000000.timeindex len=12
+DIAG reopen: leo=2 start=0 synced_upto=2 chaos=true
+DIAG reopen: leo=12 start=12 synced_upto=12 segs=[(12, 0, 0)]
+DIAG reopen: leo=12 start=12 synced_upto=12 chaos=true
+DIAG file 00000000000000000000.log len=103
+DIAG reopen: leo=2 start=0 synced_upto=0 segs=[(0, 103, 2)]
+DIAG file 00000000000000000000.log len=103
+DIAG reopen: leo=2 start=0 synced_upto=0 chaos=true
+DIAG file 00000000000000000000.index len=8
+DIAG file 00000000000000000000.log len=103
+DIAG file 00000000000000000000.timeindex len=12
+DIAG reopen: leo=2 start=0 synced_upto=2 segs=[(0, 103, 2)]
+DIAG file 00000000000000000000.index len=8
+DIAG file 00000000000000000000.log len=103
+DIAG file 00000000000000000000.timeindex len=12
+DIAG reopen: leo=2 start=0 synced_upto=2 chaos=true
+DIAG file 00000000000000000000.index len=8
+DIAG file 00000000000000000000.log len=206
+DIAG file 00000000000000000000.timeindex len=12
+DIAG reopen: leo=4 start=0 synced_upto=0 segs=[(0, 206, 4)]
+DIAG file 00000000000000000000.index len=8
+DIAG file 00000000000000000000.log len=206
+DIAG file 00000000000000000000.timeindex len=12
+DIAG reopen: leo=4 start=0 synced_upto=0 chaos=true
+DIAG file 00000000000000000000.index len=8
+DIAG file 00000000000000000000.log len=206
+DIAG file 00000000000000000000.timeindex len=12
+DIAG file 00000000000000000004.log len=206
+DIAG reopen: leo=8 start=0 synced_upto=0 segs=[(0, 206, 4), (4, 206, 4)]
+DIAG file 00000000000000000000.index len=8
+DIAG file 00000000000000000000.log len=206
+DIAG file 00000000000000000000.timeindex len=12
+DIAG file 00000000000000000004.log len=206
+DIAG reopen: leo=8 start=0 synced_upto=0 chaos=true
+DIAG file 00000000000000000006.log len=206
+DIAG reopen: leo=10 start=6 synced_upto=8 segs=[(6, 206, 4)]
+DIAG file 00000000000000000006.log len=206
+DIAG reopen: leo=10 start=6 synced_upto=8 chaos=true
+DIAG file 00000000000000000000.index len=8
+DIAG file 00000000000000000000.log len=103
+DIAG file 00000000000000000000.timeindex len=12
+DIAG reopen: leo=2 start=0 synced_upto=2 segs=[(0, 103, 2)]
+DIAG file 00000000000000000000.index len=8
+DIAG file 00000000000000000000.log len=103
+DIAG file 00000000000000000000.timeindex len=12
+DIAG reopen: leo=2 start=0 synced_upto=2 chaos=true
+DIAG file 00000000000000000016.index len=8
+DIAG file 00000000000000000016.log len=206
+DIAG file 00000000000000000016.timeindex len=12
+DIAG file 00000000000000000020.index len=8
+DIAG file 00000000000000000020.log len=103
+DIAG file 00000000000000000020.timeindex len=12
+DIAG file 00000000000000000022.index len=8
+DIAG file 00000000000000000022.log len=103
+DIAG file 00000000000000000022.timeindex len=12
+DIAG file 00000000000000000024.log len=103
+DIAG reopen: leo=26 start=16 synced_upto=22 segs=[(16, 206, 4), (20, 103, 2), (22, 103, 2), (24, 103, 2)]
+DIAG file 00000000000000000016.index len=8
+DIAG file 00000000000000000016.log len=206
+DIAG file 00000000000000000016.timeindex len=12
+DIAG file 00000000000000000020.index len=8
+DIAG file 00000000000000000020.log len=103
+DIAG file 00000000000000000020.timeindex len=12
+DIAG file 00000000000000000022.index len=8
+DIAG file 00000000000000000022.log len=103
+DIAG file 00000000000000000022.timeindex len=12
+DIAG file 00000000000000000024.log len=103
+DIAG reopen: leo=26 start=16 synced_upto=22 chaos=true
+DIAG file 00000000000000000006.index len=8
+DIAG file 00000000000000000006.log len=206
+DIAG file 00000000000000000006.timeindex len=12
+DIAG file 00000000000000000010.index len=8
+DIAG file 00000000000000000010.log len=103
+DIAG file 00000000000000000010.timeindex len=12
+DIAG file 00000000000000000012.log len=103
+DIAG reopen: leo=14 start=8 synced_upto=8 segs=[(6, 206, 4), (10, 103, 2), (12, 103, 2)]
+DIAG file 00000000000000000006.index len=8
+DIAG file 00000000000000000006.log len=206
+DIAG file 00000000000000000006.timeindex len=12
+DIAG file 00000000000000000010.index len=8
+DIAG file 00000000000000000010.log len=103
+DIAG file 00000000000000000010.timeindex len=12
+DIAG file 00000000000000000012.log len=103
+DIAG reopen: leo=14 start=8 synced_upto=8 chaos=true
+DIAG file 00000000000000000004.index len=8
+DIAG file 00000000000000000004.log len=206
+DIAG file 00000000000000000004.timeindex len=12
+DIAG file 00000000000000000008.log len=103
+DIAG reopen: leo=10 start=4 synced_upto=6 segs=[(4, 206, 4), (8, 103, 2)]
+DIAG file 00000000000000000004.index len=8
+DIAG file 00000000000000000004.log len=206
+DIAG file 00000000000000000004.timeindex len=12
+DIAG file 00000000000000000008.log len=103
+DIAG reopen: leo=10 start=4 synced_upto=6 chaos=true
+DIAG file 00000000000000000000.index len=8
+DIAG file 00000000000000000000.log len=206
+DIAG file 00000000000000000000.timeindex len=12
+DIAG file 00000000000000000004.index len=8
+DIAG file 00000000000000000004.log len=103
+DIAG file 00000000000000000004.timeindex len=12
+DIAG reopen: leo=6 start=0 synced_upto=0 segs=[(0, 206, 4), (4, 103, 2)]
+DIAG file 00000000000000000000.index len=8
+DIAG file 00000000000000000000.log len=206
+DIAG file 00000000000000000000.timeindex len=12
+DIAG file 00000000000000000004.index len=8
+DIAG file 00000000000000000004.log len=103
+DIAG file 00000000000000000004.timeindex len=12
+DIAG reopen: leo=6 start=0 synced_upto=0 chaos=true
+DIAG file 00000000000000000000.index len=16
+DIAG file 00000000000000000000.log len=204
+DIAG file 00000000000000000000.timeindex len=12
+DIAG file 00000000000000000004.index len=8
+DIAG file 00000000000000000004.log len=206
+DIAG file 00000000000000000004.timeindex len=12
+DIAG file 00000000000000000008.log len=206
+DIAG reopen: leo=12 start=0 synced_upto=10 segs=[(0, 204, 4), (4, 206, 4), (8, 206, 4)]
+DIAG file 00000000000000000000.index len=16
+DIAG file 00000000000000000000.log len=204
+DIAG file 00000000000000000000.timeindex len=12
+DIAG file 00000000000000000004.index len=8
+DIAG file 00000000000000000004.log len=206
+DIAG file 00000000000000000004.timeindex len=12
+DIAG file 00000000000000000008.log len=206
+DIAG reopen: leo=12 start=0 synced_upto=10 chaos=true
+DIAG file 00000000000000000000.index len=16
+DIAG file 00000000000000000000.log len=103
+DIAG file 00000000000000000000.timeindex len=12
+DIAG reopen: leo=2 start=1 synced_upto=2 segs=[(0, 103, 2)]
+DIAG file 00000000000000000000.index len=16
+DIAG file 00000000000000000000.log len=103
+DIAG file 00000000000000000000.timeindex len=12
+DIAG reopen: leo=2 start=1 synced_upto=2 chaos=true
+DIAG file 00000000000000000004.log len=103
+DIAG reopen: leo=6 start=5 synced_upto=5 segs=[(4, 103, 2)]
+DIAG file 00000000000000000004.log len=103
+DIAG reopen: leo=6 start=5 synced_upto=5 chaos=true
+DIAG file 00000000000000000018.index len=8
+DIAG file 00000000000000000018.log len=206
+DIAG file 00000000000000000018.timeindex len=12
+DIAG file 00000000000000000022.index len=8
+DIAG file 00000000000000000022.log len=206
+DIAG file 00000000000000000022.timeindex len=12
+DIAG file 00000000000000000026.index len=8
+DIAG file 00000000000000000026.log len=103
+DIAG file 00000000000000000026.timeindex len=12
+DIAG file 00000000000000000028.log len=103
+DIAG reopen: leo=30 start=20 synced_upto=20 segs=[(18, 206, 4), (22, 206, 4), (26, 103, 2), (28, 103, 2)]
+DIAG file 00000000000000000018.index len=8
+DIAG file 00000000000000000018.log len=206
+DIAG file 00000000000000000018.timeindex len=12
+DIAG file 00000000000000000022.index len=8
+DIAG file 00000000000000000022.log len=206
+DIAG file 00000000000000000022.timeindex len=12
+DIAG file 00000000000000000026.index len=8
+DIAG file 00000000000000000026.log len=103
+DIAG file 00000000000000000026.timeindex len=12
+DIAG file 00000000000000000028.log len=103
+DIAG reopen: leo=30 start=20 synced_upto=20 chaos=true
+DIAG file 00000000000000000000.index len=8
+DIAG file 00000000000000000000.log len=0
+DIAG file 00000000000000000000.timeindex len=12
+DIAG reopen: leo=0 start=0 synced_upto=0 segs=[(0, 0, 0)]
+DIAG file 00000000000000000000.index len=8
+DIAG file 00000000000000000000.log len=0
+DIAG file 00000000000000000000.timeindex len=12
+DIAG reopen: leo=0 start=0 synced_upto=0 chaos=true
+DIAG file 00000000000000000000.index len=8
+DIAG file 00000000000000000000.log len=206
+DIAG file 00000000000000000000.timeindex len=12
+DIAG file 00000000000000000004.index len=8
+DIAG file 00000000000000000004.log len=103
+DIAG file 00000000000000000004.timeindex len=12
+DIAG file 00000000000000000006.log len=206
+DIAG reopen: leo=10 start=0 synced_upto=0 segs=[(0, 206, 4), (4, 103, 2), (6, 206, 4)]
+DIAG file 00000000000000000000.index len=8
+DIAG file 00000000000000000000.log len=206
+DIAG file 00000000000000000000.timeindex len=12
+DIAG file 00000000000000000004.index len=8
+DIAG file 00000000000000000004.log len=103
+DIAG file 00000000000000000004.timeindex len=12
+DIAG file 00000000000000000006.log len=206
+DIAG reopen: leo=10 start=0 synced_upto=0 chaos=true
+DIAG reopen: leo=4 start=4 synced_upto=4 segs=[(4, 0, 0)]
+DIAG reopen: leo=4 start=4 synced_upto=4 chaos=true
+DIAG file 00000000000000000001.index len=8
+DIAG file 00000000000000000001.log len=103
+DIAG file 00000000000000000001.timeindex len=12
+DIAG reopen: leo=3 start=1 synced_upto=3 segs=[(1, 103, 2)]
+DIAG file 00000000000000000001.index len=8
+DIAG file 00000000000000000001.log len=103
+DIAG file 00000000000000000001.timeindex len=12
+DIAG reopen: leo=3 start=1 synced_upto=3 chaos=true
+DIAG file 00000000000000000001.index len=8
+DIAG file 00000000000000000001.log len=206
+DIAG file 00000000000000000001.timeindex len=12
+DIAG file 00000000000000000005.index len=8
+DIAG file 00000000000000000005.log len=206
+DIAG file 00000000000000000005.timeindex len=12
+DIAG file 00000000000000000009.log len=206
+DIAG reopen: leo=13 start=1 synced_upto=1 segs=[(1, 206, 4), (5, 206, 4), (9, 206, 4)]
+DIAG file 00000000000000000001.index len=8
+DIAG file 00000000000000000001.log len=206
+DIAG file 00000000000000000001.timeindex len=12
+DIAG file 00000000000000000005.index len=8
+DIAG file 00000000000000000005.log len=206
+DIAG file 00000000000000000005.timeindex len=12
+DIAG file 00000000000000000009.log len=206
+DIAG reopen: leo=13 start=1 synced_upto=1 chaos=true
+PRE0 leo=0 start=0 flushed=0 synced=0 segs=1 files=
+PRE1 leo=2 start=0 flushed=0 synced=0 segs=1 files=00000000000000000000.log:101
+PRE2 leo=2 start=0 flushed=2 synced=0 segs=1 files=00000000000000000000.log:101
+PRE3 leo=4 start=0 flushed=2 synced=0 segs=1 files=00000000000000000000.log:202
+PRE4 leo=4 start=0 flushed=4 synced=0 segs=1 files=00000000000000000000.log:202
+PRE5 leo=4 start=0 flushed=4 synced=0 segs=2 files=00000000000000000000.log:202
+PRE6 leo=4 start=0 flushed=4 synced=0 segs=2 files=00000000000000000000.log:202
+PRE7 leo=4 start=3 flushed=4 synced=3 segs=2 files=00000000000000000000.log:202
+PRE8 leo=6 start=3 flushed=4 synced=3 segs=2 files=00000000000000000000.log:202,00000000000000000004.log:101
+PRE9 leo=8 start=3 flushed=4 synced=3 segs=2 files=00000000000000000000.log:202,00000000000000000004.log:202
+PRE10 leo=10 start=3 flushed=4 synced=3 segs=3 files=00000000000000000000.log:202,00000000000000000004.log:202,00000000000000000008.log:101
+PRE11 leo=12 start=3 flushed=4 synced=3 segs=3 files=00000000000000000000.log:202,00000000000000000004.log:202,00000000000000000008.log:204
+PRE12 leo=14 start=3 flushed=4 synced=3 segs=4 files=00000000000000000000.log:202,00000000000000000004.log:202,00000000000000000008.log:204,00000000000000000012.log:103
+PRE13 leo=14 start=3 flushed=4 synced=3 segs=4 files=00000000000000000000.log:202,00000000000000000004.log:202,00000000000000000008.log:204,00000000000000000012.log:51
+PRE14 leo=16 start=3 flushed=4 synced=3 segs=4 files=00000000000000000000.log:202,00000000000000000004.log:202,00000000000000000008.log:204,00000000000000000012.log:154
+PRE15 leo=16 start=3 flushed=4 synced=4 segs=4 files=00000000000000000000.log:202,00000000000000000004.log:202,00000000000000000008.log:204,00000000000000000012.log:154
+PRE16 leo=16 start=3 flushed=4 synced=4 segs=4 files=00000000000000000000.log:202,00000000000000000004.log:202,00000000000000000008.log:204,00000000000000000012.log:154
+PRE17 leo=0 start=0 flushed=4 synced=0 segs=1 files=
+PRE18 leo=0 start=0 flushed=4 synced=0 segs=1 files=
+PRE19 leo=0 start=0 flushed=0 synced=0 segs=1 files=
+PRE20 leo=2 start=0 flushed=0 synced=0 segs=1 files=00000000000000000000.log:103
+PRE21 leo=4 start=0 flushed=0 synced=0 segs=1 files=00000000000000000000.log:206
+PRE22 leo=6 start=0 flushed=0 synced=0 segs=2 files=00000000000000000000.log:206,00000000000000000004.log:103
+PRE23 leo=8 start=0 flushed=0 synced=0 segs=2 files=00000000000000000000.log:206,00000000000000000004.log:206
+PRE24 leo=8 start=0 flushed=0 synced=0 segs=2 files=00000000000000000000.log:206,00000000000000000004.log:0
+PRE25 leo=8 start=0 flushed=8 synced=0 segs=2 files=00000000000000000000.log:206,00000000000000000004.log:0
+PRE26 leo=8 start=0 flushed=8 synced=0 segs=3 files=00000000000000000000.log:206,00000000000000000004.log:0
+PRE27 leo=8 start=0 flushed=8 synced=8 segs=3 files=00000000000000000000.log:206,00000000000000000004.log:0
+PRE28 leo=10 start=0 flushed=8 synced=8 segs=3 files=00000000000000000000.log:206,00000000000000000004.log:0,00000000000000000008.log:103
+PRE29 leo=12 start=0 flushed=8 synced=8 segs=3 files=00000000000000000000.log:206,00000000000000000004.log:0,00000000000000000008.log:206
+PRE30 leo=12 start=0 flushed=12 synced=8 segs=4 files=00000000000000000000.log:206,00000000000000000004.log:0,00000000000000000008.log:206
+CRASH30 leo=12 start=0 tracked=6
+PRE31 leo=0 start=0 flushed=12 synced=0 segs=1 files=00000000000000000000.log:0
+PRE32 leo=2 start=0 flushed=12 synced=0 segs=1 files=00000000000000000000.log:103
+PRE33 leo=2 start=0 flushed=12 synced=2 segs=1 files=00000000000000000000.log:103
+PRE34 leo=4 start=0 flushed=12 synced=2 segs=1 files=00000000000000000000.log:206
+PRE35 leo=6 start=0 flushed=12 synced=2 segs=2 files=00000000000000000000.log:206,00000000000000000004.log:103
+PRE36 leo=6 start=0 flushed=12 synced=6 segs=2 files=00000000000000000000.log:206,00000000000000000004.log:103
+PRE37 leo=6 start=0 flushed=6 synced=6 segs=3 files=00000000000000000000.log:206,00000000000000000004.log:103
+PRE38 leo=8 start=0 flushed=6 synced=6 segs=3 files=00000000000000000000.log:206,00000000000000000004.log:103,00000000000000000006.log:103
+PRE39 leo=10 start=0 flushed=6 synced=6 segs=3 files=00000000000000000000.log:206,00000000000000000004.log:103,00000000000000000006.log:206
+PRE40 leo=12 start=0 flushed=6 synced=6 segs=4 files=00000000000000000000.log:206,00000000000000000004.log:103,00000000000000000006.log:206,00000000000000000010.log:103
+PRE41 leo=14 start=0 flushed=6 synced=6 segs=4 files=00000000000000000000.log:206,00000000000000000004.log:103,00000000000000000006.log:206,00000000000000000010.log:206
+PRE42 leo=16 start=0 flushed=6 synced=6 segs=5 files=00000000000000000000.log:206,00000000000000000004.log:103,00000000000000000006.log:206,00000000000000000010.log:206,00000000000000000014.log:103
+PRE43 leo=16 start=0 flushed=16 synced=6 segs=6 files=00000000000000000000.log:206,00000000000000000004.log:103,00000000000000000006.log:206,00000000000000000010.log:206,00000000000000000014.log:103
+PRE44 leo=16 start=0 flushed=16 synced=16 segs=6 files=00000000000000000000.log:206,00000000000000000004.log:103,00000000000000000006.log:206,00000000000000000010.log:206,00000000000000000014.log:103
+PRE45 leo=18 start=0 flushed=16 synced=16 segs=6 files=00000000000000000000.log:206,00000000000000000004.log:103,00000000000000000006.log:206,00000000000000000010.log:206,00000000000000000014.log:103,00000000000000000016.log:103
+PRE46 leo=18 start=0 flushed=16 synced=16 segs=6 files=00000000000000000000.log:206,00000000000000000004.log:103,00000000000000000006.log:206,00000000000000000010.log:206,00000000000000000014.log:103,00000000000000000016.log:103
+PRE47 leo=18 start=0 flushed=18 synced=16 segs=6 files=00000000000000000000.log:206,00000000000000000004.log:103,00000000000000000006.log:206,00000000000000000010.log:206,00000000000000000014.log:103,00000000000000000016.log:103
+PRE48 leo=20 start=0 flushed=18 synced=16 segs=6 files=00000000000000000000.log:206,00000000000000000004.log:103,00000000000000000006.log:206,00000000000000000010.log:206,00000000000000000014.log:103,00000000000000000016.log:206
+PRE49 leo=22 start=0 flushed=18 synced=16 segs=7 files=00000000000000000000.log:206,00000000000000000004.log:103,00000000000000000006.log:206,00000000000000000010.log:206,00000000000000000014.log:103,00000000000000000016.log:206,00000000000000000020.log:103
+PRE50 leo=22 start=0 flushed=18 synced=18 segs=7 files=00000000000000000000.log:206,00000000000000000004.log:103,00000000000000000006.log:206,00000000000000000010.log:206,00000000000000000014.log:103,00000000000000000016.log:206,00000000000000000020.log:103
+PRE51 leo=24 start=0 flushed=18 synced=18 segs=7 files=00000000000000000000.log:206,00000000000000000004.log:103,00000000000000000006.log:206,00000000000000000010.log:206,00000000000000000014.log:103,00000000000000000016.log:206,00000000000000000020.log:206
+CRASH51 leo=24 start=0 tracked=12
+PRE52 leo=2 start=0 flushed=18 synced=2 segs=1 files=00000000000000000000.log:103
+PRE53 leo=4 start=0 flushed=18 synced=2 segs=1 files=00000000000000000000.log:206
+CRASH53 leo=4 start=0 tracked=1
+PRE54 leo=2 start=0 flushed=18 synced=2 segs=1 files=00000000000000000000.log:103
+PRE55 leo=4 start=0 flushed=18 synced=2 segs=1 files=00000000000000000000.log:206
+PRE56 leo=6 start=0 flushed=18 synced=2 segs=2 files=00000000000000000000.log:206,00000000000000000004.log:103
+PRE57 leo=8 start=0 flushed=18 synced=2 segs=2 files=00000000000000000000.log:206,00000000000000000004.log:206
+PRE58 leo=10 start=0 flushed=18 synced=2 segs=3 files=00000000000000000000.log:206,00000000000000000004.log:206,00000000000000000008.log:103
+PRE59 leo=10 start=0 flushed=10 synced=2 segs=3 files=00000000000000000000.log:206,00000000000000000004.log:206,00000000000000000008.log:103
+PRE60 leo=12 start=0 flushed=10 synced=2 segs=3 files=00000000000000000000.log:206,00000000000000000004.log:206,00000000000000000008.log:206
+PRE61 leo=6 start=0 flushed=10 synced=2 segs=2 files=00000000000000000000.log:206,00000000000000000004.log:0
+PRE62 leo=8 start=0 flushed=10 synced=2 segs=2 files=00000000000000000000.log:206,00000000000000000004.log:103
+PRE63 leo=8 start=0 flushed=8 synced=2 segs=2 files=00000000000000000000.log:206,00000000000000000004.log:103
+DIAG file 00000000000000000000.index len=16
+DIAG file 00000000000000000000.log len=206
+DIAG file 00000000000000000000.timeindex len=12
+DIAG file 00000000000000000004.index len=8
+DIAG file 00000000000000000004.log len=206
+DIAG file 00000000000000000004.timeindex len=12
+DIAG reopen: leo=8 start=0 synced_upto=2 segs=[(0, 206, 4), (4, 206, 4)]
+DIAG file 00000000000000000000.index len=16
+DIAG file 00000000000000000000.log len=206
+DIAG file 00000000000000000000.timeindex len=12
+DIAG file 00000000000000000004.index len=8
+DIAG file 00000000000000000004.log len=206
+DIAG file 00000000000000000004.timeindex len=12
+DIAG reopen: leo=8 start=0 synced_upto=2 chaos=true
+
+thread 'opfuzz_chaos_seeds' (710460) panicked at storage/tests/opfuzz.rs:76:13:
+assertion `left == right` failed: 批 offset 必须连续（seed=879009，pos=206）
+  left: 6
+ right: 4
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+
+
+failures:
+    opfuzz_chaos_seeds
+
+test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 3 filtered out; finished in 0.10s
+
+error: test failed, to rerun pass `-p basalt-storage --test opfuzz`

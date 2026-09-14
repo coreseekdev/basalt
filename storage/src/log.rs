@@ -1066,6 +1066,7 @@ fn scan_and_truncate<D: DiskIo>(disk: &D, seg: &mut Segment, expect_base: i64) -
     let mut offset_ix = crate::index::OffsetIndex::default();
     let mut time_ix = crate::index::TimeIndex::default();
     let mut since_index = 0u64;
+    let mut run_off = expect_base;
     while pos + RECORD_BATCH_HEADER_LEN <= data.len() {
         let Some(h) = BatchHeader::parse(&data[pos..]) else { break };
         let total = h.total_len();
@@ -1079,6 +1080,13 @@ fn scan_and_truncate<D: DiskIo>(disk: &D, seg: &mut Segment, expect_base: i64) -
         if crc32c::crc32c(&data[pos + CRC_PAYLOAD_OFFSET..pos + total]) != h.crc {
             break;
         }
+        // 批 base 必须与段预期 base 连续——truncate_to 截活动段后续写会
+        // 让段文件内容与段名脱钩（opfuzz 扩量 chaos seed=879009 实证：
+        // base=4 的段文件内数据从 6 起，重开读流出现 4,5 空洞）。自此截断。
+        if h.base_offset != run_off {
+            break;
+        }
+        run_off += h.record_count.max(0) as i64;
         if pos == 0 {
             offset_ix.push(0, 0);
         }

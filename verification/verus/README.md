@@ -10,15 +10,16 @@ verification results:: 18 verified, 0 errors
 
 | 工具 | 版本 | 获取 |
 |---|---|---|
-| Verus | 0.2026.09.09.f42e59f (rolling) | `https://github.com/verus-lang/verus/releases`（x86-linux.zip，自带 rustc 包装器） |
-| 依赖工具链 | rustup toolchain `1.98.1-x86_64-unknown-linux-gnu` | `rustup toolchain install 1.98.1-x86_64-unknown-linux-gnu --profile minimal` |
-| 求解器 | Z3（Verus 内置分发） | — |
+| Verus | 0.2026.09.06.8dea4a2 (release) | `https://github.com/verus-lang/verus/releases/download/release%2F0.2026.09.06.8dea4a2/verus-0.2026.09.06.8dea4a2-x86-linux.zip`（2026-09-14 切换：09.09 rolling 本地构建已不可得；三个文件全量重跑绿） |
+| 依赖工具链 | rustup toolchain `1.98.0-x86_64-unknown-linux-gnu` | `rustup toolchain install 1.98.0-x86_64-unknown-linux-gnu --profile minimal` |
+| 求解器 | Z3 **4.16.0**（09.06 发行包不捆绑，须显式提供） | `https://github.com/Z3Prover/z3/releases/download/z3-4.16.0/z3-4.16.0-x64-glibc-2.39.zip` |
 
 运行：
 
 ```sh
-rustup toolchain install 1.98.1-x86_64-unknown-linux-gnu --profile minimal
-verus --crate-type=lib record_core.rs        # 替换为解压后的 verus 二进制路径
+rustup toolchain install 1.98.0-x86_64-unknown-linux-gnu --profile minimal
+export VERUS_Z3_PATH=/path/to/z3-4.16.0/bin/z3     # 必需；版本必须恰为 4.16.0
+verus --crate-type=lib record_core.rs              # 替换为解压后的 verus 二进制路径
 ```
 
 ## 已证明的 Claim（对应 docs/VERIFICATION.md §7）

@@ -1,5 +1,5 @@
 # 形式化验证与测试门禁（docs/VERIFICATION.md §6 CI 分层）
-# 工具版本锁定见 verification/*/README.md 与账本。
+# 工具版本锁定见 verification/*/README.md 与账本 §4 版本切换记录。
 name: verification
 
 on:
@@ -16,6 +16,7 @@ jobs:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
       - run: cargo test --workspace
+      # opfuzz 四档在 cargo test 内随 workspace 运行（fixed seeds，秒级）
 
   spec-tlc:
     runs-on: ubuntu-latest
@@ -23,7 +24,7 @@ jobs:
       - uses: actions/checkout@v4
       - uses: actions/setup-java@v4
         with: { distribution: temurin, java-version: "17" }
-      - name: 名义场景（C1/C2/C4）
+      - name: 名义场景（C1/C2/C4 + C14① synced 边界，全空间）
         run: make -C spec check
       - name: 阴性对照——EagerLeader 反例必须被检出（C3，判别力门禁）
         run: |
@@ -31,6 +32,46 @@ jobs:
             echo "::error::EagerLeader 反例未检出——检查器判别力丢失，规约或不变式可能空洞"
             exit 1
           fi
+      - name: splitbrain 双场景（C4'：租约语义下控制器 fencing 失效仍安全）
+        run: make -C spec splitbrain splitbrain-cepoch
+      - name: 消费组名义（C9 v0.3 fencing 审计位，全空间）
+        run: make -C spec consumer-group
+      - name: 阴性对照——部分就绪 Sync 必须被检出（C9）
+        run: |
+          if make -C spec consumer-group-demo; then
+            echo "::error::部分就绪 Sync 反例未检出——InvStableWellFormed 判别力丢失"
+            exit 1
+          fi
+      - name: 消费组活性阴性对照（C9 负结果：任何 coordinator 公平性均不可满足）
+        run: |
+          for t in consumer-group-liveness cg-liveness-l0 cg-liveness-l2 cg-liveness-l3; do
+            # 逐个要求"必须红"：make 组合会在首个失败处停止，漏检其余场景
+            if make -C spec "$t"; then
+              echo "::error::$t 未检出反例——churn 语义发生变化，必须重新评审 CONSUMERGROUP-LIVENESS.md"
+              exit 1
+            fi
+          done
+      - name: 数据面活性稳定变体（P2-2 正结果）
+        run: make -C spec dp-liveness-stable
+
+  verus:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: 安装依赖工具链（版本锁定见 verification/verus/README.md）
+        run: rustup toolchain install 1.98.0-x86_64-unknown-linux-gnu --profile minimal
+      - name: 下载 Verus 0.2026.09.06.8dea4a2 + Z3 4.16.0
+        run: |
+          curl -sL -o verus.zip "https://github.com/verus-lang/verus/releases/download/release%2F0.2026.09.06.8dea4a2/verus-0.2026.09.06.8dea4a2-x86-linux.zip"
+          curl -sL -o z3.zip "https://github.com/Z3Prover/z3/releases/download/z3-4.16.0/z3-4.16.0-x64-glibc-2.39.zip"
+          unzip -q verus.zip -d "$HOME/verus" && unzip -q z3.zip -d "$HOME/z3"
+      - name: L3 证明门禁（C5/C6/C6a/C13' + C7'a 恢复安全性模型）
+        run: |
+          export VERUS_Z3_PATH="$HOME/z3/z3-4.16.0-x64-glibc-2.39/bin/z3"
+          V="$HOME/verus/verus-x86-linux/verus"
+          $V --crate-type=lib verification/verus/record_core.rs
+          $V --crate-type=lib verification/verus/disk_fault_model.rs
+          $V --crate-type=lib verification/verus/log_recovery_model.rs
 
   kani-l1:
     runs-on: ubuntu-latest
@@ -43,6 +84,24 @@ jobs:
           export PATH="$HOME/.kani/kani-0.67.0/bin:$PATH"
           kani verification/kani/record_l1.rs
           kani verification/kani/batch_header.rs
+
+  e2e-clients:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: actions/setup-python@v5
+        with: { python-version: "3.12" }
+      - uses: actions/setup-go@v5
+        with: { go-version: "stable" }
+      - run: pip install kafka-python confluent-kafka
+      - run: cargo build -p basalt-server
+      - name: 客户端多样性档（缺陷⑩⑪/FindCoordinator 永久机制）+ 内部 RPC 冒烟（P0-1 永久机制）
+        run: |
+          for t in basic_produce_consume.py consumer_group.py librdkafka_compat.py librdkafka_admin.py internal_smoke.py; do
+            bash testing/e2e/run_e2e.sh "$t"
+          done
+          bash testing/e2e/run_franzgo.sh
 
   perf-nightly:
     if: github.event_name == 'schedule'

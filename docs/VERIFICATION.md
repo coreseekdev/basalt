@@ -73,6 +73,12 @@ torn write: sync 时按概率只落前半块（block 粒度截断）
 
 ## 4. 工具链与切换协议（2026-09 选型，随生态演进复审）
 
+> **版本切换记录（2026-09-14）**：Verus 由 0.2026.09.09.f42e59f（rolling 本地构建，
+> 发布页已不可得）切换为发布版 **0.2026.09.06.8dea4a2** + 显式 Z3 **4.16.0**
+> （09.06 发行包不再捆绑 z3，需 `VERUS_Z3_PATH` 指向 z3 4.16.0；rustup toolchain
+> 1.98.0）。三个证明文件全量重跑绿（45+10+15）。CI 同步锁定该版本
+> （.github/workflows/verification.yml verus job）。
+
 ### 4.1 代码层：Verus 主、Creusot 切换
 
 | | Verus | Creusot |
@@ -124,9 +130,9 @@ torn write: sync 时按概率只落前半块（block 粒度截断）
 | C3 | 继任规则（(lastEpoch, len) 字典序最大者接管）是 C1 的**必要设计**：跳过它（EagerLeader）TLC 检出"新主缺 acked 数据"反例 | L2 | 同上 | ✅ 反例已检出 | `make -C spec demo-eager` |
 | C4 | 游标有界：消费者只读已提交前缀，且每条可从任一多数派恢复。注：v0.2 前 InvConsumedBounded 曾结构性恒真（consume 直读 committed 变量，评审 MUT-B 判别实证）；v0.2 改为向现任主日志 fetch——不变式现依赖 C1b+日志匹配，MUT-B 形态（脏主）可红；InvConsumedOnLeader 为推理闭包（P1-2，降级标注） | L2 | 同上 | ✅ v0.2 通过（全空间 1200 万状态，2026-09-10） | `make -C spec check` |
 | C4' | 提交时多数派视图校验（CommitChecksEpoch）对安全性**非必需**（可作纵深防御保留） | L2 | 同上 | ✅ 实验确认（splitbrain / splitbrain-cepoch 双绿） | `make -C spec splitbrain` |
-| C5 | zigzag 双射：crate 位运算原型与算术规约逐点相等；`roundtrip_crate(v)==v` 对全部 i64 | L3 | Verus 0.2026.09.09.f42e59f，`verification/verus/record_core.rs` | ✅ 18 verified, 0 errors | 见 verification/verus/README.md |
+| C5 | zigzag 双射：crate 位运算原型与算术规约逐点相等；`roundtrip_crate(v)==v` 对全部 i64 | L3 | Verus 0.2026.09.06.8dea4a2（release），`verification/verus/record_core.rs` | ✅ 45 verified, 0 errors | 见 verification/verus/README.md |
 | C6a | Compression::from_bits/bits 全函数正确性与往返（全 i16 / 全枚举值） | L3 | 同上 | ✅ | 同上 |
-| C6 | varint（LEB128）无损：`put_varint`/`get_varint` 往返 == Some(z)（全 u64）、≤10 字节上界、规范形式（续传位/终止位） | L3 | Verus 0.2026.09.09.f42e59f | ✅ 38 verified, 0 errors（2026-09-09） | `verus --crate-type=lib verification/verus/record_core.rs` |
+| C6 | varint（LEB128）无损：`put_varint`/`get_varint` 往返 == Some(z)（全 u64）、≤10 字节上界、规范形式（续传位/终止位） | L3 | Verus 0.2026.09.06.8dea4a2 | ✅ 合并入 record_core 45 verified（2026-09-14 全量重跑） | `verus --crate-type=lib verification/verus/record_core.rs` |
 | C7' | **opfuzz 累计发现并修复 7 个真实缺陷**：① SimDisk::len 只返回 pending（crash 后簿记失真）；② truncate_to 盲设 next_offset 与批边界错位（重启 offset 重排）；③ truncate_to_front 保留/删除颠倒（delete_records 销毁 ≥ offset 全部数据）；④ roll() 空段封存创建同路径双 Segment（删一炸二）；⑤ segment_for 忽略 active 段（多段日志 fetch active 尾部返回旧数据/空——P0 服务端读路径缺陷）。opfuzz 80 种子全绿（四档含 batch_io）、解除 ignore 转正；⑥ segment_for 忽略 active 段（多段日志 fetch active 尾部返回旧数据/空——P0 读路径，opfuzz 跨段循环读抓出）；⑦ truncate_to 扫描起点错用 locate(offset) 跳过应保留批（opfuzz batch_io 档抓出，已修为段首扫描）| L1 | cargo test opfuzz（clean 40 + chaos 20 + batch_io 20 种子） | ✅ 收官（2026-09-10，7 缺陷全修，T-Q.1 ✅，batch_io 档转正）
 | C7'a | **恢复安全性模型 Verus 15/15 全绿**：设备 D1-D4 + scan_valid/scan_len_bounded + synced_survive + intact_prefix_scanned | L3 | Verus 0.2026.09.09 | ✅ 2026-09-10 | `verus --crate-type=lib verification/verus/log_recovery_model.rs` | | `cargo test -p basalt-storage --test opfuzz` |
 | C7 | recover() 后日志合法（offset 连续、索引可重建）、已 sync 数据存活 | L1+L3 | opfuzz（T-Q.1）+ Verus storage（未开始） | ⬜ 规划中（M2 前） | — |

@@ -20,7 +20,7 @@ for i in 0 1 2; do
   NODE_DIR="$DATA_DIR/node$i"
   BASALT_NODE_ID=$i BASALT_PORT=$PORT BASALT_DATA_DIR="$NODE_DIR" \
   BASALT_HOST=localhost BASALT_NUM_PARTITIONS=2 BASALT_RF=3 \
-  BASALT_NODES="0=localhost:9092,1=localhost:9102,2=localhost:9112" \
+  BASALT_NODES="0=localhost:9092,1=localhost:9102,2=localhost:9112" BASALT_METRICS_PORT=0 \
   BASALT_LOG_LEVEL="${BASALT_LOG_LEVEL:-info}" \
   ./target/debug/basalt-server > "$PID_DIR/node$i.log" 2>&1 &
   echo $! > "$PID_DIR/pid-$i"

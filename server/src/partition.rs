@@ -331,9 +331,15 @@ impl PartitionActor {
                         });
                         continue;
                     }
-                    // acks=all 前置检查：新鲜 ISR 数（含 leader）≥ min.insync
-                    let fresh = self.fresh_followers().len() + 1;
-                    if acks == -1 && self.log.replicated && (fresh as i32) < self.repl.min_insync {
+                    // acks=all 前置检查：新鲜 ISR 数（含 leader）≥ 有效下限。
+                    // C1 适用条款钉死（M2 义务，2026-09-14）：下限 =
+                    // max(min.insync 配置, 多数派)——acks=all 的提交面不得
+                    // 低于多数派（ISR 收缩只允许损失可用性，unclean=false）；
+                    // 配置可收紧（更大）但不可放宽。
+                    let majority = (self.replicas.len() as i32) / 2 + 1;
+                    let effective_min = self.repl.min_insync.max(majority);
+                    let fresh = (self.fresh_followers().len() + 1) as i32;
+                    if acks == -1 && self.log.replicated && fresh < effective_min {
                         let _ = reply.send(ProduceOutcome {
                             base_offset: -1, last_offset: -1, log_append_time: now_ms(),
                             error: Some(StorageError::NotEnoughReplicas),
@@ -667,6 +673,57 @@ mod truncate_fencing_tests {
         let o = prx.await.unwrap();
         assert!(o.error.is_none(), "{:?}", o.error);
         assert_eq!(o.base_offset, 10, "后续 produce 不得复用截断区 offset");
+
+        drop(tx);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// M2 义务（C1 适用条款钉死）：acks=all 前置校验含多数派下限——
+    /// RF=3 且无新鲜 follower 上报时拒绝（即便 min.insync 配置为 1）。
+    #[tokio::test]
+    async fn acks_all_pinned_to_majority_floor() {
+        let dir = std::env::temp_dir().join(format!(
+            "basalt-ackfloor-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let pool = std::sync::Arc::new(BufferPool::new());
+        // min.insync 配置 = 1（默认）：多数派下限 2 生效
+        let tx = PartitionActor::spawn(
+            "t".into(), 0, 0, dir.clone(),
+            LogOptions { segment_max_bytes: 1 << 30, fsync: FsyncSchedule::Os, retention_ms: 0, retention_max_bytes: 0 },
+            ReplicaConfig { min_insync: 1, isr_lag: Duration::from_millis(500) },
+            pool,
+        ).unwrap();
+        tx.send(PartitionCmd::SetRole { leader: true, epoch: 1, replicas: vec![0, 1, 2] }).await.unwrap();
+
+        // RF=3、0 个新鲜 follower 上报 → fresh=1 < max(1, 2)=2 → NotEnoughReplicas
+        let (ptx, prx) = oneshot::channel();
+        tx.send(PartitionCmd::Produce {
+            batches: batch_bytes(2, "a"),
+            policy: AssignPolicy::Assign,
+            acks: -1,
+            reply: ptx,
+        }).await.unwrap();
+        let o = prx.await.unwrap();
+        assert!(
+            matches!(o.error, Some(StorageError::NotEnoughReplicas)),
+            "acks=all 在新鲜 ISR 低于多数派时必须拒绝：{:?}",
+            o.error
+        );
+
+        // 对照：acks=1（同参数）不受下限约束，正常写入
+        let (ptx, prx) = oneshot::channel();
+        tx.send(PartitionCmd::Produce {
+            batches: batch_bytes(2, "b"),
+            policy: AssignPolicy::Assign,
+            acks: 1,
+            reply: ptx,
+        }).await.unwrap();
+        let o = prx.await.unwrap();
+        assert!(o.error.is_none(), "{:?}", o.error);
+        assert_eq!(o.base_offset, 0);
 
         drop(tx);
         let _ = std::fs::remove_dir_all(&dir);

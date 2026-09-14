@@ -5,7 +5,7 @@
 
 use std::collections::HashMap;
 
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct ReplicaAssignment {
     pub topic: String,
     pub partition: i32,
@@ -14,21 +14,21 @@ pub struct ReplicaAssignment {
     pub epoch: i32,
 }
 
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct BrokerInfo {
     pub node_id: i32,
     pub host: String,
     pub port: u16,
 }
 
-#[derive(Debug, Clone, Default, PartialEq)]
+#[derive(Debug, Clone, Default, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct ClusterState {
     pub brokers: HashMap<i32, BrokerInfo>,
     pub assignments: Vec<ReplicaAssignment>,
     pub version: u64,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub enum ClusterRecord {
     RegisterBroker(BrokerInfo),
     CreateTopic { name: String, partitions: i32, rf: i32 },

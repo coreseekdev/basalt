@@ -9,6 +9,7 @@ mod config;
 mod conn;
 mod handlers;
 mod handlers_groups;
+mod ctrl_raft;
 mod internal;
 mod meta;
 mod partition;

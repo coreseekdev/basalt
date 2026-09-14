@@ -56,7 +56,25 @@
 3. **场景回归（半天）**：multinode 全场景（failover/L1/transfer/partition/
    bounce/replay）× 控制器 kill 注入新场景；账本 C12/CI 收口。
 
+## 5bis. 实施进度（第一段 ✅ 2026-09-14）
+
+- ✅ `server/src/ctrl_raft.rs`：CtrlTypeConfig / CtrlStorage（vote.json +
+  entries.jsonl + committed.txt 持久化，vote 手工编解码绕开 openraft serde
+  feature）/ CtrlRouter+CtrlNet（进程内通道路由）/ SharedStorage（Adaptor
+  拆分前置共享句柄）
+- ✅ 内嵌三节点测试：选举 → client_write ×5 复制收敛 → 杀 leader →
+  watchdog 选举 → 多数派续写 → 存储重放恢复
+- ⬜ 第二段：Controller actor 改造为 raft propose + MSG_RAFT TCP 传输 +
+  `__controller.log` 迁移
+- ⬜ 第三段：场景回归（五 multinode 场景 × 控制器 kill）
+
 ## 5. 风险
+- **tick 驱动选举未生效（实施发现，2026-09-14）**：openraft 0.9.25 内嵌
+  三节点集成中，leader 死亡后 follower 的选举超时未触发（term 恒 1、
+  无 Vote RPC，core running_state=Ok）。v1 采用 **watchdog 触发选举**：
+  各节点在 ForwardToLeader/无主时调用 `raft.trigger().elect()`——Kafka
+  同款由失败检测触发选举的模式。根因排查（tick 任务、AsyncRuntime 集成）
+  留第二段，期间 watchdog 为唯一选举入口。
 
 - openraft API 版本漂移快（0.9 → 0.13 破坏性变更多）：锁定 0.9.x 并在
   README 记录（同 Verus 版本纪律）。

@@ -450,6 +450,20 @@ impl FollowerPull {
                                 eprintln!("PULL-ACK t={} p={} err={:?} last={}", self.topic, self.partition, out.error.is_some(), out.last_offset);
                                 if out.error.is_none() {
                                     next_offset = out.last_offset + 1;
+                                    // T-M2.5 in-flight 重复投递注入：同一切片重放一次。
+                                    // 绝对偏移策略下重放 = base 不匹配被拒（replica gap
+                                    // 路径）或 0 新记录——offset 纪律保证幂等。
+                                    if std::env::var("BASALT_PULL_REPLAY").ok().as_deref() == Some("1") {
+                                        let (tx2, rx2) = oneshot::channel();
+                                        if self.local_tx.send(PartitionCmd::Produce {
+                                            batches: res.data.clone(),
+                                            policy: basalt_storage::log::AssignPolicy::Absolute,
+                                            acks: 1,
+                                            reply: tx2,
+                                        }).await.is_ok() {
+                                            let _ = rx2.await; // 拒绝/空均可——幂等由 offset 纪律保证
+                                        }
+                                    }
                                 } else if let Some(basalt_storage::error::StorageError::Other(m)) = &out.error {
                                     if m.contains("replica gap") {
                                         // gap：本地 LEO 与 leader 错位——以本地真实 LEO 重试

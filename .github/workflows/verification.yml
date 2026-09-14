@@ -103,6 +103,18 @@ jobs:
           done
           bash testing/e2e/run_franzgo.sh
 
+  opfuzz-nightly:
+    if: github.event_name == 'schedule'
+    continue-on-error: true # 扫雷模式：chaos seed=879009 WIP 期间不阻塞
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - name: 扩量种子扫描（2000 种子；新背离自动产出种子与复现命令）
+        run: |
+          OPFUZZ_CLEAN_SEEDS=500 OPFUZZ_CHAOS_SEEDS=250 OPFUZZ_BATCHIO_SEEDS=250 \
+            cargo test -p basalt-storage --test opfuzz -- --test-threads=4
+
   perf-nightly:
     if: github.event_name == 'schedule'
     runs-on: ubuntu-latest

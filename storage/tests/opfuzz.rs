@@ -60,6 +60,10 @@ fn batch_bytes(payload: &str) -> Bytes {
 
 /// 校验一批流：每批 CRC 合法、offset 连续（base_{k+1} = last_k + 1）。
 fn assert_batch_stream(data: &[u8]) {
+    assert_batch_stream_seed(data, 0);
+}
+
+fn assert_batch_stream_seed(data: &[u8], seed: u64) {
     let mut pos = 0usize;
     let mut expect_next: Option<i64> = None;
     while pos < data.len() {
@@ -69,7 +73,7 @@ fn assert_batch_stream(data: &[u8]) {
         assert!(validate_crc(slice), "批 CRC 必须合法（pos={pos}）");
         let h = BatchHeader::parse(slice).expect("批头必须可解析");
         if let Some(next) = expect_next {
-            assert_eq!(h.base_offset, next, "批 offset 必须连续");
+            assert_eq!(h.base_offset, next, "批 offset 必须连续（seed={seed}，pos={pos}）");
         }
         expect_next = Some(h.base_offset + h.record_count as i64);
         pos += bl;
@@ -112,7 +116,7 @@ fn run_seed_io(seed: u64, torn: f64, batch_io: bool) {
     let mut synced_upto: i64 = 0;
     let mut ops: Vec<String> = vec![];
 
-    let dump = batch_io && (seed == 418916 || seed == 1570935);
+    let dump = seed == 418916 || seed == 1570935 || seed == 879009;
     for step in 0..64u64 {
         if dump {
             let files: Vec<String> = disk
@@ -260,8 +264,7 @@ fn run_seed_io(seed: u64, torn: f64, batch_io: bool) {
         off = r.first_offset + cnt;
     }
     let r = all.clone().freeze();
-    let r = all.clone().freeze();
-    assert_batch_stream(&r);
+    assert_batch_stream_seed(&r, seed);
 
     // 持久断言（clean）：tracked 标签按序全部可读回
     if !chaos {
@@ -323,9 +326,16 @@ fn run_seed_io(seed: u64, torn: f64, batch_io: bool) {
 /// 60 种子上全部通过；剩余一个待查项：seed=4 尾批子序列断言
 /// （read_len=1149 < 预期，疑 read_ex 单段读循环拼接边界或真实尾批丢失，
 /// 需结合 read_ex 语义专项排查——见 docs/review-storage-c7-20260909.md）。
+/// 种子数参数化：CI 夜间档以 OPFUZZ_*_SEEDS 扩量（verification.yml schedule），
+/// 默认维持账本口径（clean 40 / chaos 20 / batch_io 20——四档合计 80）。
+fn seed_count(env: &str, default: u64) -> u64 {
+    std::env::var(env).ok().and_then(|v| v.parse().ok()).unwrap_or(default).max(1)
+}
+
 #[test]
 fn opfuzz_clean_seeds() {
-    for seed in 1..=40u64 {
+    let n = seed_count("OPFUZZ_CLEAN_SEEDS", 40);
+    for seed in 1..=n {
         run_seed(seed, 0.0);
     }
 }
@@ -333,7 +343,8 @@ fn opfuzz_clean_seeds() {
 #[test]
 
 fn opfuzz_chaos_seeds() {
-    for seed in 1..=20u64 {
+    let n = seed_count("OPFUZZ_CHAOS_SEEDS", 20);
+    for seed in 1..=n {
         let torn = if seed % 2 == 0 { 0.05 } else { 0.15 };
         run_seed(seed * 7919, torn);
     }
@@ -411,7 +422,8 @@ fn repro_seed1_minimal() {
 fn opfuzz_batch_io_seeds() {
     // P0-2 回归档：batch_io=true 的 roll/staging 交互（code review 二轮实证
     // 旧实现此处 ack 丢失）。clean 无故障 + SyncEach 语义经 flush 修正。
-    for seed in 1..=20u64 {
+    let n = seed_count("OPFUZZ_BATCHIO_SEEDS", 20);
+    for seed in 1..=n {
         run_seed_io(seed * 104729, 0.0, true);
     }
 }

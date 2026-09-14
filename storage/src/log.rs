@@ -144,7 +144,11 @@ impl<D: DiskIo> Log<D> {
         let active_base = segs.last().map(|s| s.base_offset).unwrap_or(-1);
         for seg in &mut segs {
             // checkpoint 匹配（sealed 段大小未变）→ 跳过 CRC 全扫
-            if seg.base_offset != active_base && seg.bytes > 0 {
+            // 链连续性前置：checkpoint 大小匹配还不够——前段可能被 torn
+            // write 截尾，本段与预期 base 出现空洞时必须落回全扫
+            // （scan_and_truncate 按预期 base 截齐，空洞段变空后移除；
+            // opfuzz 扩量 chaos seed=879009 实证：读流 0,1→6,7 缺 4,5）
+            if seg.base_offset != active_base && seg.bytes > 0 && seg.base_offset == next_offset {
                 if cp.get(&seg.base_offset).map(|&sz| sz == seg.bytes).unwrap_or(false) {
                     // 轻量校验首 61B + 信任 checkpoint
                     let mut hdr = [0u8; RECORD_BATCH_HEADER_LEN];
@@ -196,6 +200,22 @@ impl<D: DiskIo> Log<D> {
             }
             next_offset = seg.base_offset + seg.next_rel;
             sealed.push(seg.clone());
+        }
+        // 删除/截断可能移除全部段文件（数据合法位于 log_start 之下）：
+        // LEO 不得低于持久化的 log_start——否则重开后 append 从 0 重新
+        // 分配，offset 流回卷（opfuzz 扩量 seed=207 实证，⑮同族）。
+        // 完全位于 start 之下的段（含 torn/crash 截断后）一并列删除：
+        // 其数据全在已删区间；跨线段（base < start < end）原样保留，
+        // 读路径按 log_start 过滤。拓扑与 LEO 保持一致（LEO == 末段
+        // base + next_rel，conformance 结构断言）。
+        if let Some(start) = persisted_start {
+            next_offset = next_offset.max(start);
+            for s in sealed.iter().filter(|s| s.base_offset + s.next_rel <= start) {
+                let _ = disk.remove(&s.path);
+                let _ = disk.remove(&s.index_path);
+                let _ = disk.remove(&s.time_path);
+            }
+            sealed.retain(|s| s.base_offset + s.next_rel > start);
         }
         let active = sealed.pop().unwrap_or_else(|| Segment::new(&dir, next_offset));
         let derived_start = sealed.first().map(|s| s.base_offset).unwrap_or(active.base_offset);

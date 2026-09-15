@@ -26,6 +26,8 @@ basalt-record = { path = "../record" }
 basalt-storage = { path = "../storage" }
 basalt-metadata = { path = "../metadata" }
 basalt-coordinator = { path = "../coordinator" }
+raft = "0.7"
+slog = "2"
 
 [lints]
 workspace = true

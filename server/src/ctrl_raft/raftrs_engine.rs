@@ -192,13 +192,6 @@ fn driver(
 
         let mut ready = node.ready();
         if !ready.messages().is_empty() || !ready.entries().is_empty() {
-            eprintln!(
-                "READY id={id} msgs={} entries={} committed={} hs={:?}",
-                ready.messages().len(),
-                ready.entries().len(),
-                ready.committed_entries().len(),
-                ready.hs().map(|h| (h.term, h.vote, h.commit))
-            );
         }
 
         // 持久化 hard state / entries（MemStorage 内存等价物）
@@ -223,8 +216,8 @@ fn driver(
         }
 
         // ③ 持久化后再发的消息（leader 的 append/heartbeat——依赖落盘顺序）
-        for msg in ready.persisted_messages() {
-            router.route(msg.to as i32, msg.clone());
+        for msg in ready.persisted_messages().to_vec() {
+            router.route(msg.to as i32, msg);
         }
 
         // ④ 应用已提交

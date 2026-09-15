@@ -618,8 +618,8 @@ async fn handle_internal_conn(
                 Bytes::from(r.map(|_| 0i16).unwrap_or(-1i16).to_be_bytes().to_vec())
             }
             MSG_RAFT => {
-                // payload 即纯 protobuf Message 字节（internal 帧解帧时已剥去
-                // 类型字节）——直接投递给本节点 raft 引擎
+                // 接收探针：确认 wire 帧到达接收端
+                eprintln!("RAFT-RECV payload_len={} first={:?} engine={}", payload.len(), &payload[..std::cmp::min(4, payload.len())], crate::ctrl_raft::raftrs_engine::engine_enabled());
                 if crate::ctrl_raft::raftrs_engine::engine_enabled() {
                     crate::ctrl_raft::raftrs_engine::deliver_wire(payload.to_vec());
                 }

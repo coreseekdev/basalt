@@ -48,7 +48,7 @@ pub trait CtrlRaftEngine: Send {
 | 存储 | v2 trait（0.9.25 封印，走经典 RaftStorage + Adaptor）| 同步 `Storage` trait（raft-rs 内置 MemStorage 可起步）|
 | 网络 | RaftNetwork trait（async）| Ready.messages 取出后自行发送（同步消息类型）|
 | 演进 | 活跃、0.9→0.10 破坏性大 | 平稳（TiKV 生产锚定）|
-| 已知问题 | 0.9.25 tick 驱动选举在本集成未生效 → watchdog（ADR-15 §6）| tick 节奏由集成方负责（时钟漂移/批次处理需自查）|
+| 已知问题 | ~~tick 驱动选举未生效~~ ✅ 已解决：根因是消息流 bug（非 tick），修复后 tick 选举完美工作 | tick 节奏由集成方负责（时钟漂移/批次处理需自查）|
 | 选型建议 | 默认引擎 | 备选引擎；TiKV 生态一致性偏好者 |
 
 ## 3. 选择与共存策略

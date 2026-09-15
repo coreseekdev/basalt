@@ -174,12 +174,6 @@ fn driver(
             last_tick = Instant::now();
         }
 
-        // 无主 watchdog：跟随者恒触发选举（不等 pending——
-        // tick 驱动选举未生效的补偿，Kafka 失败检测触发同款）
-        if node.raft.leader_id == 0 && node.raft.state == raft::StateRole::Follower {
-            let _ = node.campaign();
-        }
-
         // leader 才能提交命令；follower 直接拒绝（调用方重试路由到新主）
         if node.raft.state == raft::StateRole::Leader {
             for (rec, reply) in pending.drain(..) {

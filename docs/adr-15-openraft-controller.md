@@ -70,12 +70,11 @@
 - 🟨 第三段：六 multinode 场景在 raftrs 模式下全部 PASS（failover/l1/transfer/partition/bounce/replay）；控制器 kill 场景（multinode_ctrl_kill.py）🚧——心跳广播已修复（引擎模式向全 peers 广播），但 node0 死亡后分区 leader failover 链路仍未完全贯通（存活节点的 raft 重选 + controller 接管 + LeaderChange 提案 + MetaSync 传播——任一环节卡住即 produce 挂起）。需要专门的 3 进程 raft 联调会话逐步验证
 
 ## 5. 风险
-- **tick 驱动选举未生效（实施发现，2026-09-14）**：openraft 0.9.25 内嵌
-  三节点集成中，leader 死亡后 follower 的选举超时未触发（term 恒 1、
-  无 Vote RPC，core running_state=Ok）。v1 采用 **watchdog 触发选举**：
-  各节点在 ForwardToLeader/无主时调用 `raft.trigger().elect()`——Kafka
-  同款由失败检测触发选举的模式。根因排查（tick 任务、AsyncRuntime 集成）
-  留第二段，期间 watchdog 为唯一选举入口。
+- ~~tick 驱动选举未生效~~ **已解决（2026-09-14）**：根因是 ready 消息流
+  bug（非 leader 的 `ready.messages()` 被 `is_persisted_msg` 门控返回空），
+  并非 tick 问题。修复三级消息流（take_messages/persisted_messages/
+  LightReady）后 tick 驱动选举完美工作——无需 watchdog。ADR-16 有完整
+  根因分析。
 
 - openraft API 版本漂移快（0.9 → 0.13 破坏性变更多）：锁定 0.9.x 并在
   README 记录（同 Verus 版本纪律）。

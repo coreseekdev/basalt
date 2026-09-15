@@ -14,6 +14,7 @@ done
 sleep 0.5
 
 cleanup() {
+  if [ "${SKIP_CLEANUP:-0}" = "1" ]; then return; fi
   for f in "$PID_DIR"/*; do
     [ -f "$f" ] && kill -9 "$(cat "$f")" 2>/dev/null
   done

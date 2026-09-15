@@ -100,15 +100,26 @@ impl RaftRsRouter {
     }
 
     fn route(&self, to: i32, msg: Message) {
-        // 跨进程：TCP（MSG_RAFT wire——protobuf 编码后经内部端口发送）
+        // 跨进程：TCP（connect 500ms 超时——防死节点阻塞驱动线程）
         if let Some(addr) = self.tcp_peers.lock().unwrap().get(&to) {
-            if let Ok(bytes) = protobuf::Message::write_to_bytes(&msg) {
-                if let Ok(mut sock) = std::net::TcpStream::connect(addr.as_str()) {
-                    use std::io::Write;
-                    let mut f = ((bytes.len() + 1) as u32).to_be_bytes().to_vec();
-                    f.push(crate::internal::MSG_RAFT);
-                    f.extend_from_slice(&bytes);
-                    sock.write_all(&f).ok();
+            let sa: std::net::SocketAddr = format!("{}:0", "127.0.0.1")
+                .parse()
+                .unwrap(); // placeholder; addr 已含 port
+            let _ = sa;
+            let addrs: Vec<_> = std::net::ToSocketAddrs::to_socket_addrs(addr.as_str())
+                .map(|i| i.collect())
+                .unwrap_or_default();
+            for sa in &addrs {
+                if let Ok(mut sock) = std::net::TcpStream::connect_timeout(sa, Duration::from_millis(300)) {
+                    sock.set_write_timeout(Some(Duration::from_millis(300))).ok();
+                    if let Ok(protobuf_bytes) = protobuf::Message::write_to_bytes(&msg) {
+                        use std::io::Write;
+                        let mut f = ((protobuf_bytes.len() + 1) as u32).to_be_bytes().to_vec();
+                        f.push(crate::internal::MSG_RAFT);
+                        f.extend_from_slice(&protobuf_bytes);
+                        sock.write_all(&f).ok();
+                    }
+                    break;
                 }
             }
             return;

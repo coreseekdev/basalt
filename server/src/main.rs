@@ -66,12 +66,11 @@ async fn async_main(cfg: Config) {
             let router = crate::ctrl_raft::raftrs_engine::RaftRsRouter::new();
             // TCP peer 地址表（跨进程 raft 消息路由）
             for (id, host, port) in &cfg.nodes {
-                if *id != cfg.node_id {
-                    router.tcp_peers.lock().unwrap().insert(
-                        *id,
-                        format!("{host}:{}", port + 1),
-                    );
-                }
+                let raft_id = id + 1; // broker→raft id 偏移（INVALID_ID=0）
+                router.tcp_peers.lock().unwrap().insert(
+                    raft_id,
+                    format!("{host}:{}", port + 1),
+                );
             }
             Some(crate::ctrl_raft::raftrs_engine::spawn_with_dir(
                 cfg.node_id,

@@ -17,6 +17,7 @@ cleanup() {
   for f in "$PID_DIR"/*; do
     [ -f "$f" ] && kill -9 "$(cat "$f")" 2>/dev/null
   done
+  cp "$PID_DIR"/node*.log /tmp/ 2>/dev/null || true
   # 调试：保留 node 日志
 cp "$PID_DIR"/node*.log /tmp/ 2>/dev/null || true
 rm -rf "$PID_DIR" "$DATA_DIR"

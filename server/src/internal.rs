@@ -168,6 +168,7 @@ impl Controller {
     /// 非 raft leader 的提案会被引擎拒绝——调用方（run 循环）仅在
     /// is_leader 时行使职权，此处有限重试即可。
     fn engine_propose(&self, rec: &ClusterRecord) -> Result<(), String> {
+        eprintln!("PROPOSE node={} rec={:?}", self.node_id, std::mem::discriminant(rec));
         let Some(engine) = &self.engine else {
             return Err("engine disabled".into());
         };
@@ -309,6 +310,13 @@ impl Controller {
             self.state = st;
         }
         let now = Instant::now();
+        if self.engine.is_some() {
+            let alive: Vec<i32> = self.last_heartbeat.iter()
+                .filter(|(_, t)| now.duration_since(**t) <= self.heartbeat_timeout)
+                .map(|(id, _)| *id).collect();
+            eprintln!("FC node={} authority={} state_ver={} alive={:?} assignments={}",
+                self.node_id, self.has_engine_authority(), self.state.version, alive, self.state.assignments.len());
+        }
         // 控制器自身：免死 + 常驻 alive（无独立心跳线程，每次检查时刷新）
         self.last_heartbeat.insert(self.node_id, now);
         let stale: Vec<i32> = self

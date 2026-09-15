@@ -133,6 +133,7 @@ pub enum ControllerCmd {
     Heartbeat { node_id: i32 },
     Sync { version: u64, reply: oneshot::Sender<Option<Vec<u8>>> },
     CreateTopic { name: String, partitions: i32, rf: i32, reply: oneshot::Sender<()> },
+    DeleteTopic { name: String, reply: oneshot::Sender<bool> },
     ApplySnapshot { state: ClusterState },
     /// 引擎模式跨节点 propose 转发（MSG_CTRL_PROPOSE 落地）：本节点为 raft
     /// leader 时本地 propose，否则返回错误（转发方重试）
@@ -388,6 +389,21 @@ impl Controller {
             ControllerCmd::ApplySnapshot { state } => {
                 self.state = state;
             }
+            ControllerCmd::DeleteTopic { name, reply } => {
+                // 幂等：不存在时 no-op 返回 true（DeleteTopics 语义容忍）
+                let exists = self.state.assignments.iter().any(|a| a.topic == name);
+                if !exists {
+                    let _ = reply.send(true);
+                    return;
+                }
+                let r = if self.engine.is_some() {
+                    self.apply_via_engine(&ClusterRecord::DeleteTopic { name: name.clone() })
+                } else {
+                    self.apply_and_persist(&ClusterRecord::DeleteTopic { name: name.clone() });
+                    Ok(())
+                };
+                let _ = reply.send(r.is_ok());
+            }
             ControllerCmd::ProposeRemote { rec, reply } => {
                 // 仅 raft leader 受理转发提案；非 leader 立即拒绝——
                 // 否则转发方每轮等待本节点完整重试周期（7.5s）造成级联阻塞
@@ -590,6 +606,11 @@ fn encode_record(rec: &ClusterRecord) -> Vec<u8> {
             b.extend_from_slice(&partitions.to_be_bytes());
             b.extend_from_slice(&rf.to_be_bytes());
         }
+        ClusterRecord::DeleteTopic { name } => {
+            b.push(4);
+            b.extend_from_slice(&(name.len() as i16).to_be_bytes());
+            b.extend_from_slice(name.as_bytes());
+        }
         ClusterRecord::LeaderChange { topic, partition, leader, epoch } => {
             b.push(3);
             b.extend_from_slice(&(topic.len() as i16).to_be_bytes());
@@ -640,6 +661,10 @@ fn decode_record(data: &[u8]) -> Option<ClusterRecord> {
             let leader = g32(&mut p);
             let epoch = g32(&mut p);
             ClusterRecord::LeaderChange { topic, partition, leader, epoch }
+        }
+        4 => {
+            let name = gstr(&mut p);
+            ClusterRecord::DeleteTopic { name }
         }
         _ => return None,
     })

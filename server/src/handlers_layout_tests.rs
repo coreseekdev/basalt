@@ -339,7 +339,18 @@ pub mod handlers_layout_tests {
     async fn probe_delete_topics_layouts() {
         let k = basalt_protocol::api::key::DELETE_TOPICS;
         let ctx = make_ctx(&[("t1", 1)]).await;
+        // 真删除语义（v0/v5 用例会实际移除 t1）→ 每个用例前重播种簇状态
+        async fn reseed(ctx: &Ctx) {
+            let mut state = basalt_metadata::cluster::ClusterState::default();
+            state.brokers.insert(0, basalt_metadata::cluster::BrokerInfo { node_id: 0, host: "localhost".into(), port: 9092 });
+            state.assignments.push(basalt_metadata::cluster::ReplicaAssignment {
+                topic: "t1".into(), partition: 0, replicas: vec![0], leader: 0, epoch: 1,
+            });
+            let _ = ctx.meta_tx.send(MetaCmd::ApplyCluster(Box::new(state))).await;
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
     
+        reseed(&ctx).await;
         // v0：TopicNames 分支；响应无 TopicId（6+）无 ErrorMessage（5+）
         let st = s([("TopicNames", Value::Array(vec![Value::str("t1")])), ("TimeoutMs", Value::I32(3000))]);
         let r = dt(&ctx, 0, st).await;
@@ -350,6 +361,7 @@ pub mod handlers_layout_tests {
         assert!(missing(as_struct(&rs[0]), "TopicId"), "v0 无 TopicId");
         assert!(missing(as_struct(&rs[0]), "ErrorMessage"), "v0 无 ErrorMessage");
         assert!(missing(&r, "ThrottleTimeMs"), "v0 无 Throttle");
+        reseed(&ctx).await;
         // v5：ErrorMessage 出现（5+），TopicId 仍无
         let st = s([("TopicNames", Value::Array(vec![Value::str("t1")])), ("TimeoutMs", Value::I32(3000))]);
         let r = dt(&ctx, 5, st).await;
@@ -357,11 +369,13 @@ pub mod handlers_layout_tests {
         assert!(as_struct(&rs[0]).get("ErrorMessage").is_some(), "v5 起 ErrorMessage 存在");
         assert!(missing(as_struct(&rs[0]), "TopicId"), "v5 无 TopicId");
         assert_eq!(fld(&r, "ThrottleTimeMs").as_i32(), 0);
+        reseed(&ctx).await;
         // v5 未知 topic
         let st = s([("TopicNames", Value::Array(vec![Value::str("nope")])), ("TimeoutMs", Value::I32(3000))]);
         let r = dt(&ctx, 5, st).await;
         let rs = arr(&r, "Responses");
         assert_eq!(sfield(&rs[0], "ErrorCode").as_i16(), 3, "UnknownTopicOrPartition");
+        reseed(&ctx).await;
         // v6：Topics（DeleteTopicState）分支 + TopicId 回显
         let st = s([("Topics", Value::Array(vec![s([
             ("Name", Value::str("t1")),

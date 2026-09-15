@@ -9,6 +9,7 @@ package io.basalt.e2e;
 //
 // 用法：testing/e2e/run_kafkaclients.sh（拉起 broker 后 mvn exec:java）。
 
+import org.apache.kafka.clients.admin.NewTopic;
 import org.apache.kafka.clients.consumer.*;
 import org.apache.kafka.clients.producer.*;
 import org.apache.kafka.common.TopicPartition;
@@ -124,7 +125,56 @@ public class KafkaClientsE2E {
         }
     }
 
+    /** 管理面（⑪ 家族判别面）：AdminClient CreateTopics v7+ 布局/描述/删除。 */
+    static void adminPhase() {
+        String step = "createTopics";
+        Properties p = new Properties();
+        p.put("bootstrap.servers", BOOTSTRAP);
+        try (org.apache.kafka.clients.admin.AdminClient adm =
+                     org.apache.kafka.clients.admin.AdminClient.create(p)) {
+            // CreateTopics：新 topic（compact 布局）
+            NewTopic nt = new NewTopic("kafkaclients-admin", 2, (short) 1);
+            step = "createTopics";
+            adm.createTopics(Collections.singletonList(nt)).all().get();
+            step = "propagate";
+            Thread.sleep(1000);  // metadata 传播窗口
+            // DescribeTopics：分区/副本明细可读
+            step = "describeTopics-after-create";
+            var desc = adm.describeTopics(Collections.singletonList("kafkaclients-admin"))
+                          .allTopicNames().get();
+            var td = desc.get("kafkaclients-admin");
+            if (td == null || td.partitions().size() != 2) {
+                fail("admin describe: partitions != 2 got " +
+                     (td == null ? "null" : td.partitions().size()));
+            }
+            // ListTopics：可见性
+            step = "listTopics";
+            if (!adm.listTopics().names().get().contains("kafkaclients-admin")) {
+                fail("admin listTopics missing kafkaclients-admin");
+            }
+            // DeleteTopics：删除后 Describe 报 UnknownTopic
+            step = "deleteTopics";
+            adm.deleteTopics(Collections.singletonList("kafkaclients-admin")).all().get();
+            Thread.sleep(2000);  // 删除的元数据传播（控制器刷新 + 客户端 metadata）
+            try {
+                step = "describeTopics-after-delete";
+                var after = adm.describeTopics(Collections.singletonList("kafkaclients-admin"))
+                               .allTopicNames().get();
+                if (after.containsKey("kafkaclients-admin")) {
+                    fail("admin delete: topic still describable");
+                }
+            } catch (java.util.concurrent.ExecutionException e) {
+                // 期望：UnknownTopicOrPartition
+            }
+        } catch (Exception e) {
+            fail("admin step=" + step + ": " + e);
+        }
+    }
+
     public static void main(String[] args) {
+        // 阶段 0：管理面（CreateTopics v7+ / Describe / List / Delete）
+        adminPhase();
+        System.out.println("[0] admin create/describe/list/delete ok");
         // 阶段 1：produce 20 + 消费者 A 全量读 + commit
         produce(0, 20);
         System.out.println("[1] 20 produced (acks=all)");

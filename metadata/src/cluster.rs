@@ -32,6 +32,7 @@ pub struct ClusterState {
 pub enum ClusterRecord {
     RegisterBroker(BrokerInfo),
     CreateTopic { name: String, partitions: i32, rf: i32 },
+    DeleteTopic { name: String },
     LeaderChange { topic: String, partition: i32, leader: i32, epoch: i32 },
 }
 
@@ -72,6 +73,9 @@ impl ClusterState {
                         epoch: 0,
                     });
                 }
+            }
+            ClusterRecord::DeleteTopic { name } => {
+                self.assignments.retain(|a| a.topic != *name);
             }
             ClusterRecord::LeaderChange { topic, partition, leader, epoch } => {
                 if let Some(a) = self

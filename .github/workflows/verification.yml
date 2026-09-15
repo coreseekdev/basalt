@@ -102,7 +102,15 @@ jobs:
         with: { python-version: "3.12" }
       - uses: actions/setup-go@v5
         with: { go-version: "stable" }
+      - uses: actions/setup-java@v4
+        with: { distribution: temurin, java-version: "17" }
+      - uses: actions/setup-python@v5
+        with: { python-version: "3.12" }
       - run: pip install kafka-python confluent-kafka
+      - uses: actions/cache@v4
+        with:
+          path: ~/.m2
+          key: maven-kafkaclients-3.7.0
       - run: cargo build -p basalt-server
       - name: 客户端多样性档（缺陷⑩⑪/FindCoordinator 永久机制）+ 内部 RPC 冒烟（P0-1 永久机制）
         run: |
@@ -110,6 +118,7 @@ jobs:
             bash testing/e2e/run_e2e.sh "$t"
           done
           bash testing/e2e/run_franzgo.sh
+          bash testing/e2e/run_kafkaclients.sh
       - name: 多节点 M2 场景（failover/L1<2s/计划内交接/分区追赶/bounce v1）
         run: |
           for s in multinode_failover.py multinode_l1.py multinode_transfer.py multinode_partition.py multinode_bounce.py; do

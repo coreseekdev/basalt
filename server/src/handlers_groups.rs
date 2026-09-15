@@ -382,13 +382,30 @@ pub async fn delete_topics(req: &basalt_protocol::value::Struct, ctx: &Ctx) -> V
         let err = if name.is_empty() {
             ErrorCode::UnknownTopicId
         } else {
-            let (reply_tx, reply_rx) = oneshot::channel();
-            let _ = ctx.meta_tx.send(MetaCmd::Lookup { names: Some(vec![name.clone()]), allow_create: false, reply: reply_tx }).await;
-            let (found, _brokers) = reply_rx.await.unwrap_or_default();
-            if found.is_empty() {
+            // 先查存在性（Kafka 语义：删未知 topic = UNKNOWN_TOPIC_OR_PARTITION）
+            let (ptx, prx) = oneshot::channel();
+            let _ = ctx.meta_tx.send(MetaCmd::Lookup { names: Some(vec![name.clone()]), allow_create: false, reply: ptx }).await;
+            let (pre, _brokers) = prx.await.unwrap_or_default();
+            if pre.iter().all(|t| t.name != name) {
+                results.push(s([
+                    ("Name", Value::str(name)),
+                    ("TopicId", Value::Uuid(0)),
+                    ("ErrorCode", Value::I16(ErrorCode::UnknownTopicOrPartition as i16)),
+                    ("ErrorMessage", Value::Null),
+                ]));
+                continue;
+            }
+            let (dtx, drx) = oneshot::channel();
+            let _ = ctx.meta_tx.send(MetaCmd::DeleteTopic { name: name.clone(), reply: dtx }).await;
+            let ok = drx.await.unwrap_or(false);
+            // 删除后回查：仍可见 = 删除失败（真错误）；不可见 = 成功
+            let (ltx, lrx) = oneshot::channel();
+            let _ = ctx.meta_tx.send(MetaCmd::Lookup { names: Some(vec![name.clone()]), allow_create: false, reply: ltx }).await;
+            let (found, _brokers) = lrx.await.unwrap_or_default();
+            if found.iter().any(|t| t.name == name) {
                 ErrorCode::UnknownTopicOrPartition
             } else {
-                ErrorCode::None // 删除语义 POC：标记即可，物理删除由 retention 完成
+                ErrorCode::None
             }
         };
         results.push(s([

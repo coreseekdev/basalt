@@ -66,6 +66,11 @@ pub enum MetaCmd {
         rf: i32,
         reply: oneshot::Sender<bool>,
     },
+    /// 删题（转发控制器，raft 复制后本地 assignment 消失）。
+    DeleteTopic {
+        name: String,
+        reply: oneshot::Sender<bool>,
+    },
 }
 
 pub struct MetaService {
@@ -156,6 +161,46 @@ impl MetaService {
         while let Some(cmd) = self.rx.recv().await {
             match cmd {
                 MetaCmd::ApplyCluster(state) => self.apply_cluster(state).await,
+                MetaCmd::DeleteTopic { name, reply } => {
+                    if let Some(tx) = &self.controller_tx {
+                        let (txr, rxr) = tokio::sync::oneshot::channel();
+                        let ok = tx
+                            .send(crate::internal::ControllerCmd::DeleteTopic {
+                                name: name.clone(),
+                                reply: txr,
+                            })
+                            .await
+                            .is_ok()
+                                && rxr.await.unwrap_or(false);
+                        // 控制器已删 → 刷新本地簇视图（否则 post-lookup 仍见
+                        // 旧 assignment，删除被误报为 UNKNOWN——Java 档实证）
+                        if ok {
+                            self.refresh_cluster_snapshot().await;
+                        }
+                        let _ = reply.send(ok);
+                    } else {
+                        // 无控制器（单点自治理）：本地集群态即权威——
+                        // 移除 assignment 与路由后即达成删除语义
+                        self.cluster
+                            .assignments
+                            .retain(|a| a.topic != *name);
+                        let live: std::collections::BTreeSet<(String, i32)> = self
+                            .cluster
+                            .assignments
+                            .iter()
+                            .map(|a| (a.topic.clone(), a.partition))
+                            .collect();
+                        self.routes.by_name.retain(|k, _| live.contains(k));
+                        let live_ids: std::collections::BTreeSet<(u128, i32)> = self
+                            .cluster
+                            .assignments
+                            .iter()
+                            .map(|a| (topic_id_from(&a.topic), a.partition))
+                            .collect();
+                        self.routes.by_id.retain(|k, _| live_ids.contains(k));
+                        let _ = reply.send(true);
+                    }
+                }
                 MetaCmd::Lookup { names, allow_create, reply } => {
                     let mut out = Vec::new();
                     match &names {
@@ -406,6 +451,23 @@ impl MetaService {
                 });
             }
         }
+        // 已删除的 topic（DeleteTopic 后 assignment 消失）：路由移除。
+        // actor 孤儿为 POC 边界——数据由 retention 清理，路由语义立即
+        // 正确（metadata UNKNOWN_TOPIC、produce 走建题路径）
+        let live: std::collections::BTreeSet<(String, i32)> = self
+            .cluster
+            .assignments
+            .iter()
+            .map(|a| (a.topic.clone(), a.partition))
+            .collect();
+        self.routes.by_name.retain(|k, _| live.contains(k));
+        let live_ids: std::collections::BTreeSet<(u128, i32)> = self
+            .cluster
+            .assignments
+            .iter()
+            .map(|a| (topic_id_from(&a.topic), a.partition))
+            .collect();
+        self.routes.by_id.retain(|k, _| live_ids.contains(k));
         let _ = self.tx_watch.send(self.routes.clone());
     }
 }

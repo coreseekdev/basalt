@@ -618,15 +618,10 @@ async fn handle_internal_conn(
                 Bytes::from(r.map(|_| 0i16).unwrap_or(-1i16).to_be_bytes().to_vec())
             }
             MSG_RAFT => {
-                // payload: u32 len + protobuf Message —— 投递给本节点 raft 引擎
-                if payload.len() < 4 {
-                    sock.write_all(&short_frame()).await?;
-                    return Ok(());
-                }
-                let (len_bytes, frame) = payload.split_at(4);
-                let _len = u32::from_be_bytes(len_bytes.try_into().unwrap()) as usize;
+                // payload 即纯 protobuf Message 字节（internal 帧解帧时已剥去
+                // 类型字节）——直接投递给本节点 raft 引擎
                 if crate::ctrl_raft::raftrs_engine::engine_enabled() {
-                    crate::ctrl_raft::raftrs_engine::deliver_wire(frame.to_vec());
+                    crate::ctrl_raft::raftrs_engine::deliver_wire(payload.to_vec());
                 }
                 Bytes::new()
             }

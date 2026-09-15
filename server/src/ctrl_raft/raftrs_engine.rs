@@ -57,6 +57,9 @@ pub struct RaftRsHandle {
     pub id: i32,
     tx: mpsc::Sender<EngineCmd>,
     pub shared: Arc<Mutex<ClusterState>>,
+    pub is_leader: Arc<std::sync::atomic::AtomicBool>,
+    pub leader_id: Arc<std::sync::atomic::AtomicI32>,
+    pub applied: Arc<std::sync::atomic::AtomicU64>,
 }
 
 impl RaftRsHandle {
@@ -107,7 +110,11 @@ fn driver(
     cmd_rx: mpsc::Receiver<EngineCmd>,
     mut msg_rx: mpsc::Receiver<Message>,
     shared: Arc<Mutex<ClusterState>>,
+    is_leader: Arc<std::sync::atomic::AtomicBool>,
+    leader_id: Arc<std::sync::atomic::AtomicI32>,
+    applied: Arc<std::sync::atomic::AtomicU64>,
 ) {
+    use std::sync::atomic::Ordering;
     let mut last_tick = Instant::now();
     let mut pending: Vec<(ClusterRecord, mpsc::Sender<Result<(), String>>)> = Vec::new();
     let mut leader_known: Option<u64> = None;
@@ -235,10 +242,18 @@ fn driver(
                     st.apply(&rec);
                     st.version = e.get_index();
                 }
+                applied.store(e.get_index(), Ordering::Relaxed);
             }
         }
 
         leader_known = Some(node.raft.leader_id);
+        let im_leader = node.raft.state == raft::StateRole::Leader;
+        is_leader.store(im_leader, Ordering::Relaxed);
+        if im_leader {
+            leader_id.store(id, Ordering::Relaxed);
+        } else if node.raft.leader_id != 0 {
+            leader_id.store(node.raft.leader_id as i32, Ordering::Relaxed);
+        }
         if node.raft.state != last_role || node.raft.term != last_term {
             eprintln!("ENGINE id={id} role={:?} term={} leader={:?}", node.raft.state, node.raft.term, node.raft.leader_id);
             last_role = node.raft.state;
@@ -259,7 +274,13 @@ pub fn spawn(id: i32, peers: Vec<i32>, router: RaftRsRouter) -> RaftRsHandle {
     let _ = engine_cmd_tx().set(cmd_tx.clone());
     let (msg_tx, msg_rx) = mpsc::channel();
     let shared = Arc::new(Mutex::new(ClusterState::default()));
+    let is_leader = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let leader_id = Arc::new(std::sync::atomic::AtomicI32::new(0));
+    let applied = Arc::new(std::sync::atomic::AtomicU64::new(0));
     let shared_clone = shared.clone();
+    let is_leader_t = is_leader.clone();
+    let leader_id_t = leader_id.clone();
+    let applied_t = applied.clone();
 
     router.register(id, msg_tx);
 
@@ -277,10 +298,10 @@ pub fn spawn(id: i32, peers: Vec<i32>, router: RaftRsRouter) -> RaftRsHandle {
         });
         let node = RawNode::new(&cfg, mem_store, &logger()).unwrap();
 
-        driver(id, node, router, cmd_rx, msg_rx, shared_clone);
+        driver(id, node, router, cmd_rx, msg_rx, shared_clone, is_leader_t, leader_id_t, applied_t);
     });
 
-    RaftRsHandle { id, tx: cmd_tx, shared }
+    RaftRsHandle { id, tx: cmd_tx, shared, is_leader, leader_id, applied }
 }
 
 #[cfg(test)]

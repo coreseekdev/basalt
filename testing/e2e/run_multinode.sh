@@ -28,7 +28,7 @@ for i in 0 1 2; do
   BASALT_NODE_ID=$i BASALT_PORT=$PORT BASALT_DATA_DIR="$NODE_DIR" \
   BASALT_HOST=localhost BASALT_NUM_PARTITIONS=2 BASALT_RF=3 \
   BASALT_NODES="0=localhost:9092,1=localhost:9102,2=localhost:9112" BASALT_METRICS_PORT=0 \
-  BASALT_LOG_LEVEL="${BASALT_LOG_LEVEL:-info}" \
+  BASALT_CTRL_RAFT_ENGINE="${RAFTRS:-}" BASALT_LOG_LEVEL="${BASALT_LOG_LEVEL:-info}" \
   ./target/debug/basalt-server > "$PID_DIR/node$i.log" 2>&1 &
   echo $! > "$PID_DIR/pid-$i"
   echo $! > "$PID_DIR/port-$PORT"
@@ -36,6 +36,8 @@ done
 sleep 2
 
 SCENARIO="${1:-multinode_failover.py}"
+# RAFTRS=1 时全节点启用 raft 引擎 runtime
+if [ "${RAFTRS:-0}" = "1" ]; then export RAFTRS=1; fi
 KILL_BY_PORT=1 BROKERS="localhost:9092,localhost:9102,localhost:9112" \
   python3 "testing/e2e/$SCENARIO"
 RC=$?

@@ -56,12 +56,23 @@ async fn async_main(cfg: Config) {
 
     // 控制器 actor（仅控制器节点）
     let controller_tx = if is_controller {
+        // ADR-15/16：引擎运行时（BASALT_CTRL_RAFT_ENGINE=raftrs）下，
+        // 先装配本节点 raft 引擎（voters = 全部 nodes），Controller 经
+        // engine propose 复制元数据变更；仅 raft leader 行使职权。
+        let engine_handle = if crate::ctrl_raft::raftrs_engine::engine_enabled() {
+            let peers: Vec<i32> = cfg.nodes.iter().map(|(id, _, _)| *id).collect();
+            let router = crate::ctrl_raft::raftrs_engine::RaftRsRouter::new();
+            Some(crate::ctrl_raft::raftrs_engine::spawn(cfg.node_id, peers, router))
+        } else {
+            None
+        };
         Some(internal::Controller::spawn(
             cfg.node_id,
             std::path::Path::new(&cfg.data_dir).join("__controller.log"),
             std::time::Duration::from_millis(
                 std::env::var("BASALT_HEARTBEAT_TIMEOUT_MS").ok().and_then(|v| v.parse().ok()).unwrap_or(1000),
             ),
+            engine_handle,
         ))
     } else {
         None

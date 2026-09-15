@@ -1,6 +1,9 @@
 # ADR-16：控制器 Raft 多引擎支持（openraft / raft-rs 可插拔）
 
-> 状态：已实施（openraft 骨架 + raft-rs 引擎 + 双测试；2026-09-14）。
+> 状态：已实施（openraft 骨架 + raft-rs 引擎 + 双测试 + 三进程 runtime 联调；2026-09-14）。
+> **runtime 联调**：`BASALT_CTRL_RAFT_ENGINE=raftrs` 下三节点引擎组选举、
+> CreateTopic 经 raft propose 复制到全部节点（multinode_raftrs.py 30/30），
+> 默认模式五场景回归不受影响。
 > **raft-rs 实施关键发现**：0.7 的出站消息分三类暴露——非 leader 走
 > `ready.take_messages()`（先发，不依赖落盘）、leader 走
 > `ready.persisted_messages()`（持久化后发）、`advance(ready)` 返回的

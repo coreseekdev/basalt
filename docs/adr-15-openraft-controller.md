@@ -64,9 +64,10 @@
   拆分前置共享句柄）
 - ✅ 内嵌三节点测试：选举 → client_write ×5 复制收敛 → 杀 leader →
   watchdog 选举 → 多数派续写 → 存储重放恢复
-- ⬜ 第二段：Controller actor 改造为 raft propose + MSG_RAFT TCP 传输 +
-  `__controller.log` 迁移
-- ⬜ 第三段：场景回归（五 multinode 场景 × 控制器 kill）
+- ✅ 第二段（部分）：Controller actor 引擎感知（propose/职权门控/MetaSync
+  读引擎态）+ MSG_RAFT TCP 传输 + BASALT_CTRL_RAFT_ENGINE 运行时挂接；
+  `__controller.log` 迁移工具 ⬜（MemStorage 起步，快照持久化为后续）
+- ⬜ 第三段：五 multinode 场景 × 控制器 kill 回归（raftrs 模式冒烟 ✅ 30/30）
 
 ## 5. 风险
 - **tick 驱动选举未生效（实施发现，2026-09-14）**：openraft 0.9.25 内嵌

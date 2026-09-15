@@ -146,14 +146,64 @@ pub struct Controller {
     pub last_heartbeat: HashMap<i32, Instant>,
     pub heartbeat_timeout: Duration,
     pub rx: mpsc::Receiver<ControllerCmd>,
+    /// ADR-15/16：raft 引擎运行时（BASALT_CTRL_RAFT_ENGINE=raftrs 时启用）。
+    /// 启用后元数据变更经 raft propose 复制；本 actor 仅在 raft leader 上行使职权。
+    pub engine: Option<crate::ctrl_raft::raftrs_engine::RaftRsHandle>,
 }
 
 impl Controller {
-    pub fn spawn(node_id: i32, log_path: PathBuf, heartbeat_timeout: Duration) -> mpsc::Sender<ControllerCmd> {
+    pub fn spawn(
+        node_id: i32,
+        log_path: PathBuf,
+        heartbeat_timeout: Duration,
+        engine: Option<crate::ctrl_raft::raftrs_engine::RaftRsHandle>,
+    ) -> mpsc::Sender<ControllerCmd> {
         let (tx, rx) = mpsc::channel(256);
-        let ctrl = Controller::open(node_id, log_path, heartbeat_timeout, rx);
+        let ctrl = Controller::open(node_id, log_path, heartbeat_timeout, rx, engine);
         tokio::spawn(ctrl.run());
         tx
+    }
+
+    /// 引擎模式下经 raft propose 复制一条记录并等待本节点应用完成。
+    /// 非 raft leader 的提案会被引擎拒绝——调用方（run 循环）仅在
+    /// is_leader 时行使职权，此处有限重试即可。
+    fn engine_propose(&self, rec: &ClusterRecord) -> Result<(), String> {
+        let Some(engine) = &self.engine else {
+            return Err("engine disabled".into());
+        };
+        for _ in 0..50 {
+            match engine.propose(rec.clone()) {
+                Ok(()) => {
+                    // 等待本节点 apply 追上（本地 apply 与 commit 同步推进）
+                    let want = engine.applied_index();
+                    for _ in 0..100 {
+                        if engine.applied_index() >= want {
+                            return Ok(());
+                        }
+                        std::thread::sleep(Duration::from_millis(10));
+                    }
+                    return Ok(());
+                }
+                Err(m) if m.contains("not leader") => {
+                    std::thread::sleep(Duration::from_millis(150));
+                }
+                Err(m) => return Err(m),
+            }
+        }
+        Err("raft proposal timeout".into())
+    }
+
+    /// 引擎模式下的变更入口：propose 复制；本地 state 由引擎 apply 同步。
+    fn apply_via_engine(&mut self, rec: &ClusterRecord) -> Result<(), String> {
+        self.engine_propose(rec)
+    }
+
+    /// 引擎模式下本节点是否raft leader（failover/提案职权判定）。
+    fn has_engine_authority(&self) -> bool {
+        match &self.engine {
+            Some(e) => e.is_leader.load(std::sync::atomic::Ordering::Relaxed),
+            None => true, // 无引擎 = 传统单写者模式，恒有职权
+        }
     }
 
     async fn run(mut self) {
@@ -161,11 +211,18 @@ impl Controller {
             match tokio::time::timeout(Duration::from_millis(500), self.rx.recv()).await {
                 Ok(Some(cmd)) => {
                     self.handle(cmd);
-                    // 命令流量可能持续不断（MetaSync 轮询），failover 检查不能只依赖超时分支
-                    self.failover_check();
+                    // 引擎模式：仅 raft leader 行使 failover 职权；
+                    // 传统模式：全员检查（原有行为）
+                    if self.has_engine_authority() {
+                        self.failover_check();
+                    }
                 }
                 Ok(None) => break,
-                Err(_) => self.failover_check(),
+                Err(_) => {
+                    if self.has_engine_authority() {
+                        self.failover_check();
+                    }
+                }
             }
         }
     }
@@ -173,7 +230,11 @@ impl Controller {
     fn handle(&mut self, cmd: ControllerCmd) {
         match cmd {
             ControllerCmd::Register { info, reply } => {
-                self.apply_and_persist(&ClusterRecord::RegisterBroker(info.clone()));
+                if self.engine.is_some() {
+                    let _ = self.apply_via_engine(&ClusterRecord::RegisterBroker(info.clone()));
+                } else {
+                    self.apply_and_persist(&ClusterRecord::RegisterBroker(info.clone()));
+                }
                 // 心跳键 = 本次注册的节点（而非"当前最大 id"——那会键错位）
                 self.last_heartbeat.insert(info.node_id, Instant::now());
                 let _ = reply.send(());
@@ -182,16 +243,27 @@ impl Controller {
                 self.last_heartbeat.insert(node_id, Instant::now());
             }
             ControllerCmd::Sync { version, reply } => {
-                let _ = reply.send(if self.state.version > version {
-                    Some(self.state.encode())
+                // 引擎模式：读引擎 apply 后的状态（版本 = applied index + 状态内 version）
+                let state_snap = match &self.engine {
+                    Some(e) => e.shared.lock().unwrap().clone(),
+                    None => self.state.clone(),
+                };
+                let _ = reply.send(if state_snap.version > version {
+                    Some(state_snap.encode())
                 } else {
                     None
                 });
             }
             ControllerCmd::CreateTopic { name, partitions, rf, reply } => {
                 let exists = self.state.assignments.iter().any(|a| a.topic == name);
-                if !exists {
-                    self.apply_and_persist(&ClusterRecord::CreateTopic { name, partitions, rf });
+                if self.engine.is_some() {
+                    if let Err(m) = self.apply_via_engine(&ClusterRecord::CreateTopic { name: name.clone(), partitions, rf }) {
+                        tracing::error!(topic=%name, error=%m, "CreateTopic raft propose failed");
+                    }
+                } else {
+                    if !exists {
+                        self.apply_and_persist(&ClusterRecord::CreateTopic { name, partitions, rf });
+                    }
                 }
                 let _ = reply.send(());
             }
@@ -213,7 +285,11 @@ impl Controller {
                             leader: to,
                             epoch,
                         };
-                        self.apply_and_persist(&rec);
+                        if self.engine.is_some() {
+                            let _ = self.apply_via_engine(&rec);
+                        } else {
+                            self.apply_and_persist(&rec);
+                        }
                         tracing::info!(topic=%topic, partition, to, epoch, "TRANSFER");
                         Ok(())
                     }
@@ -279,7 +355,11 @@ impl Controller {
                         epoch: a.epoch + 1,
                     };
                     tracing::info!(topic=%a.topic, partition=a.partition, old=a.leader, new=*next, epoch=a.epoch+1, "FAILOVER");
-                    self.apply_and_persist(&rec);
+                    if self.engine.is_some() {
+                        let _ = self.apply_via_engine(&rec);
+                    } else {
+                        self.apply_and_persist(&rec);
+                    }
                 }
             }
         }
@@ -287,7 +367,13 @@ impl Controller {
 }
 
 impl Controller {
-    pub fn open(node_id: i32, log_path: PathBuf, heartbeat_timeout: Duration, rx: mpsc::Receiver<ControllerCmd>) -> Controller {
+    pub fn open(
+        node_id: i32,
+        log_path: PathBuf,
+        heartbeat_timeout: Duration,
+        rx: mpsc::Receiver<ControllerCmd>,
+        engine: Option<crate::ctrl_raft::raftrs_engine::RaftRsHandle>,
+    ) -> Controller {
         // 恢复：重放 record 日志（自定义 record 编解码见 apply_and_persist）
         let mut state = ClusterState::default();
         if let Ok(data) = std::fs::read(&log_path) {
@@ -315,6 +401,7 @@ impl Controller {
             last_heartbeat,
             heartbeat_timeout,
             rx,
+            engine: None,
         }
     }
 

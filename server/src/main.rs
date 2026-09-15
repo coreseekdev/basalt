@@ -88,6 +88,10 @@ async fn async_main(cfg: Config) {
                 std::env::var("BASALT_HEARTBEAT_TIMEOUT_MS").ok().and_then(|v| v.parse().ok()).unwrap_or(1000),
             ),
             engine_handle,
+            // 全体节点内部端口地址（引擎模式 propose 转发用）
+            cfg.nodes.iter()
+                .map(|(id, h, p)| (*id, format!("{h}:{}", p + 1)))
+                .collect(),
         ))
     } else {
         None
@@ -185,6 +189,49 @@ async fn async_main(cfg: Config) {
             // 引擎模式：直接轮询本地 Controller（raft 复制后的状态），
             // 无需网络跳——节点间一致性由 raft 保证
             let local_tx = controller_tx_sync.clone().unwrap();
+            // 自注册：经 raft 复制（非 leader 节点由 controller 转发给 raft leader）。
+            // fire-and-forget：选举窗口内的转发重试不应阻塞心跳/同步循环的启动
+            // （state.brokers 经 MetaSync 轮询最终一致收敛）
+            let reg_tx = local_tx.clone();
+            let reg_cfg = sync_cfg.clone();
+            tokio::spawn(async move {
+                let (txr, rxr) = tokio::sync::oneshot::channel();
+                let _ = reg_tx
+                    .send(internal::ControllerCmd::Register {
+                        info: basalt_metadata::cluster::BrokerInfo {
+                            node_id: reg_cfg.node_id,
+                            host: reg_cfg.host.clone(),
+                            port: reg_cfg.port,
+                        },
+                        reply: txr,
+                    })
+                    .await;
+                let _ = rxr.await;
+            });
+            // 心跳广播到全部 peers（每节点 controller 本地记账，
+            // 仅 raft leader 行使 failover 职权）
+            let hb_ms: u64 = std::env::var("BASALT_HEARTBEAT_MS").ok().and_then(|v| v.parse().ok()).unwrap_or(300);
+            let hb_node = sync_cfg.node_id;
+            let hb_peers: Vec<(i32, String)> = sync_cfg.nodes.iter()
+                .filter(|(id, _, _)| *id != hb_node)
+                .map(|(id, h, p)| (*id, format!("{h}:{}", p + 1)))
+                .collect();
+            let hb_clients: Vec<(i32, internal::InternalClient)> = hb_peers.iter()
+                .map(|(id, addr)| (*id, internal::InternalClient::new(addr.clone())))
+                .collect();
+            tokio::spawn(async move {
+                eprintln!("HB-LOOP node={} peers={:?}", hb_node, hb_peers);
+                loop {
+                    for (pid, pc) in &hb_clients {
+                        if !internal::blocked_peers().contains(pid) {
+                            if let Err(e) = pc.heartbeat(hb_node).await {
+                                eprintln!("HB-ERR node={} to={} err={}", hb_node, pid, e);
+                            }
+                        }
+                    }
+                    tokio::time::sleep(std::time::Duration::from_millis(hb_ms)).await;
+                }
+            });
             let mut last_version = 0u64;
             loop {
                 let (txr, rxr) = tokio::sync::oneshot::channel();
@@ -195,6 +242,9 @@ async fn async_main(cfg: Config) {
                     // Controller::Sync 回复 = state.encode() 纯编码字节（无 marker）
                     if let Some(state) = basalt_metadata::cluster::ClusterState::decode(&data) {
                         if state.version > last_version || state.assignments.len() > 0 {
+                            if state.version != last_version {
+                                eprintln!("SYNC node={} ver={}", sync_cfg.node_id, state.version);
+                            }
                             last_version = state.version;
                             let _ = meta_tx_sync.send(meta::MetaCmd::ApplyCluster(Box::new(state))).await;
                         }

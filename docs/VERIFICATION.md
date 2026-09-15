@@ -185,6 +185,19 @@ torn write: sync 时按概率只落前半块（block 粒度截断）
 | ⑬ | read_ex 首批越窗补读后无条件 break——小 max_bytes 消费者拉大批分区永久空响应活锁（三轮 P1-1 契约被 582b071 窗口化击穿）| 契约击穿（性能改造回归）| 四轮 review agent 差分探针（场景 8 红 / 场景 1-7,9,10 绿自证分辨力）| log_test::read_ex_large_batch_small_max_bytes_returns_batch |
 | ⑭ | batch_io staging 生命周期三处：fast path 直写绕窗、fast path SyncEach 失败零回滚（僵尸滞留）、收口失败 staging 残留（错误结算数据随下窗落盘）| 多缓冲生命周期交互 | 四轮 review agent actor 级探针 | log_test ×2（append 失败按 cp.staged_len 截除、收口失败整体丢弃）+ SimDisk::set_fail_writes 确定性注入机制 |
 | ⑮ | truncate_to 窗口内无条件 clear staged——低于截断点的批未写盘却被按保留结算（ack 成功但数据从未落盘；FollowerPull 严格 await 使其今日不可达，潜伏）| 窗口语义边界（storage/actor 未闭合缺口）| 四轮 review agent log 级探针（含对照组/现状快照防恒真）| log_test::truncate_to_flushes_window_first_keeps_staged_below_offset |
+| ㉒ | Controller::open 构造体硬编码 `engine: None`——引擎句柄参数被丢弃，引擎模式全部 controller 退化为传统单写者（propose 复制/职权门控全失效）| 重构事故（参数丢弃）| e2e 探针（CTRL-LOOP engine=false 一眼定位）| multinode_raftrs.py：引擎模式建题经 raft 复制 + 全节点可见断言 |
+| ㉓ | CreateTopic 在本地 propose 不路由 raft leader——非 leader 节点提案永挂；ProposeRemote 无职权门控时 7.5s 级联阻塞转发方 | 架构接线缺口（ proposer 位置错误）| FWD 探针链（FWD-BEGIN/FWD-ARRIVE）| MSG_CTRL_PROPOSE 转发（encode_record + 1B 应答）+ ProposeRemote 仅 raft leader 受理（非 leader 立即拒绝防级联）|
+| ㉔ | 双重 id 错位：① follower 存 leader_id 残留 raft id（未减 broker+1 偏移）→ 转发指错节点；② leader_id=0 当"未知"哨兵而 broker 0 合法 → "leader 是 node0"被误判未知、propose 永不转发 | 边界值语义错误（哨兵与合法值冲突）| 三节点单测 + HB-LOOP/FWD 探针不对称性 | 哨兵改 -1 + driver 统一减偏移；raftrs 三节点测试断言收敛 |
+| ㉕ | 注册 fire-and-forget 化之前：心跳/同步 daemon 循环串行等待注册完成——转发重试期间（选举窗口 + 转发目标 7.5s 重试）daemon 全停 | 生命周期耦合（关键路径被可重试路径阻塞）| HB-LOOP 探针缺失不对称性 | 注册 spawn 化（state.brokers 经 MetaSync 最终一致收敛）|
+| ㉖ | CreateTopic 非幂等：重复提案 push 重复 assignment（metadata 重试打到不同节点即触发，LeaderChange 只改第一份，failover 后路由仍指向死节点）；且 broker 未注册齐即建题 → rf 被 min 成 1、单副本无 failover 能力 | 状态机幂等缺失 + 初始化时序 | failover e2e 15s 超时 + assignments=4（应 2）异常信号 | cluster.rs apply(CreateTopic) 同名 no-op（早退不 bump version）+ controller rf 守卫（brokers < rf 拒绝，客户端重试）|
+| ㉗ | 无 WAL 重启：MemStorage 空、leader 心跳 commit 越过空日志 → raft-rs commit_to fatal! 杀死驱动线程（节点永不追赶、静默死亡）| 持久化模型与库契约不一致 | 节点日志 panic 行 + TICK-DIAG 停摆 | 快照恢复三元组：state.json + state.meta.json（applied/term，先 state 后 meta 的写序保证）→ apply_snapshot + **cfg.applied 契约**（commit_since_index 初值）+ step/ready 双 catch_unwind 安全网 |
+| ㉘ | hs/entries 持久化块重复执行 → MemStorage 无重叠检查 append → 存储日志重复索引 → slice 定位错乱、committed 条目跳条交付 | 重复副作用（幂等性破坏）| restore 单测逐条 APPLY 序列比对 | 确定性回归锁：**restore_tests::restore_catches_up_missed_entries**（杀节点→多数派续写→快照恢复→逐 assignment 内容比对，3×连跑通过）|
+| ㉙ | **raft-rs 0.7 LightReady 契约漏读**：committed entries 分两批交付（Ready + advance 的 LightReady），驱动只应用 Ready 批——LightReady 批被丢弃（游标照常推进、状态机永久落后，快照恢复节点必现）| 库契约误读（交付面不完整）| PR 探针（ce=0 而 committed/persisted 全 6）+ applied 水位跳变 | process_ready 对 ready 与 light 两批走同一 apply_entries；㉘ 单测锁定 |
+| ㉚ | 跨进程 RaftWire 与进程内 msg_rx 步进路径分裂：RESYNC 预检/catch_unwind/水位跟踪只写在进程内通道——生产路径（TCP wire）三层防护全为死代码；其后 process_ready 重构又丢失 leader_id 原子更新（转发恒 -1）| 传输抽象不一致 + 重构事故（第二次）| FWD-BEGIN=0 不对称性一锤定音 | step_incoming 统一入口（wire 解析后与进程内同路径）+ 引擎 8 场景 e2e 全绿门禁 |
+| ㉛ | leader 侧 Progress.matched 单调不下调（update_committed 契约）——无 WAL 重启节点永远"已被追平"、缺失日志永不重发 | 库状态机与持久化模型不匹配 | probe_meta_split.py 三 broker 元数据比对（分裂且 5s 不收敛）| 心跳响应预检：commit < matched → 下调 matched + become_probe（重发接管）；probe_meta_split.py 转正为永久诊断工具 |
+| ㉜ | 追平门控缺失：重启节点以陈旧快照服务 metadata（p1 leader=自己，真 leader 已 failover）——僵尸 leader 吸收 produce 致 acks=all 停摆 | 新旧权威共存（fencing 缺失）| 同 ㉛ 探针（node 报 leader=1 其余报 2）| engine_state_ready 门控（applied >= leader_commit 水位，无水位=未就绪）：Sync/TransferLeader/CreateTopic 幂等检查统一走门控 |
+| ㉝ | pre-vote 未启用 + 无条件 startup campaign：重启节点以同等日志参选打断在位 leader（disruption 活锁，bounce r0c/r1c 实证）| 选举扰动（thesis §9.6 缺失）| bounce 轮次失败模式聚类 | cfg.pre_vote=true + startup campaign 仅冷启动（重 join 靠 tick election timeout 兜底活性）|
+| ㉞ | bounce 场景重启节点缺 BASALT_CTRL_RAFT_ENGINE（runner inline 传参不 export）——重启节点无 raft 运行时，集群多数派永久缺失 | 测试 harness 环境漂移 | HB-LOOP 探针单侧缺失 | 场景内按 RAFTRS 显式补齐引擎 env；重启节点引擎一致性纳入场景前置检查 |
 
 
 ## 9. 参考

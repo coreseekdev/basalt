@@ -22,6 +22,10 @@ COMMON = {"BASALT_HOST": "localhost", "BASALT_NUM_PARTITIONS": "2",
           "BASALT_RF": "3", "BASALT_METRICS_PORT": "0",
           "BASALT_NODES": "0=localhost:9092,1=localhost:9102,2=localhost:9112",
           "BASALT_LOG_LEVEL": "warn"}
+# 引擎模式：重启的节点必须带同一引擎（runner 是 inline 传参不 export，
+# 这里按 RAFTRS 显式补齐，否则重启节点无 raft 运行时=多数派永久缺失）
+if os.environ.get("RAFTRS") in ("1", "raftrs"):
+    COMMON["BASALT_CTRL_RAFT_ENGINE"] = "raftrs"
 
 ROUNDS = [(1, "hard"), (2, "hard"), (1, "clean"), (2, "clean"),
           (2, "hard"), (1, "clean")]

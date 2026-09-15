@@ -42,6 +42,13 @@ impl ClusterState {
                 self.brokers.insert(b.node_id, b.clone());
             }
             ClusterRecord::CreateTopic { name, partitions, rf } => {
+                // 幂等：同名 topic 已存在则整体 no-op（metadata 重试打到不同
+                // 节点会产生重复 CreateTopic 记录；重复 push 使同一分区存在
+                // 多份 assignment，LeaderChange 只改第一份，metadata 可能
+                // 路由到已失效副本）。提前 return 不 bump version。
+                if self.assignments.iter().any(|a| a.topic == *name) {
+                    return;
+                }
                 let mut brokers: Vec<i32> = self.brokers.keys().copied().collect();
                 brokers.sort_unstable();
                 if brokers.is_empty() {

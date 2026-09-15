@@ -22,6 +22,8 @@ pub const MSG_FETCH_SLICE: u8 = 5;
 pub const MSG_TRANSFER: u8 = 6;
 /// raft 引擎 wire 帧（prost/protobuf 编码的 raft::eraftpb::Message）
 pub const MSG_RAFT: u8 = 7;
+/// 引擎模式 propose 转发：payload = encode_record(rec)；应答 1B 状态（1=ok）
+pub const MSG_CTRL_PROPOSE: u8 = 8;
 
 /// 分区注入（T-M2.5）：本节点拒绝与之通信的对端集合（双向断边）。
 /// BASALT_BLOCK_PEERS="1,2" —— 心跳/元数据/FetchSlice 全部断开。
@@ -132,6 +134,9 @@ pub enum ControllerCmd {
     Sync { version: u64, reply: oneshot::Sender<Option<Vec<u8>>> },
     CreateTopic { name: String, partitions: i32, rf: i32, reply: oneshot::Sender<()> },
     ApplySnapshot { state: ClusterState },
+    /// 引擎模式跨节点 propose 转发（MSG_CTRL_PROPOSE 落地）：本节点为 raft
+    /// leader 时本地 propose，否则返回错误（转发方重试）
+    ProposeRemote { rec: ClusterRecord, reply: oneshot::Sender<Result<(), String>> },
     /// 计划内交接（M2 L1：目标为副本成员，epoch+1 走 LeaderChange——
     /// 数据已在副本集内同步，交接窗口 = 元数据广播周期，无数据迁移）
     TransferLeader { topic: String, partition: i32, to: i32, reply: oneshot::Sender<Result<(), String>> },
@@ -149,6 +154,9 @@ pub struct Controller {
     /// ADR-15/16：raft 引擎运行时（BASALT_CTRL_RAFT_ENGINE=raftrs 时启用）。
     /// 启用后元数据变更经 raft propose 复制；本 actor 仅在 raft leader 上行使职权。
     pub engine: Option<crate::ctrl_raft::raftrs_engine::RaftRsHandle>,
+    /// 全体节点内部端口地址（broker_id → "host:internal_port"），
+    /// 引擎模式下 propose 转发给 raft leader 用。
+    pub peers: HashMap<i32, String>,
 }
 
 impl Controller {
@@ -157,9 +165,10 @@ impl Controller {
         log_path: PathBuf,
         heartbeat_timeout: Duration,
         engine: Option<crate::ctrl_raft::raftrs_engine::RaftRsHandle>,
+        peers: Vec<(i32, String)>,
     ) -> mpsc::Sender<ControllerCmd> {
         let (tx, rx) = mpsc::channel(256);
-        let ctrl = Controller::open(node_id, log_path, heartbeat_timeout, rx, engine);
+        let ctrl = Controller::open(node_id, log_path, heartbeat_timeout, rx, engine, peers);
         tokio::spawn(ctrl.run());
         tx
     }
@@ -186,7 +195,26 @@ impl Controller {
                     return Ok(());
                 }
                 Err(m) if m.contains("not leader") => {
-                    std::thread::sleep(Duration::from_millis(150));
+                    // 非 leader：经内部 RPC 把记录转发给当前 raft leader
+                    // （leader = -1 即选举中，原地等待下一轮；broker 0 合法）
+                    let leader = engine.leader_id.load(std::sync::atomic::Ordering::Relaxed);
+                    if leader >= 0 && leader != self.node_id {
+                        match self.forward_propose(rec, leader) {
+                            Ok(()) => {
+                                // leader 已 propose 成功；等本地 apply（复制回来）
+                                std::thread::sleep(Duration::from_millis(50));
+                                return Ok(());
+                            }
+                            Err(m) => {
+                                // 转发目标瞬态失败（对端选举中/未就绪）——可重试，
+                                // 不能硬返回（否则注册类变更在启动窗口永久丢失）
+                                eprintln!("FWD node={} to={} err={}", self.node_id, leader, m);
+                                std::thread::sleep(Duration::from_millis(150));
+                            }
+                        }
+                    } else {
+                        std::thread::sleep(Duration::from_millis(150));
+                    }
                 }
                 Err(m) => return Err(m),
             }
@@ -194,9 +222,67 @@ impl Controller {
         Err("raft proposal timeout".into())
     }
 
+    /// 引擎模式 propose 转发：阻塞式内部 RPC（MSG_CTRL_PROPOSE）发往
+    /// raft leader 节点，由其 controller 本地 propose（它是 leader，必成功）。
+    fn forward_propose(&self, rec: &ClusterRecord, leader: i32) -> Result<(), String> {
+        let Some(addr) = self.peers.get(&leader) else {
+            return Err(format!("no peer addr for leader {leader}"));
+        };
+        eprintln!("FWD-BEGIN node={} -> leader={}", self.node_id, leader);
+        let payload = encode_record(rec);
+        let mut frame = ((payload.len() + 1) as u32).to_be_bytes().to_vec();
+        frame.push(MSG_CTRL_PROPOSE);
+        frame.extend_from_slice(&payload);
+        let addrs: Vec<_> = std::net::ToSocketAddrs::to_socket_addrs(addr.as_str())
+            .map(|i| i.collect())
+            .unwrap_or_default();
+        for sa in addrs {
+            if let Ok(mut sock) =
+                std::net::TcpStream::connect_timeout(&sa, Duration::from_millis(500))
+            {
+                sock.set_write_timeout(Some(Duration::from_millis(500))).ok();
+                sock.set_read_timeout(Some(Duration::from_millis(3000))).ok();
+                use std::io::{Read, Write};
+                if sock.write_all(&frame).is_ok() {
+                    let mut len_buf = [0u8; 4];
+                    if sock.read_exact(&mut len_buf).is_ok() {
+                        let n = u32::from_be_bytes(len_buf) as usize;
+                        let mut buf = vec![0u8; n];
+                        if sock.read_exact(&mut buf).is_ok()
+                            && !buf.is_empty()
+                            && buf[0] == 1
+                        {
+                            return Ok(());
+                        }
+                        return Err("leader rejected propose".into());
+                    }
+                }
+            }
+            break;
+        }
+        Err("leader unreachable".into())
+    }
+
     /// 引擎模式下的变更入口：propose 复制；本地 state 由引擎 apply 同步。
     fn apply_via_engine(&mut self, rec: &ClusterRecord) -> Result<(), String> {
         self.engine_propose(rec)
+    }
+
+    /// 引擎状态是否可对外服务：日志已追平（applied >= 最近已知 leader
+    /// commit 水位）。无 leader 水位（0 = 未见任何心跳/尚未当选）时视为
+    /// 未就绪——冷启动节点在当选/收到心跳前不服务陈旧/空状态
+    fn engine_state_ready(&self) -> bool {
+        match &self.engine {
+            None => true,
+            Some(e) => {
+                let lc = e.leader_commit.load(std::sync::atomic::Ordering::Relaxed);
+                if lc == 0 {
+                    // 冷启动：尚未当选也未见任何 leader 心跳——无从证明状态新鲜
+                    return false;
+                }
+                e.applied_index() >= lc
+            }
+        }
     }
 
     /// 引擎模式下本节点是否raft leader（failover/提案职权判定）。
@@ -208,6 +294,7 @@ impl Controller {
     }
 
     async fn run(mut self) {
+        eprintln!("CTRL-LOOP node={} engine={} start", self.node_id, self.engine.is_some());
         loop {
             match tokio::time::timeout(Duration::from_millis(500), self.rx.recv()).await {
                 Ok(Some(cmd)) => {
@@ -229,6 +316,17 @@ impl Controller {
     }
 
     fn handle(&mut self, cmd: ControllerCmd) {
+        // 引擎模式：所有 handler 统一读引擎 apply 后的状态（TransferLeader
+        // 资格校验 / CreateTopic 幂等检查都依赖最新 assignment）。
+        // 未追平时预加载快照不可信，按空态处理
+        if self.engine.is_some() {
+            if self.engine_state_ready() {
+                let e = self.engine.as_ref().unwrap();
+                self.state = e.shared.lock().unwrap().clone();
+            } else {
+                self.state = ClusterState::default();
+            }
+        }
         match cmd {
             ControllerCmd::Register { info, reply } => {
                 if self.engine.is_some() {
@@ -244,9 +342,18 @@ impl Controller {
                 self.last_heartbeat.insert(node_id, Instant::now());
             }
             ControllerCmd::Sync { version, reply } => {
-                // 引擎模式：读引擎 apply 后的状态（raft 复制的一致性快照）
+                // 引擎模式：读引擎 apply 后的状态（raft 复制的一致性快照）。
+                // 追平门控：applied < leader commit 水位 = 日志还在追赶，
+                // 服务陈旧快照会形成僵尸 leader——返回 None 让调用方按
+                // "无更新"处理，客户端重试其他节点
                 let state_snap = match &self.engine {
-                    Some(e) => e.shared.lock().unwrap().clone(),
+                    Some(e) => {
+                        if !self.engine_state_ready() {
+                            let _ = reply.send(None);
+                            return;
+                        }
+                        e.shared.lock().unwrap().clone()
+                    }
                     None => self.state.clone(),
                 };
                 let _ = reply.send(if state_snap.version > version || state_snap.assignments.len() > 0 {
@@ -256,7 +363,15 @@ impl Controller {
                 });
             }
             ControllerCmd::CreateTopic { name, partitions, rf, reply } => {
+                eprintln!("CTRL-CREATE node={} name={}", self.node_id, name);
                 let exists = self.state.assignments.iter().any(|a| a.topic == name);
+                // rf 守卫：broker 未注册齐就建题会按不完整集群算副本
+                // （apply 里 rf 被 min 到 broker 数）——拒绝本次，metadata
+                // 不含该 topic，客户端重试时集群视图已齐
+                if (self.state.brokers.len() as i32) < rf {
+                    let _ = reply.send(());
+                    return;
+                }
                 if self.engine.is_some() {
                     if let Err(m) = self.apply_via_engine(&ClusterRecord::CreateTopic { name: name.clone(), partitions, rf }) {
                         tracing::error!(topic=%name, error=%m, "CreateTopic raft propose failed");
@@ -270,6 +385,16 @@ impl Controller {
             }
             ControllerCmd::ApplySnapshot { state } => {
                 self.state = state;
+            }
+            ControllerCmd::ProposeRemote { rec, reply } => {
+                // 仅 raft leader 受理转发提案；非 leader 立即拒绝——
+                // 否则转发方每轮等待本节点完整重试周期（7.5s）造成级联阻塞
+                let r = if self.has_engine_authority() {
+                    self.apply_via_engine(&rec)
+                } else {
+                    Err("not leader (remote reject)".into())
+                };
+                let _ = reply.send(r);
             }
             ControllerCmd::TransferLeader { topic, partition, to, reply } => {
                 // 先按不可变借用校验资格，再取独立信息调用 apply_and_persist
@@ -294,8 +419,20 @@ impl Controller {
                         tracing::info!(topic=%topic, partition, to, epoch, "TRANSFER");
                         Ok(())
                     }
-                    Some(_) => Err("transfer target not eligible".into()),
-                    None => Err("assignment not found".into()),
+                    Some(a) => {
+                        eprintln!(
+                            "TRANSFER-REJECT node={} topic={} to={} leader={} replicas={:?} alive={}",
+                            self.node_id, topic, to, a.leader, a.replicas, alive
+                        );
+                        Err("transfer target not eligible".into())
+                    }
+                    None => {
+                        eprintln!(
+                            "TRANSFER-MISS node={} topic={} assignments={}",
+                            self.node_id, topic, self.state.assignments.len()
+                        );
+                        Err("assignment not found".into())
+                    }
                 };
                 let _ = reply.send(r);
             }
@@ -386,6 +523,7 @@ impl Controller {
         heartbeat_timeout: Duration,
         rx: mpsc::Receiver<ControllerCmd>,
         engine: Option<crate::ctrl_raft::raftrs_engine::RaftRsHandle>,
+        peers: Vec<(i32, String)>,
     ) -> Controller {
         // 恢复：重放 record 日志（自定义 record 编解码见 apply_and_persist）
         let mut state = ClusterState::default();
@@ -414,7 +552,8 @@ impl Controller {
             last_heartbeat,
             heartbeat_timeout,
             rx,
-            engine: None,
+            engine,
+            peers: peers.into_iter().collect(),
         }
     }
 
@@ -549,6 +688,9 @@ async fn handle_internal_conn(
 
         let resp: Bytes = match msg_type {
             MSG_REGISTER => {
+                static N: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+                let n = N.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                eprintln!("INT-REG node={} n={}", ctx.node_id, n);
                 let Ok((node_id, host, port)) = parse_register(payload) else {
                     sock.write_all(&short_frame()).await?;
                     return Ok(());
@@ -564,6 +706,11 @@ async fn handle_internal_conn(
                 Bytes::new()
             }
             MSG_HEARTBEAT => {
+                static N: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+                let n = N.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                if n % 20 == 0 {
+                    eprintln!("INT-HB node={} n={}", ctx.node_id, n);
+                }
                 if payload.len() < 4 {
                     sock.write_all(&short_frame()).await?;
                     return Ok(());
@@ -624,6 +771,25 @@ async fn handle_internal_conn(
                     crate::ctrl_raft::raftrs_engine::deliver_wire(payload.to_vec());
                 }
                 Bytes::new()
+            }
+            MSG_CTRL_PROPOSE => {
+                // 引擎模式 propose 转发落地：解码记录交本节点 controller propose
+                eprintln!("FWD-ARRIVE node={} payload_len={}", ctx.node_id, payload.len());
+                let ok = match decode_record(payload) {
+                    Some(rec) => {
+                        if let Some(tx) = &ctx.controller_tx {
+                            let (txr, rxr) = tokio::sync::oneshot::channel();
+                            let _ = tx
+                                .send(ControllerCmd::ProposeRemote { rec, reply: txr })
+                                .await;
+                            rxr.await.is_ok()
+                        } else {
+                            false
+                        }
+                    }
+                    None => false,
+                };
+                Bytes::from(vec![if ok { 1 } else { 0 }])
             }
             MSG_CREATE_TOPIC => {
                 let Ok((name, partitions, rf)) = parse_create(payload) else {
@@ -779,7 +945,7 @@ mod failover_tests {
         let dir = std::env::temp_dir().join(format!("ctrl-test-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         let log = dir.join("ctrl.log");
-        let mut ctrl = Controller::open(0, log.clone(), Duration::from_millis(4000), rx, None);
+        let mut ctrl = Controller::open(0, log.clone(), Duration::from_millis(4000), rx, None, Vec::new());
         for i in 0..3 {
             ctrl.apply_and_persist(&ClusterRecord::RegisterBroker(BrokerInfo {
                 node_id: i, host: "h".into(), port: 9000 + i as u16,

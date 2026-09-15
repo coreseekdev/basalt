@@ -64,3 +64,23 @@ pub trait CtrlRaftEngine: Send {
 两引擎共享同一验收测试形态（内嵌三节点、通道网络）：
 选举 → propose ×N → 多数派收敛 → 杀 leader → 选举/续写 → 存储重放/快照恢复。
 断言口径一致，使引擎可横向比较。
+
+## 5. 实施状态（2026-09-15 更新）
+
+- **raftrs 引擎 runtime 三进程 e2e 8/8 全绿**：raftrs / failover（kill -9 leader
+  60/60 零丢失）/ transfer（交接窗口 <1.5s）/ partition / replay / l1（failover
+  <2s）/ **bounce（6 轮 churn 零丢失）** / ctrl_kill（控制器 kill +1786ms 恢复
+  acks=all，36/36 零丢失）。默认模式 6 场景回归全绿（ctrl_kill 为引擎专属）。
+- **raft-rs 0.7 集成要点**（踩坑记录，缺陷账本 ㉒-㉞ 全记录）：
+  - Ready/LightReady 两批 committed entries 交付契约——LightReady 批必须应用；
+  - 快照恢复必须 `cfg.applied`（commit_since_index 初值）+ MemStorage
+    apply_snapshot，否则 leader 心跳 commit 越过空日志触发 commit_to fatal!；
+  - `raft.leader_id` 是 raft id（=broker+1），对外统一 broker id 需减回；
+    "未知"哨兵用 -1（broker 0 合法）；
+  - Progress.matched 单调不下调——无 WAL 重启节点需心跳响应预检手动下调 +
+    become_probe，否则缺失日志永不重发；
+  - pre-vote 必开；重 join 节点不做 startup campaign（防 disruption）；
+  - hs/entries 只 persist 一次（MemStorage::append 无重叠检查）。
+- **已知边界**（POC 接受）：raft 日志无 WAL（快照恢复点之后靠重放追赶）；
+  追平前节点不服务元数据（engine_state_ready 门控）；冷节点加入运行中集群
+  未测（所有场景同为冷启动）。

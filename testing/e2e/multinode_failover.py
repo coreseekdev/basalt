@@ -11,7 +11,7 @@ PID_DIR = os.environ.get("PID_DIR", "/tmp/basalt-multinode-pids")
 
 def main():
     # 阶段 1: auto-create + metadata 传播等待 + 40 条 acks=all
-    producer = KafkaProducer(bootstrap_servers=B, acks=-1,
+    producer = KafkaProducer(bootstrap_servers=B, acks=-1, retries=5,
                              request_timeout_ms=15000, max_block_ms=15000)
     producer.partitions_for(TOPIC)
     time.sleep(1)  # 等 metadata 传播到全 broker
@@ -30,7 +30,7 @@ def main():
 
     # 阶段 3: 只用存活节点 post-failover 生产 + 全量读回
     B_alive = ["localhost:9092", "localhost:9112"]
-    producer = KafkaProducer(bootstrap_servers=B_alive, acks=-1,
+    producer = KafkaProducer(bootstrap_servers=B_alive, acks=-1, retries=5,
                              request_timeout_ms=15000, max_block_ms=15000)
     for i in range(40, 60):
         producer.send(TOPIC, value=f"k-{i}".encode(), partition=i % 2).get(timeout=15)

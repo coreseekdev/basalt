@@ -109,6 +109,12 @@ struct ParkedAck {
     log_append_time: i64,
     reply: oneshot::Sender<ProduceOutcome>,
     deadline: Instant,
+    /// 冻结提交面（账本 ㉟）：append 时的 fresh follower 集合。
+    /// 放行要求面内全部成员的已知 LEO ≥ last_offset+1——此后 fresh
+    /// 集合收缩（laggard 上报过期）不再使 HW 越权放行；面内成员未追平
+    /// 就一直等到超时回 NotEnoughReplicas（可重试，客户端重试落到
+    /// failover 后的新 leader——与 Kafka acks=all 语义一致）
+    face: Vec<i32>,
 }
 
 pub struct PartitionActor {
@@ -378,6 +384,7 @@ impl PartitionActor {
                             log_append_time: outcome.log_append_time,
                             reply,
                             deadline: Instant::now() + Duration::from_secs(10),
+                            face: self.fresh_followers(),
                         });
                         self.advance_hw();
                         self.release_acks();
@@ -535,10 +542,14 @@ impl PartitionActor {
     fn release_acks(&mut self) {
         let mut i = 0;
         while i < self.parked_acks.len() {
-            if std::env::var("BASALT_LEO_PROBE").is_ok() && self.parked_acks[i].last_offset >= 18 {
-                eprintln!("ACK-RELEASE? t={} p={} last={} hw={}", self.name, self.index, self.parked_acks[i].last_offset, self.log.high_watermark);
-            }
-            if self.parked_acks[i].last_offset < self.log.high_watermark {
+            // 冻结提交面放行（账本 ㉟）：面内全部成员的最后已知 LEO 追平
+            // 才放行——不要求成员仍 fresh（上报过期 ≠ 数据消失）；
+            // HW 自身仍按 fresh min 服务读路径，但不再是 ack 放行依据
+            let need = self.parked_acks[i].last_offset + 1;
+            let covered = self.parked_acks[i].face.iter().all(|f| {
+                self.follower_leos.get(f).map(|(leo, _)| *leo >= need).unwrap_or(false)
+            });
+            if covered {
                 let p = self.parked_acks.remove(i);
                 let _ = p.reply.send(ProduceOutcome {
                     base_offset: p.base_offset,
@@ -784,6 +795,94 @@ mod truncate_fencing_tests {
         let (ltx, lrx) = oneshot::channel();
         tx.send(PartitionCmd::LocalLeo { reply: ltx }).await.unwrap();
         assert_eq!(lrx.await.unwrap(), 2);
+
+        drop(tx);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+}
+
+
+#[cfg(test)]
+mod frozen_face_tests {
+    //! 账本 ㉟ 回归：parked ack 放行 = 冻结提交面全员追平。
+    //! 缺陷形态：放行只看 HW（fresh-only min）——laggard 上报过期即被
+    //! 跳过，HW 越权放行；failover 选中该副本即丢已 ack 消息。
+
+    use super::*;
+    use basalt_record::{encode_batch, Rec};
+    use basalt_storage::log::{FsyncSchedule, LogOptions};
+    use bytes::{Bytes, BytesMut};
+
+    fn batch_bytes(tag: &str) -> Bytes {
+        let recs: Vec<Rec> = (0..1)
+            .map(|i| Rec {
+                timestamp_delta: i as i64,
+                key: Some(Bytes::from(format!("k{i}"))),
+                value: Some(Bytes::from(format!("{tag}-{i}"))),
+                headers: vec![],
+            })
+            .collect();
+        let mut b = BytesMut::new();
+        encode_batch(0, 0, 1000, 0, -1, -1, -1, &recs, &mut b);
+        b.freeze()
+    }
+
+    #[tokio::test]
+    async fn parked_ack_waits_for_full_frozen_face() {
+        let dir = std::env::temp_dir().join(format!(
+            "basalt-frozenface-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let pool = std::sync::Arc::new(BufferPool::new());
+        let tx = PartitionActor::spawn(
+            "ff".into(),
+            0,
+            0,
+            dir.clone(),
+            LogOptions { segment_max_bytes: 1 << 30, fsync: FsyncSchedule::Os, retention_ms: 0, retention_max_bytes: 0 },
+            ReplicaConfig { min_insync: 1, isr_lag: Duration::from_millis(500) },
+            pool,
+        )
+        .unwrap();
+
+        tx.send(PartitionCmd::SetRole { leader: true, epoch: 1, replicas: vec![0, 1, 2] }).await.unwrap();
+
+        // follower 上报：f1 追平（LEO=0→尚无数据）、f2 落后（LEO=0）
+        for (fid, off) in [(1i32, 0i64), (2i32, 0i64)] {
+            let (rtx, rrx) = oneshot::channel();
+            tx.send(PartitionCmd::FetchSlice { follower: fid, offset: off, max_bytes: 1024, reply: rtx }).await.unwrap();
+            let _ = rrx.await.unwrap();
+        }
+
+        // produce acks=-1 → park，face = {1, 2}
+        let (ptx, mut prx) = oneshot::channel();
+        tx.send(PartitionCmd::Produce {
+            batches: batch_bytes("m0"),
+            policy: AssignPolicy::Assign,
+            acks: -1,
+            reply: ptx,
+        })
+        .await
+        .unwrap();
+
+        // f1 追平到 LEO=1（offset 0 已拉取）；f2 仍停在 0
+        let (rtx, rrx) = oneshot::channel();
+        tx.send(PartitionCmd::FetchSlice { follower: 1, offset: 1, max_bytes: 1024, reply: rtx }).await.unwrap();
+        let _ = rrx.await.unwrap();
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert!(prx.try_recv().is_err(), "面内 f2 未追平不得放行（㉟ 冻结面）");
+
+        // f2 追平 → 冻结面全员覆盖 → 放行
+        let (rtx, rrx) = oneshot::channel();
+        tx.send(PartitionCmd::FetchSlice { follower: 2, offset: 1, max_bytes: 1024, reply: rtx }).await.unwrap();
+        let _ = rrx.await.unwrap();
+        let o = tokio::time::timeout(Duration::from_secs(2), prx).await
+            .expect("冻结面追平后应放行")
+            .unwrap();
+        assert!(o.error.is_none(), "{:?}", o.error);
+        assert_eq!(o.last_offset, 0);
 
         drop(tx);
         let _ = std::fs::remove_dir_all(&dir);

@@ -175,12 +175,35 @@ async fn async_main(cfg: Config) {
     let meta_tx_sync = meta_tx.clone();
     let controller_tx_sync = controller_tx.clone();
     tokio::spawn(async move {
+        let engine_mode = crate::ctrl_raft::raftrs_engine::engine_enabled();
         let ctrl = controller_peer(&sync_cfg);
         let Some((ctrl_id, ctrl_host, ctrl_port)) = ctrl else { return };
         let ctrl_addr = format!("{ctrl_host}:{}", ctrl_port + 1);
         let client = internal::InternalClient::new(ctrl_addr.clone());
 
-        if sync_cfg.node_id != ctrl_id {
+        if engine_mode {
+            // 引擎模式：直接轮询本地 Controller（raft 复制后的状态），
+            // 无需网络跳——节点间一致性由 raft 保证
+            let local_tx = controller_tx_sync.clone().unwrap();
+            let mut last_version = 0u64;
+            loop {
+                let (txr, rxr) = tokio::sync::oneshot::channel();
+                if local_tx.send(internal::ControllerCmd::Sync { version: last_version, reply: txr }).await.is_err() {
+                    break;
+                }
+                if let Ok(Some(data)) = rxr.await {
+                    if data.len() > 1 {
+                        if let Some(state) = basalt_metadata::cluster::ClusterState::decode(&data[1..]) {
+                            if state.version > last_version {
+                                last_version = state.version;
+                                let _ = meta_tx_sync.send(meta::MetaCmd::ApplyCluster(Box::new(state))).await;
+                            }
+                        }
+                    }
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+            }
+        } else if sync_cfg.node_id != ctrl_id {
             // 注册（非控制器节点 → 静态控制器）
             let _ = client.register(sync_cfg.node_id, &sync_cfg.host, sync_cfg.port).await;
             // 心跳：传统模式发静态控制器；引擎模式向全部 peers 广播

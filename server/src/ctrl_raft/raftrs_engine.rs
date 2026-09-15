@@ -100,6 +100,20 @@ impl RaftRsRouter {
     }
 
     fn route(&self, to: i32, msg: Message) {
+        // 跨进程：TCP（MSG_RAFT wire——protobuf 编码后经内部端口发送）
+        if let Some(addr) = self.tcp_peers.lock().unwrap().get(&to) {
+            if let Ok(bytes) = protobuf::Message::write_to_bytes(&msg) {
+                if let Ok(mut sock) = std::net::TcpStream::connect(addr.as_str()) {
+                    use std::io::Write;
+                    let mut f = ((bytes.len() + 1) as u32).to_be_bytes().to_vec();
+                    f.push(crate::internal::MSG_RAFT);
+                    f.extend_from_slice(&bytes);
+                    sock.write_all(&f).ok();
+                }
+            }
+            return;
+        }
+        // 进程内：通道
         if let Some(tx) = self.inner.lock().unwrap().get(&to).cloned() {
             let _ = tx.send(msg);
         }
@@ -169,9 +183,20 @@ fn driver(
         }
 
         // tick 节拍（50ms）
-        if last_tick.elapsed() >= Duration::from_millis(50) {
+        let do_tick = last_tick.elapsed() >= Duration::from_millis(50);
+        if do_tick {
             node.tick();
             last_tick = Instant::now();
+        }
+        // 每 10 次循环打印一次 raft 状态摘要（诊断）
+        {
+            let term = node.raft.term;
+            let role = node.raft.state;
+            let leader = node.raft.leader_id;
+            let msgs_len = node.raft.msgs.len();
+            if id == 1 {
+                eprintln!("TICK id={id} term={term} role={role:?} leader={leader} msgs_len={msgs_len}");
+            }
         }
 
         // leader 才能提交命令；follower 直接拒绝（调用方重试路由到新主）

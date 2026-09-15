@@ -191,6 +191,16 @@ fn driver(
         }
 
         let mut ready = node.ready();
+        {
+            let n_msgs = ready.messages().len();
+            let n_persisted = ready.persisted_messages().len();
+            let n_entries = ready.entries().len();
+            let n_committed = ready.committed_entries().len();
+            if id == 1 && n_msgs + n_persisted + n_entries + n_committed > 0 {
+                eprintln!("DRIVER id={} term={} role={:?} msgs={} persisted={} entries={} committed={}",
+                    id, node.raft.term, node.raft.state, n_msgs, n_persisted, n_entries, n_committed);
+            }
+        }
         if !ready.messages().is_empty() || !ready.entries().is_empty() {
         }
 

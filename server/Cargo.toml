@@ -26,7 +26,9 @@ basalt-record = { path = "../record" }
 basalt-storage = { path = "../storage" }
 basalt-metadata = { path = "../metadata" }
 basalt-coordinator = { path = "../coordinator" }
-raft = "0.7"
+raft = { version = "0.7", features = ["protobuf-codec"] }
+raft-proto = { version = "0.7", features = ["protobuf-codec"] }
+protobuf = "2"
 slog = "2"
 
 [lints]

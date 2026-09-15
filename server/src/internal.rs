@@ -20,6 +20,8 @@ pub const MSG_META_SYNC: u8 = 3;
 pub const MSG_CREATE_TOPIC: u8 = 4;
 pub const MSG_FETCH_SLICE: u8 = 5;
 pub const MSG_TRANSFER: u8 = 6;
+/// raft 引擎 wire 帧（prost/protobuf 编码的 raft::eraftpb::Message）
+pub const MSG_RAFT: u8 = 7;
 
 /// 分区注入（T-M2.5）：本节点拒绝与之通信的对端集合（双向断边）。
 /// BASALT_BLOCK_PEERS="1,2" —— 心跳/元数据/FetchSlice 全部断开。
@@ -514,6 +516,19 @@ async fn handle_internal_conn(
                     Err("not controller".into())
                 };
                 Bytes::from(r.map(|_| 0i16).unwrap_or(-1i16).to_be_bytes().to_vec())
+            }
+            MSG_RAFT => {
+                // payload: u32 len + protobuf Message —— 投递给本节点 raft 引擎
+                if payload.len() < 4 {
+                    sock.write_all(&short_frame()).await?;
+                    return Ok(());
+                }
+                let (len_bytes, frame) = payload.split_at(4);
+                let _len = u32::from_be_bytes(len_bytes.try_into().unwrap()) as usize;
+                if crate::ctrl_raft::raftrs_engine::engine_enabled() {
+                    crate::ctrl_raft::raftrs_engine::deliver_wire(frame.to_vec());
+                }
+                Bytes::new()
             }
             MSG_CREATE_TOPIC => {
                 let Ok((name, partitions, rf)) = parse_create(payload) else {

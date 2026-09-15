@@ -26,7 +26,29 @@ fn logger() -> slog::Logger {
 pub enum EngineCmd {
     Propose(ClusterRecord, mpsc::Sender<Result<(), String>>),
     TriggerElect,
+    /// 跨进程 MSG_RAFT：对端引擎的 raft 消息（prost 编码）
+    RaftWire(Vec<u8>),
     Stop(mpsc::Sender<()>),
+}
+
+/// 本节点引擎的命令通道注册表（internal RPC MSG_RAFT 处理器经此投递）。
+pub fn engine_cmd_tx() -> &'static std::sync::OnceLock<mpsc::Sender<EngineCmd>> {
+    static TX: std::sync::OnceLock<mpsc::Sender<EngineCmd>> = std::sync::OnceLock::new();
+    &TX
+}
+
+/// MSG_RAFT wire 帧投递入口（internal.rs 调用）。
+pub fn deliver_wire(bytes: Vec<u8>) {
+    if let Some(tx) = engine_cmd_tx().get() {
+        let _ = tx.send(EngineCmd::RaftWire(bytes));
+    }
+}
+
+/// 引擎是否启用（BASALT_CTRL_RAFT_ENGINE=raftrs）。
+pub fn engine_enabled() -> bool {
+    std::env::var("BASALT_CTRL_RAFT_ENGINE")
+        .map(|v| v == "raftrs")
+        .unwrap_or(false)
 }
 
 /// 共享句柄（调用面）：propose / 触发选举 / 只读状态克隆。
@@ -99,6 +121,12 @@ fn driver(
             match cmd_rx.try_recv() {
                 Ok(EngineCmd::TriggerElect) => {
                     let _ = node.campaign();
+                }
+                Ok(EngineCmd::RaftWire(bytes)) => {
+                    // protobuf-codec 原生编解码（raft-proto Message）
+                    if let Ok(msg) = protobuf::Message::parse_from_bytes(&bytes) {
+                        let _ = node.step(msg);
+                    }
                 }
                 Ok(EngineCmd::Propose(rec, reply)) => pending.push((rec, reply)),
                 Ok(EngineCmd::Stop(ack)) => {
@@ -228,6 +256,7 @@ fn driver(
 /// 启动引擎驱动线程。返回共享句柄（router 由调用方统一装配三节点）。
 pub fn spawn(id: i32, peers: Vec<i32>, router: RaftRsRouter) -> RaftRsHandle {
     let (cmd_tx, cmd_rx) = mpsc::channel();
+    let _ = engine_cmd_tx().set(cmd_tx.clone());
     let (msg_tx, msg_rx) = mpsc::channel();
     let shared = Arc::new(Mutex::new(ClusterState::default()));
     let shared_clone = shared.clone();

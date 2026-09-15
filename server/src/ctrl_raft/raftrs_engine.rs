@@ -335,7 +335,7 @@ pub fn spawn_with_dir(id: i32, peers: Vec<i32>, router: RaftRsRouter, dir: PathB
             voters: raft_peers.iter().map(|x| *x as u64).collect(),
             ..Default::default()
         });
-        let node = RawNode::new(&cfg, mem_store, &logger()).unwrap();
+        let mut node = RawNode::new(&cfg, mem_store, &logger()).unwrap();
 
         // 启动选举触发：raft-rs 0.7 的 tick_election 依赖 promotable
         // （初始 ConfState 投票者自动满足），但首次 tick 前需显式触发

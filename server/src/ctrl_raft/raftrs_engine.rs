@@ -292,7 +292,8 @@ pub fn spawn_with_dir(id: i32, peers: Vec<i32>, router: RaftRsRouter, dir: PathB
     std::thread::spawn(move || {
         let mut cfg = Config::new(raft_id as u64);
         cfg.heartbeat_tick = 2;
-        cfg.election_tick = 10;
+        // election_tick 保持默认（ raft-rs 内部随机化 election_timeout =
+        // rand(election_tick, 2 * election_tick)），不同节点自然去同步
         cfg.validate().unwrap();
 
         let mem_store = MemStorage::new();

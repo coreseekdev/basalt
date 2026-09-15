@@ -434,8 +434,12 @@ impl PartitionActor {
                 }
                 PartitionCmd::FetchSlice { follower, offset, max_bytes, reply } => {
                     crate::partition::metrics().fetch_requests.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                    // fencing：仅 leader 服务复制拉取
-                    if self.role != Role::Leader {
+                    // fencing：leader 服务常规复制拉取；副本集内成员互为
+                    // 就任拉齐（reconciliation，㉟）来源——新主升任与源副本
+                    // 角色翻转存在竞态，拉齐请求落在翻转后时源仍须可服务
+                    // （FetchSlice 是内部协议，外部消费者走 Fetch 不受影响）
+                    let peer_reconcile = self.replicas.contains(&follower);
+                    if self.role != Role::Leader && !peer_reconcile {
                         let _ = reply.send(SliceOutcome {
                             error: Some(StorageError::NotLeader),
                             high_watermark: -1, next_offset: -1, data: Bytes::new(),

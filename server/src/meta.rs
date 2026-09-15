@@ -19,6 +19,8 @@ pub struct Route {
     pub leader: i32,
     #[allow(dead_code)]
     pub epoch: i32,
+    /// 副本集（就任拉齐的副本间 FetchSlice 互信依据）
+    pub replicas: Vec<i32>,
 }
 
 #[derive(Clone, Default)]
@@ -220,6 +222,55 @@ impl MetaService {
         tokio::spawn(pull.run());
     }
 
+    /// 就任拉齐（账本 ㉟ reconciliation）：升主前探测副本集内各存活副本的
+    /// LEO，若有人比本地长则拉回缺失尾部并 ReconcileAppend 落盘。
+    /// 有界等待（每副本 800ms），全部失败则按现状直接就任（降级 = 旧行为）。
+    async fn reconcile_leader_tail(
+        &self,
+        topic: &str,
+        partition: i32,
+        replicas: &[i32],
+        tx: &mpsc::Sender<PartitionCmd>,
+    ) {
+        // 本地 LEO
+        let (lx, lrx) = tokio::sync::oneshot::channel();
+        if tx.send(PartitionCmd::LocalLeo { reply: lx }).await.is_err() {
+            return;
+        }
+        let my_leo = lrx.await.unwrap_or(0);
+        // 探测各副本：取 leader_next 最大且 > 本地的响应
+        let mut best: Option<(i64, bytes::Bytes)> = None;
+        for r in replicas.iter().filter(|r| **r != self.cfg.node_id) {
+            let Some(info) = self.cluster.brokers.get(r) else { continue };
+            let addr = format!("{}:{}", info.host, info.port + 1);
+            let client = crate::internal::InternalClient::new(addr);
+            let fut = client.fetch_slice(topic, partition, self.cfg.node_id, my_leo, 8 * 1024 * 1024);
+            if let Ok(Ok(resp)) = tokio::time::timeout(
+                std::time::Duration::from_millis(800),
+                fut,
+            ).await {
+                if resp.error == 0 {
+                    let next = resp.leader_next_offset as i64;
+                    if next > my_leo && best.as_ref().map(|(n, _)| next > *n).unwrap_or(true) {
+                        best = Some((next, resp.data));
+                    }
+                }
+            }
+        }
+        if let Some((_, blob)) = best {
+            if !blob.is_empty() {
+                tracing::info!(topic=%topic, partition=%partition, bytes=blob.len(), "leader reconcile: pulling missed tail");
+                let (ax, arx) = tokio::sync::oneshot::channel();
+                if tx.send(PartitionCmd::ReconcileAppend { batches: blob, reply: ax }).await.is_ok() {
+                    match arx.await {
+                        Ok(true) => {}
+                        _ => tracing::warn!(topic=%topic, partition=%partition, "leader reconcile append failed"),
+                    }
+                }
+            }
+        }
+    }
+
     async fn create_via_controller(&mut self, name: &str, partitions: i32, rf: i32) -> bool {
         // 创建：本机持有控制器 actor → 直调；否则 RPC 到控制器内部端口
         if let Some(tx) = &self.controller_tx {
@@ -294,7 +345,7 @@ impl MetaService {
                 match PartitionActor::spawn(a.topic.clone(), a.partition, self.cfg.node_id, dir, opts, self.cfg.replica_config(), self.pool.clone()) {
                     Ok(tx) => {
                         entry.1.insert(a.partition);
-                        let route = Route { tx: tx.clone(), leader: a.leader, epoch: a.epoch };
+                        let route = Route { tx: tx.clone(), leader: a.leader, epoch: a.epoch, replicas: a.replicas.clone() };
                         self.routes.by_name.insert((a.topic.clone(), a.partition), route.clone());
                         self.routes.by_id.insert((topic_id_from(&a.topic), a.partition), route);
                         let _ = tx
@@ -316,12 +367,19 @@ impl MetaService {
                 }
             } else if let Some(route) = self.routes.by_name.get_mut(&(a.topic.clone(), a.partition)) {
                 // 提取 route 信息（限制 borrow 范围）
+                let route_epoch_before = route.epoch;
                 let (_was_leader, tx_clone) = {
                     route.leader = a.leader;
                     route.epoch = a.epoch;
                     (route.leader == self.cfg.node_id, route.tx.clone())
                 };
                 let is_leader = a.leader == self.cfg.node_id;
+                // 就任拉齐（账本 ㉟ reconciliation）：升主前从存活副本拉回
+                // 本地缺失的尾部——任何副本被选为新 leader 都能补齐后再服务，
+                // 「豁免掉队成员后来当 leader 丢已 ack 消息」的窗口由此关闭
+                if is_leader && a.epoch > route_epoch_before {
+                    self.reconcile_leader_tail(&a.topic, a.partition, &a.replicas, &tx_clone).await;
+                }
                 // drop route borrow 后再 await
                 let _ = tx_clone
                     .send(PartitionCmd::SetRole {

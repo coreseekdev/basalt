@@ -74,7 +74,7 @@ pub mod handlers_layout_tests {
         for (name, parts) in topics {
             for p in 0..*parts {
                 let (tx, _rx) = tokio::sync::mpsc::channel::<crate::partition::PartitionCmd>(1);
-                rt.by_name.insert((name.to_string(), p), Route { tx, leader: 0, epoch: 0 });
+                rt.by_name.insert((name.to_string(), p), Route { tx, leader: 0, epoch: 0, replicas: vec![0] });
             }
         }
         let (_tw, rx2) = tokio::sync::watch::channel(rt);

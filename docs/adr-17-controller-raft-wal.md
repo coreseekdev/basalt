@@ -54,3 +54,9 @@ ack 点落在内存，多数派同停机会丢最近 2s 快照窗口内已 ack �
 - restore_tests ×2：快照+WAL 联合恢复；无快照仅 WAL 重建状态机；
 - 引擎 e2e：raftrs / ctrl_kill / bounce 全绿；failover 见账本 ㉟
   （acks-all × failover 竞态，非本 ADR 引入，时序漂移显形）。
+
+## 6. 后记（同日）
+
+ISR 收缩状态机 + leader reconciliation 已落地（账本 ㉟ 完整修复）：控制器
+WAL 的时序抖动曾是 ㉟ 竞态的显形条件，reconciliation 就任拉齐使 failover
+轮转对副本数据状态不再敏感——两机制互补闭环。

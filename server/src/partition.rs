@@ -74,6 +74,12 @@ pub enum PartitionCmd {
     LocalLeo {
         reply: oneshot::Sender<i64>,
     },
+    /// 就任拉齐（账本 ㉟）：meta 层从存活副本拉回缺失尾部后按原偏移落盘
+    /// （append 以 next_offset 为基重写批头——拉取起点 = 本地 LEO，偏移一致）
+    ReconcileAppend {
+        batches: Bytes,
+        reply: oneshot::Sender<bool>,
+    },
     /// 截断到 offset（分叉尾巴自愈）。
     TruncateTo {
         offset: i64,
@@ -135,6 +141,10 @@ pub struct PartitionActor {
     /// follower → (LEO, 最近一次上报时刻)
     follower_leos: HashMap<i32, (i64, Instant)>,
     parked_acks: Vec<ParkedAck>,
+    /// follower ISR（不含 leader；账本 ㉟）：上报新鲜且已追平的副本集合。
+    /// 收缩 = isr_lag 内无上报（显式移除，advance_hw 扫描）；重回 = 上报
+    /// offset ≥ next_offset（完全追平）。HW = min(ISR LEO)。
+    isr: std::collections::BTreeSet<i32>,
     /// batch_io 窗口内的 produce 应答（ADR-14）：flush 成功后才发放；
     /// flush 失败改发错误——杜绝"ack 而未写文件"（持久化点纪律）。
     deferred_produce: Vec<(oneshot::Sender<ProduceOutcome>, ProduceOutcome)>,
@@ -177,6 +187,7 @@ impl PartitionActor {
             replicas: Vec::new(),
             follower_leos: HashMap::new(),
             parked_acks: Vec::new(),
+            isr: std::collections::BTreeSet::new(),
             deferred_produce: Vec::new(),
             repl,
         };
@@ -304,6 +315,7 @@ impl PartitionActor {
                         tracing::info!(topic=%self.name, partition=self.index, ?new_role, epoch, replicas=?replicas, "role updated");
                         // 角色翻转：清空上一任期状态（LEO 上报/停等/挂起 fetch 全部失效）
                         self.follower_leos.clear();
+                        self.isr.clear();
                         for (_, outcome) in self.deferred_produce.drain(..) {
                             let _ = outcome;
                         }
@@ -347,8 +359,10 @@ impl PartitionActor {
                     // 配置可收紧（更大）但不可放宽。
                     let majority = (self.replicas.len() as i32) / 2 + 1;
                     let effective_min = self.repl.min_insync.max(majority);
-                    let fresh = (self.fresh_followers().len() + 1) as i32;
-                    if acks == -1 && self.log.replicated && fresh < effective_min {
+                    // 提交面 = leader + ISR（显式收缩后，落后副本不进提交面；
+                    // C1：收缩只允许损失可用性，unclean=false）
+                    let in_sync = (self.isr.len() + 1) as i32;
+                    if acks == -1 && self.log.replicated && in_sync < effective_min {
                         let _ = reply.send(ProduceOutcome {
                             base_offset: -1, last_offset: -1, log_append_time: now_ms(),
                             error: Some(StorageError::NotEnoughReplicas),
@@ -384,7 +398,7 @@ impl PartitionActor {
                             log_append_time: outcome.log_append_time,
                             reply,
                             deadline: Instant::now() + Duration::from_secs(10),
-                            face: self.fresh_followers(),
+                            face: self.isr.iter().copied().collect(),
                         });
                         self.advance_hw();
                         self.release_acks();
@@ -433,6 +447,13 @@ impl PartitionActor {
                         if std::env::var("BASALT_LEO_PROBE").is_ok() {
                             eprintln!("LEO-REPORT t={} p={} from={} leo={}", self.name, self.index, follower, offset);
                         }
+                        // ISR 重回（账本 ㉟）：不在 ISR 的 follower 只有完全
+                        // 追平（offset ≥ next_offset）才重回；落后者只记 LEO
+                        // 供追赶，不进入提交面
+                        if offset >= self.log.next_offset && !self.isr.contains(&follower) {
+                            self.isr.insert(follower);
+                            tracing::info!(topic=%self.name, partition=self.index, follower, offset, "ISR expand");
+                        }
                         self.follower_leos.insert(follower, (offset, Instant::now()));
                     }
                     let out = if offset < self.log.next_offset {
@@ -455,6 +476,19 @@ impl PartitionActor {
                     self.advance_hw();
                     self.release_acks();
                     self.serve_pending();
+                }
+                PartitionCmd::ReconcileAppend { batches, reply } => {
+                    // 拉齐落盘不走 produce 角色/提交面检查——调用方（meta 就任
+                    // 编排）保证只在升主路径上调用且数据来自副本集内
+                    let r = self
+                        .log
+                        .append(&batches, AssignPolicy::Assign, now_ms())
+                        .map(|o| o.last_offset)
+                        .is_ok();
+                    if r {
+                        self.advance_hw();
+                    }
+                    let _ = reply.send(r);
                 }
                 PartitionCmd::ListOffsets { timestamp, reply } => {
                     let _ = reply.send(self.log.list_offset(timestamp));
@@ -519,12 +553,25 @@ impl PartitionActor {
         if !self.log.replicated {
             return;
         }
-        let min_follower = self.fresh_followers().len();
-        if min_follower == 0 {
-            return; // 无新鲜上报：HW 保持（等待上报或 ISR 超时收缩——POC 不自动收缩）
+        // ISR 收缩（账本 ㉟，显式动作）：isr_lag 内无上报的 follower 移出——
+        // 此前"fresh-only min"让它从 HW 计算里静默消失，ack 在部分副本缺失
+        // 时放行、failover 选中该副本即丢已 ack 消息（k-39 实证）
+        let now = Instant::now();
+        let shrunk: Vec<i32> = self.isr.iter().copied()
+            .filter(|id| match self.follower_leos.get(id) {
+                Some((_, t)) => now.duration_since(*t) > self.repl.isr_lag,
+                None => true,
+            })
+            .collect();
+        for id in shrunk {
+            self.isr.remove(&id);
+            tracing::info!(topic=%self.name, partition=self.index, follower=id, "ISR shrink");
+        }
+        if self.isr.is_empty() {
+            return; // 全员未上报：HW 保持（等上报/收缩）
         }
         let min_leo = self
-            .fresh_followers()
+            .isr
             .iter()
             .filter_map(|id| self.follower_leos.get(id).map(|(leo, _)| *leo))
             .min()
@@ -532,7 +579,7 @@ impl PartitionActor {
         let new_hw = self.log.next_offset.min(min_leo);
         if new_hw > self.log.high_watermark {
             if std::env::var("BASALT_LEO_PROBE").is_ok() {
-                eprintln!("HW-ADV t={} p={} hw={} fresh={:?}", self.name, self.index, new_hw, self.fresh_followers());
+                eprintln!("HW-ADV t={} p={} hw={} isr={:?}", self.name, self.index, new_hw, self.isr);
             }
             self.log.high_watermark = new_hw;
         }

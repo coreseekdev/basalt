@@ -819,7 +819,9 @@ async fn handle_internal_conn(
                 };
                 let resp = match route {
                     None => Bytes::from(error_slice(6)),
-                    Some(route) if route.leader != ctx.node_id => Bytes::from(error_slice(6)),
+                    // 副本集内互信：leader 服务常规拉取；副本间服务就任拉齐
+                    // （reconciliation，账本 ㉟）——非副本集内一律拒绝
+                    Some(route) if route.leader != ctx.node_id && !route.replicas.contains(&ctx.node_id) => Bytes::from(error_slice(6)),
                     Some(route) => {
                 let (tx, rx) = tokio::sync::oneshot::channel();
                 if route

@@ -182,17 +182,31 @@ async fn async_main(cfg: Config) {
         let client = internal::InternalClient::new(ctrl_addr.clone());
 
         if sync_cfg.node_id != ctrl_id {
-            // 注册 + 心跳（非控制器节点）
+            // 注册（非控制器节点 → 静态控制器）
             let _ = client.register(sync_cfg.node_id, &sync_cfg.host, sync_cfg.port).await;
-            let hb_client = internal::InternalClient::new(ctrl_addr.clone());
-            let hb_node = sync_cfg.node_id;
-            // L1 failover <2s：心跳 400ms + 超时 1200ms → 最坏 1.6s 检出
+            // 心跳：传统模式发静态控制器；引擎模式向全部 peers 广播
+            // （每节点 controller 本地记账，仅 raft leader 行使 failover 职权）
             let hb_ms: u64 = std::env::var("BASALT_HEARTBEAT_MS").ok().and_then(|v| v.parse().ok()).unwrap_or(300);
+            let engine_mode = crate::ctrl_raft::raftrs_engine::engine_enabled();
+            let hb_node = sync_cfg.node_id;
+            let hb_peers: Vec<(i32, String)> = if engine_mode {
+                sync_cfg.nodes.iter()
+                    .filter(|(id, _, _)| *id != hb_node)
+                    .map(|(id, h, p)| (*id, format!("{h}:{}", p + 1)))
+                    .collect()
+            } else {
+                vec![(ctrl_id, ctrl_addr.clone())]
+            };
+            let hb_clients: Vec<(i32, internal::InternalClient)> = hb_peers.iter()
+                .map(|(id, addr)| (*id, internal::InternalClient::new(addr.clone())))
+                .collect();
             tokio::spawn(async move {
                 loop {
-                    // 分区注入：对端在断边集内则不发送
-                    if !internal::blocked_peers().contains(&ctrl_id) {
-                        let _ = hb_client.heartbeat(hb_node).await;
+                    for (pid, pc) in &hb_clients {
+                        // 分区注入：对端在断边集内则不发送
+                        if !internal::blocked_peers().contains(pid) {
+                            let _ = pc.heartbeat(hb_node).await;
+                        }
                     }
                     tokio::time::sleep(std::time::Duration::from_millis(hb_ms)).await;
                 }

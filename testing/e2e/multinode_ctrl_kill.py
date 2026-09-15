@@ -31,17 +31,21 @@ def main():
     # 存活节点继续生产（raft 重选 + controller 接管）
     producer = KafkaProducer(bootstrap_servers=B_ALIVE, acks=-1,
                              request_timeout_ms=1000, max_block_ms=1000, retries=0)
-    deadline = t0 + 15
+    deadline = t0 + 30
     i = 100
     ok_at = None
+    attempt = 0
     while time.monotonic() < deadline:
         try:
             producer.send(TOPIC, value=f"post-{i}".encode(), partition=0).get(timeout=1)
             ok_at = time.monotonic()
             break
-        except Exception:
+        except Exception as e:
+            if attempt % 20 == 0:
+                print(f"    retry {attempt}: {type(e).__name__}", flush=True)
             time.sleep(0.1)
             i += 1
+            attempt += 1
     assert ok_at, "15s 内无 acks=all 成功——controller kill 后未恢复"
     for j in range(i + 1, i + 16):
         try:

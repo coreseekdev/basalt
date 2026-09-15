@@ -48,7 +48,7 @@ pub fn deliver_wire(bytes: Vec<u8>) {
 /// 引擎是否启用（BASALT_CTRL_RAFT_ENGINE=raftrs）。
 pub fn engine_enabled() -> bool {
     std::env::var("BASALT_CTRL_RAFT_ENGINE")
-        .map(|v| v == "raftrs")
+        .map(|v| v == "raftrs" || v == "1")
         .unwrap_or(false)
 }
 
@@ -174,11 +174,9 @@ fn driver(
             last_tick = Instant::now();
         }
 
-        // 无主 watchdog：跟随者带待提交命令时发起选举
-        if node.raft.leader_id == 0
-            && node.raft.state == raft::StateRole::Follower
-            && !pending.is_empty()
-        {
+        // 无主 watchdog：跟随者恒触发选举（不等 pending——
+        // tick 驱动选举未生效的补偿，Kafka 失败检测触发同款）
+        if node.raft.leader_id == 0 && node.raft.state == raft::StateRole::Follower {
             let _ = node.campaign();
         }
 

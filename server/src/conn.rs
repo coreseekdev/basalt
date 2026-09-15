@@ -27,26 +27,36 @@ pub async fn serve_connection(
     pool: std::sync::Arc<basalt_storage::pool::BufferPool>,
 ) {
     // 读半 + 写半分离：请求处理可并发（消除队头阻塞——长轮询 fetch 不再拖死同连接
-    // 的 offset commit/heartbeat），响应经写通道串行化回写（保留单一写者）
+    // 的 offset commit/heartbeat）。⚠ Kafka 线协议要求同连接响应按请求序返回
+    // （correlation id 匹配的前提；Java kafka-clients 严格按序）——处理可以
+    // 乱序完成，写出必须按请求序：写任务按 (seq, resp) 重排缓冲
     let (mut rd, mut wr) = sock.into_split();
-    let (resp_tx, mut resp_rx) = tokio::sync::mpsc::channel::<Bytes>(256);
+    let (resp_tx, mut resp_rx) = tokio::sync::mpsc::channel::<(u64, Option<Bytes>)>(256);
 
-    // 写任务：唯一写者；写完后归还读缓冲到池（perf #2，ADR-14 范围外）
+    // 写任务：唯一写者 + 请求序重排；写完后归还读缓冲到池（perf #2）
     let writer_pool = pool.clone();
     let writer = tokio::spawn(async move {
-        while let Some(resp) = resp_rx.recv().await {
-            if wr.write_all(&resp).await.is_err() {
-                break;
-            }
-            // 归还唯一所有的读缓冲（Bytes 唯一 → BytesMut → 池）
-            if let Ok(bm) = Bytes::try_into_mut(resp) {
-                use basalt_storage::pool::BufferPool;
-                BufferPool::release(&writer_pool, bm);
+        let mut pending: std::collections::BTreeMap<u64, Option<Bytes>> = Default::default();
+        let mut write_seq: u64 = 1;   // 请求序号从 1 起（读侧先增再派发）
+        while let Some((seq, resp)) = resp_rx.recv().await {
+            pending.insert(seq, resp);
+            while let Some(resp) = pending.remove(&write_seq) {
+                write_seq += 1;
+                let Some(resp) = resp else { continue }; // acks=0：占位无响应
+                if wr.write_all(&resp).await.is_err() {
+                    return;
+                }
+                // 归还唯一所有的读缓冲（Bytes 唯一 → BytesMut → 池）
+                if let Ok(bm) = Bytes::try_into_mut(resp) {
+                    use basalt_storage::pool::BufferPool;
+                    BufferPool::release(&writer_pool, bm);
+                }
             }
         }
     });
 
     let mut read_buf = BytesMut::with_capacity(64 * 1024);
+    let mut req_seq: u64 = 0;
     loop {
         let len = match read_frame_len(&mut rd, &mut read_buf).await {
             Ok(l) => l,
@@ -63,24 +73,34 @@ pub async fn serve_connection(
         // 慢消费者背压：响应通道满时暂停读（客户端不读就不给它读下一请求）
         let ctx = ctx.clone_for_request();
         let resp_tx = resp_tx.clone();
+        req_seq += 1;
+        let seq = req_seq;
         tokio::spawn(async move {
             match dispatch(frame_bytes, &ctx).await {
                 Ok(Some(resp)) => {
-                    let _ = resp_tx.send(resp).await;
+                    let _ = resp_tx.send((seq, Some(resp))).await;
                 }
-                Ok(None) => {} // acks=0：无响应
+                Ok(None) => {
+                    // acks=0：无响应，但序号必须占位推进（保持请求序）
+                    let _ = resp_tx.send((seq, None)).await;
+                }
                 Err(DispatchError::UnknownApi) => {
-                    tracing::warn!(peer = %peer, "unknown api key, closing");
-                    // 关连接：丢弃写任务感知方式——发送空帧无意义，直接退出任务，
-                    // 读循环在客户端超时后自行收敛。生产化时可引入 per-conn 关闭令牌。
+                    tracing::warn!(peer = %peer, "unknown api key");
+                    // 序号占位：写任务严格按请求序写出——任何分支不占位都会
+                    // 在该连接上制造永久缺口，卡死其后全部响应（kafka-clients
+                    // 档实证：一个解析失败请求卡死整连接）
+                    let _ = resp_tx.send((seq, None)).await;
                 }
                 Err(DispatchError::UnsupportedVersion(api_key, version)) => {
                     if let Some(b) = synth_unsupported(api_key, version).map(Bytes::from) {
-                        let _ = resp_tx.send(Bytes::from(b)).await;
+                        let _ = resp_tx.send((seq, Some(Bytes::from(b)))).await;
+                    } else {
+                        let _ = resp_tx.send((seq, None)).await;
                     }
                 }
                 Err(DispatchError::Protocol(e)) => {
                     tracing::warn!(peer = %peer, error = %e, "protocol error");
+                    let _ = resp_tx.send((seq, None)).await;
                 }
             }
         });

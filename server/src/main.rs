@@ -103,6 +103,27 @@ async fn async_main(cfg: Config) {
     // 与 Bytes/mpsc 内部引用计数同级豁免（ADR-13）。
     #[allow(clippy::disallowed_types)]
     let pool: std::sync::Arc<BufferPool> = std::sync::Arc::new(BufferPool::new());
+    // 单节点（BASALT_NODES 未配置）：无 controller_peer/自注册路径——
+    // cluster.brokers 恒空 → metadata 响应 Brokers=[] → kafka-clients 严格
+    // 要求分区 leader 可映射到 Brokers 列表，视整个 metadata 为不完整
+    // （"Topic not present"）。补自注册使 broker 列表恒含自身
+    if cfg.nodes.is_empty() {
+        if let Some(tx) = &controller_tx {
+            let (rtx, rrx) = tokio::sync::oneshot::channel();
+            let _ = tx
+                .send(internal::ControllerCmd::Register {
+                    info: basalt_metadata::cluster::BrokerInfo {
+                        node_id: cfg.node_id,
+                        host: cfg.host.clone(),
+                        port: cfg.port,
+                    },
+                    reply: rtx,
+                })
+                .await;
+            let _ = rrx.await;
+        }
+    }
+
     let (meta_tx, routes_rx) = meta::MetaService::spawn(cfg.clone(), controller_addr, controller_tx.clone(), pool.clone());
     let group_tx = basalt_coordinator::GroupManager::spawn(std::path::Path::new(&cfg.data_dir));
     let routes_rx_internal = routes_rx.clone();

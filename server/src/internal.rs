@@ -365,10 +365,12 @@ impl Controller {
             ControllerCmd::CreateTopic { name, partitions, rf, reply } => {
                 eprintln!("CTRL-CREATE node={} name={}", self.node_id, name);
                 let exists = self.state.assignments.iter().any(|a| a.topic == name);
-                // rf 守卫：broker 未注册齐就建题会按不完整集群算副本
-                // （apply 里 rf 被 min 到 broker 数）——拒绝本次，metadata
-                // 不含该 topic，客户端重试时集群视图已齐
-                if (self.state.brokers.len() as i32) < rf {
+                // rf 守卫：多副本建题时 broker 未注册齐会按不完整集群算
+                // 副本（apply 里 rf 被 min 到 broker 数）——拒绝本次，
+                // metadata 不含该 topic，客户端重试时集群视图已齐。
+                // 只保护 rf>1：单节点传统模式无自注册路径（brokers 恒空、
+                // apply 回退 vec![0]），rf=1 本无 failover 可言
+                if rf > 1 && (self.state.brokers.len() as i32) < rf {
                     let _ = reply.send(());
                     return;
                 }

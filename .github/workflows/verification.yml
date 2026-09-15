@@ -115,6 +115,11 @@ jobs:
           for s in multinode_failover.py multinode_l1.py multinode_transfer.py multinode_partition.py multinode_bounce.py; do
             bash testing/e2e/run_multinode.sh "$s"
           done
+      - name: 多节点引擎模式 M2.1/M2.2（raftrs 8 场景：WAL/ISR/reconciliation 回归面）
+        run: |
+          for s in multinode_raftrs.py multinode_failover.py multinode_transfer.py multinode_partition.py multinode_replay.py multinode_l1.py multinode_bounce.py multinode_isr.py multinode_ctrl_kill.py; do
+            RAFTRS=1 bash testing/e2e/run_multinode.sh "$s"
+          done
 
   opfuzz-nightly:
     if: github.event_name == 'schedule' # ⑱⑲⑳ 修复后转阻塞门禁

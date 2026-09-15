@@ -188,15 +188,14 @@ fn driver(
             node.tick();
             last_tick = Instant::now();
         }
-        // 每 10 次循环打印一次 raft 状态摘要（诊断）
-        {
-            let term = node.raft.term;
-            let role = node.raft.state;
-            let leader = node.raft.leader_id;
-            let msgs_len = node.raft.msgs.len();
-            if id == 1 {
-                eprintln!("TICK id={id} term={term} role={role:?} leader={leader} msgs_len={msgs_len}");
-            }
+        // 诊断：非 Leader 节点的选举计时器
+        if node.raft.state != raft::StateRole::Leader {
+            eprintln!(
+                "TICK-DIAG id={id} term={term} role={role:?} leader={leader} msgs={msgs_len} tick_flag={do_tick}",
+                id = id, term = node.raft.term, role = node.raft.state,
+                leader = node.raft.leader_id, msgs_len = node.raft.msgs.len(),
+                do_tick = do_tick,
+            );
         }
 
         // leader 才能提交命令；follower 直接拒绝（调用方重试路由到新主）
@@ -337,6 +336,13 @@ pub fn spawn_with_dir(id: i32, peers: Vec<i32>, router: RaftRsRouter, dir: PathB
             ..Default::default()
         });
         let node = RawNode::new(&cfg, mem_store, &logger()).unwrap();
+
+        // 启动选举触发：raft-rs 0.7 的 tick_election 依赖 promotable
+        // （初始 ConfState 投票者自动满足），但首次 tick 前需显式触发
+        // 以避免所有节点同时 campaign（split vote）。随机延迟去同步。
+        let jitter = (std::process::id() % 300 + 50) as u64;
+        std::thread::sleep(Duration::from_millis(jitter));
+        let _ = node.campaign();
 
         let shared_snap = shared_clone.clone();
         let last_ver = Arc::new(std::sync::atomic::AtomicU64::new(0));

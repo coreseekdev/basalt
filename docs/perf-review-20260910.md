@@ -65,3 +65,10 @@ partition.rs:434-452/347/232-255/473-484。顺带清理。
 当前 kafka-python 受 GIL 限制，会吃掉发现 1/3/5 的效果）；
 syscall 画像 strace -c；分配画像 dhat/jemalloc；每项优化挂 config flag
 做同规格 A/B；opfuzz + sim_disk 回归必跑（发现 4/8 触及持久化语义）。
+
+## 复测（2026-09-16，㊷ 有序响应写出后）
+
+conn.rs 请求并发派发的响应乱序修复（写任务按请求序重排缓冲）复测无性能回退：
+produce 441K / 473K msg/s（两轮，基准区间 437-605K 内）、consume 234K / 244K msg/s
+（基准 254K 的 -4~8%，单次采样方差量级）、individual latency p50=0.0ms p99=0.1ms
+（持平）。重排缓冲为每响应一次 BTreeMap 插入，µs 级，不构成瓶颈。

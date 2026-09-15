@@ -15,6 +15,16 @@ if make -C spec demo-eager TLATOOLS="$TLATOOLS" >/dev/null 2>&1; then
 fi
 echo "反例按预期检出"
 
+echo "== TLA+ 提交协议规约（账本 ㉟：HW/ISR/冻结面/reconciliation）=="
+make -C spec replication-commit TLATOOLS="$TLATOOLS"
+
+echo "== 阴性对照：无 reconciliation 突变体必须被检出（账本 ㉟ 判别力）=="
+if make -C spec replication-commit-norecon TLATOOLS="$TLATOOLS" >/dev/null 2>&1; then
+    echo "错误：突变体通过——InvAckedSurvivable 判别力丢失" >&2
+    exit 1
+fi
+echo "反例按预期检出"
+
 echo "== Verus record 切片（账本 C5/C6/C6a）=="
 "${VERUS:-verus}" --crate-type=lib verification/verus/record_core.rs
 

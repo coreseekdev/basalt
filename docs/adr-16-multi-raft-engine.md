@@ -53,8 +53,11 @@ pub trait CtrlRaftEngine: Send {
 
 ## 3. 选择与共存策略
 
-- 运行时选择：`BASALT_CTRL_RAFT_ENGINE=openraft|raftrs`（默认 openraft，
-  与 ADR-15 第一段一致）。
+- 运行时选择：`BASALT_CTRL_RAFT_ENGINE=openraft|raftrs`。
+  **默认引擎修订（2026-09-16）**：默认改为 **raftrs**——九场景 e2e 门禁、
+  控制器 WAL（ADR-17）、ISR/reconciliation 的全部验收面都在 raftrs 上；
+  openraft 引擎保持骨架可用（选举/复制/快照内嵌测试绿），但未达同等
+  验收面（无控制器 WAL、无多进程 e2e 门禁），选用需自担。
 - 两引擎各自目录、各自测试；不承诺跨引擎迁移（raft 日志格式引擎私有，
   迁移走快照导入）。
 - 引擎新增（如自研）：实现 trait + 测试即可，控制器 actor 不改。

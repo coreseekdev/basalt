@@ -30,6 +30,7 @@ raft = { version = "0.7", features = ["protobuf-codec"] }
 raft-proto = { version = "0.7", features = ["protobuf-codec"] }
 protobuf = "2"
 slog = "2"
+crc32c = { workspace = true }
 
 [lints]
 workspace = true

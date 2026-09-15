@@ -622,3 +622,4 @@ mod tests {
 }
 
 pub mod raftrs_engine;
+pub mod wal_log;

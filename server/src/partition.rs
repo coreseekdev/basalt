@@ -250,6 +250,9 @@ impl PartitionActor {
         let mut i = 0;
         while i < self.parked_acks.len() {
             if self.parked_acks[i].deadline <= now {
+                if std::env::var("BASALT_LEO_PROBE").is_ok() {
+                    eprintln!("ACK-DEADLINE t={} p={} last={}", self.name, self.index, self.parked_acks[i].last_offset);
+                }
                 let p = self.parked_acks.remove(i);
                 let _ = p.reply.send(ProduceOutcome {
                     base_offset: -1,
@@ -420,6 +423,9 @@ impl PartitionActor {
                     }
                     // follower 的拉取起点即其 LEO：记录（>=0）并推进 HW
                     if offset >= 0 {
+                        if std::env::var("BASALT_LEO_PROBE").is_ok() {
+                            eprintln!("LEO-REPORT t={} p={} from={} leo={}", self.name, self.index, follower, offset);
+                        }
                         self.follower_leos.insert(follower, (offset, Instant::now()));
                     }
                     let out = if offset < self.log.next_offset {
@@ -518,6 +524,9 @@ impl PartitionActor {
             .unwrap_or(i64::MAX);
         let new_hw = self.log.next_offset.min(min_leo);
         if new_hw > self.log.high_watermark {
+            if std::env::var("BASALT_LEO_PROBE").is_ok() {
+                eprintln!("HW-ADV t={} p={} hw={} fresh={:?}", self.name, self.index, new_hw, self.fresh_followers());
+            }
             self.log.high_watermark = new_hw;
         }
     }
@@ -526,6 +535,9 @@ impl PartitionActor {
     fn release_acks(&mut self) {
         let mut i = 0;
         while i < self.parked_acks.len() {
+            if std::env::var("BASALT_LEO_PROBE").is_ok() && self.parked_acks[i].last_offset >= 18 {
+                eprintln!("ACK-RELEASE? t={} p={} last={} hw={}", self.name, self.index, self.parked_acks[i].last_offset, self.log.high_watermark);
+            }
             if self.parked_acks[i].last_offset < self.log.high_watermark {
                 let p = self.parked_acks.remove(i);
                 let _ = p.reply.send(ProduceOutcome {

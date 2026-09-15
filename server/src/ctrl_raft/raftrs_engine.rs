@@ -14,6 +14,9 @@ use std::time::Instant;
 
 use raft::prelude::*;
 use raft::storage::MemStorage;
+use raft::Storage;
+
+use super::wal_log::{ReadyPersist, WalStorage};
 use raft::RawNode;
 
 use basalt_metadata::cluster::ClusterRecord;
@@ -152,8 +155,8 @@ impl RaftRsRouter {
 /// 单条对端 raft 消息的统一步进：日志回卷重同步预检（leader 侧）、
 /// leader commit 水位跟踪（follower 侧）、catch_unwind 安全网。
 /// 跨进程与进程内两条传输都必须经过这里。
-fn step_incoming(
-    node: &mut RawNode<MemStorage>,
+fn step_incoming<T: Storage>(
+    node: &mut RawNode<T>,
     msg: Message,
     id: i32,
     leader_commit: &std::sync::atomic::AtomicU64,
@@ -206,8 +209,8 @@ fn step_incoming(
 /// catch_unwind——raft-rs 在 follower→leader 迁移且仍有未持久化条目
 /// 记录时会 fatal! 断言，panic 不允许杀死驱动线程。
 #[allow(clippy::too_many_arguments)]
-fn process_ready(
-    node: &mut RawNode<MemStorage>,
+fn process_ready<T: Storage + ReadyPersist>(
+    node: &mut RawNode<T>,
     router: &RaftRsRouter,
     shared: &Arc<Mutex<ClusterState>>,
     applied: &std::sync::atomic::AtomicU64,
@@ -254,21 +257,16 @@ fn process_ready(
                 id, node.raft.term, node.raft.state, n_msgs, n_persisted, n_entries, n_committed);
         }
     }
-    // 注意：hs/entries 的持久化只在 ② 处执行一次——MemStorage::append
-    // 无重叠检查，重复 append 会产生重复索引、破坏快照边界的日志定位
+    // 注意：hs/entries 的持久化只在 ② 处执行一次——append 无重叠检查，
+    // 重复持久化会产生重复索引、破坏快照边界的日志定位
 
     // ① 非持久化消息先发（candidate 的投票请求等——不依赖落盘顺序）
     for msg in ready.take_messages() {
         router.route(msg.to as i32, msg);
     }
 
-    // ② 持久化 hard state / entries（MemStorage 内存等价物）
-    if let Some(hs) = ready.hs() {
-        node.mut_store().wl().set_hardstate(hs.clone());
-    }
-    if !ready.entries().is_empty() {
-        node.mut_store().wl().append(ready.entries());
-    }
+    // ② 持久化 hard state / entries（WalStorage 写穿；MemStorage 内存等价）
+    node.mut_store().persist_ready(ready.hs(), ready.entries());
 
     // ③ 持久化后再发的消息（leader 的 append/heartbeat——依赖落盘顺序）
     for msg in ready.persisted_messages().to_vec() {
@@ -321,9 +319,9 @@ fn process_ready(
     }
 }
 
-fn driver(
+fn driver<T: Storage + ReadyPersist>(
     id: i32,
-    mut node: RawNode<MemStorage>,
+    mut node: RawNode<T>,
     router: RaftRsRouter,
     cmd_rx: mpsc::Receiver<EngineCmd>,
     mut msg_rx: mpsc::Receiver<Message>,
@@ -535,34 +533,21 @@ pub fn spawn_with_dir(id: i32, peers: Vec<i32>, router: RaftRsRouter, dir: PathB
         // rand(election_tick, 2 * election_tick)），不同节点自然去同步
         cfg.validate().unwrap();
 
-        let mem_store = MemStorage::new();
-        if let Some((applied_idx, term)) = restore_meta {
-            if applied_idx > 0 {
-                let mut snap = Snapshot::default();
-                snap.mut_metadata().set_index(applied_idx);
-                snap.mut_metadata().set_term(term);
-                snap.mut_metadata().set_conf_state(ConfState {
-                    voters: raft_peers.iter().map(|x| *x as u64).collect(),
-                    ..Default::default()
-                });
-                if let Err(e) = mem_store.wl().apply_snapshot(snap) {
-                    eprintln!("ENGINE id={} snapshot restore failed: {}", id, e);
-                } else {
-                    eprintln!("ENGINE id={} restored snapshot index={} term={}", id, applied_idx, term);
-                }
-            }
-        }
-        mem_store.wl().set_conf_state(ConfState {
+        // 存储 = 写穿 WAL（ADR-17 delta-A）：恢复从段序重放（含 0 段=
+        // 冷启动），快照文件仅作状态机种子 + committed 交付游标
+        let store = WalStorage::open(&snapshot_dir);
+        store.set_confstate(&ConfState {
             voters: raft_peers.iter().map(|x| *x as u64).collect(),
             ..Default::default()
         });
-        let mut node = RawNode::new(&cfg, mem_store, &logger()).unwrap();
+        let mut node = RawNode::new(&cfg, store, &logger()).unwrap();
 
         // 启动选举触发：仅冷启动节点主动 campaign（去同步 jitter）。
-        // 快照恢复的重新加入节点不得主动 campaign——它与 leader 日志等长
-        // 时 pre-vote 会通过、打断在位 leader（bounce r2 扰动实证）；
-        // 其选举需求由 tick 的 election timeout 自然触发兜底。
-        if restore_meta.is_none() {
+        // 有 raft 历史（WAL 重放或快照）的重新加入节点不得主动
+        // campaign——它与 leader 日志等长时 pre-vote 会通过、打断在位
+        // leader（bounce r2 扰动实证）；其选举需求由 tick 的 election
+        // timeout 自然触发兜底。
+        if restore_meta.is_none() && !node.mut_store().has_history() {
             let jitter = (std::process::id() % 300 + 50) as u64;
             std::thread::sleep(Duration::from_millis(jitter));
             let _ = node.campaign();
@@ -742,12 +727,16 @@ mod restore_tests {
             }
             time::sleep(Duration::from_millis(100));
         }
-        // 提交 2 条（等快照线程落盘：2s 周期）。提案 election-agnostic
+        // 建题 + 提交 2 条（等快照线程落盘：2s 周期）。提案 election-agnostic；
+        // CreateTopic 使 LeaderChange 的 assignment 内容断言真实化
         for i in 0..2 {
+            let rec = if i == 0 {
+                ClusterRecord::CreateTopic { name: "t".into(), partitions: 2, rf: 3 }
+            } else {
+                ClusterRecord::LeaderChange { topic: "t".into(), partition: 0, leader: 1, epoch: 1 }
+            };
             for _ in 0..50u32 {
-                if handles.values().any(|h| h.propose(ClusterRecord::LeaderChange {
-                    topic: "t".into(), partition: i, leader: 1, epoch: i + 1,
-                }).is_ok()) {
+                if handles.values().any(|h| h.propose(rec.clone()).is_ok()) {
                     break;
                 }
                 time::sleep(Duration::from_millis(100));
@@ -817,6 +806,100 @@ mod restore_tests {
                 .find(|x| x.topic == a.topic && x.partition == a.partition)
                 .unwrap_or_else(|| panic!("node3 缺 assignment {}#{}", a.topic, a.partition));
             assert_eq!((a.leader, a.epoch), (b.leader, b.epoch), "leader/epoch 不一致");
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// WAL 契约的核心价值：快照文件缺失/陈旧时，状态机可仅从 WAL 重建
+    /// （committed 条目重投递 → ClusterState 重放）——控制器恢复不再依赖
+    /// 2s 周期的快照文件
+    #[test]
+    fn restore_rebuilds_state_from_wal_without_snapshot() {
+        let dir = std::env::temp_dir().join(format!("basalt-wal-rebuild-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).ok();
+        let router = RaftRsRouter::new();
+        let ids = [1, 2, 3];
+        let mut handles: BTreeMap<i32, RaftRsHandle> = BTreeMap::new();
+        for &id in &ids {
+            let d = dir.join(format!("node{id}"));
+            handles.insert(id, spawn_with_dir(id, ids.to_vec(), router.clone(), d));
+        }
+        handles[&1].trigger_elect();
+        for _ in 0..50 {
+            if handles.values().all(|h| h.applied_index() >= 1) {
+                break;
+            }
+            time::sleep(Duration::from_millis(100));
+        }
+        // 建题 + 2 条变更（写进 WAL；快照文件可能尚未落盘）
+        for i in 0..2 {
+            let rec = if i == 0 {
+                ClusterRecord::CreateTopic { name: "t".into(), partitions: 2, rf: 3 }
+            } else {
+                ClusterRecord::LeaderChange { topic: "t".into(), partition: 0, leader: 1, epoch: 1 }
+            };
+            for _ in 0..50u32 {
+                if handles.values().any(|h| h.propose(rec.clone()).is_ok()) {
+                    break;
+                }
+                time::sleep(Duration::from_millis(100));
+            }
+        }
+        for _ in 0..50 {
+            if handles.values().all(|h| h.applied_index() >= 3) {
+                break;
+            }
+            time::sleep(Duration::from_millis(100));
+        }
+
+        // 杀 node3；多数派续写 1 条（idx 4）
+        handles[&3].stop();
+        handles.remove(&3);
+        time::sleep(Duration::from_millis(100));
+        let mut committed = false;
+        for _ in 0..80u32 {
+            if handles.values().any(|h| h.propose(ClusterRecord::LeaderChange {
+                topic: "t".into(), partition: 1, leader: 1, epoch: 7,
+            }).is_ok()) {
+                committed = true;
+                break;
+            }
+            time::sleep(Duration::from_millis(100));
+        }
+        assert!(committed, "多数派 propose 失败");
+        for _ in 0..50 {
+            if handles.values().all(|h| h.applied_index() >= 4) {
+                break;
+            }
+            time::sleep(Duration::from_millis(100));
+        }
+
+        // 删快照文件（模拟快照陈旧/丢失），仅留 WAL → 重启
+        let n3 = dir.join("node3");
+        let _ = std::fs::remove_file(n3.join("state.json"));
+        let _ = std::fs::remove_file(n3.join("state.meta.json"));
+        let h3 = spawn_with_dir(3, ids.to_vec(), router.clone(), n3);
+
+        let mut converged = false;
+        for _ in 0..100 {
+            let want = handles.values().map(|h| h.applied_index()).max().unwrap_or(0);
+            if want >= 4 && h3.applied_index() >= want {
+                converged = true;
+                break;
+            }
+            time::sleep(Duration::from_millis(100));
+        }
+        assert!(converged, "WAL 重建未追平: v3={} vmax={}",
+            h3.applied_index(), handles.values().map(|h| h.applied_index()).max().unwrap_or(0));
+        let snap3 = h3.shared.lock().unwrap().clone();
+        let snap1 = handles[&1].shared.lock().unwrap().clone();
+        assert_eq!(snap3.assignments.len(), snap1.assignments.len(), "WAL 重建 assignment 数不一致");
+        for a in &snap1.assignments {
+            let b = snap3.assignments.iter()
+                .find(|x| x.topic == a.topic && x.partition == a.partition)
+                .unwrap_or_else(|| panic!("WAL 重建缺 assignment {}#{}", a.topic, a.partition));
+            assert_eq!((a.leader, a.epoch), (b.leader, b.epoch), "WAL 重建 leader/epoch 不一致");
         }
         let _ = std::fs::remove_dir_all(&dir);
     }

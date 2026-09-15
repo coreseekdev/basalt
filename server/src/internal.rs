@@ -303,6 +303,11 @@ impl Controller {
 
     /// 心跳超时 → leader failover（epoch+1，副本轮转）。
     fn failover_check(&mut self) {
+        // 引擎模式：failover 决策读引擎 apply 后的状态
+        if let Some(e) = &self.engine {
+            let st = e.shared.lock().unwrap().clone();
+            self.state = st;
+        }
         let now = Instant::now();
         // 控制器自身：免死 + 常驻 alive（无独立心跳线程，每次检查时刷新）
         self.last_heartbeat.insert(self.node_id, now);

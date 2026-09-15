@@ -82,10 +82,12 @@ impl RaftRsHandle {
     }
 }
 
-/// 进程内消息路由（raft-rs Message）。
+/// raft 消息路由：进程内通道（测试）或 TCP（跨进程，BASALT_CTRL_RAFT_ENGINE=raftrs）。
 #[derive(Clone, Default)]
 pub struct RaftRsRouter {
     inner: Arc<Mutex<std::collections::BTreeMap<i32, mpsc::Sender<Message>>>>,
+    /// 跨进程模式：node_id → (host, internal_port)
+    pub tcp_peers: Arc<Mutex<std::collections::BTreeMap<i32, String>>>,
 }
 
 impl RaftRsRouter {

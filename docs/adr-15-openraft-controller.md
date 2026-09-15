@@ -67,7 +67,7 @@
 - ✅ 第二段（部分）：Controller actor 引擎感知（propose/职权门控/MetaSync
   读引擎态）+ MSG_RAFT TCP 传输 + BASALT_CTRL_RAFT_ENGINE 运行时挂接；
   `__controller.log` 迁移工具 ⬜（MemStorage 起步，快照持久化为后续）
-- ⬜ 第三段：五 multinode 场景 × 控制器 kill 回归（raftrs 模式冒烟 ✅ 30/30）
+- 🟨 第三段：五 multinode 场景在 raftrs 模式下全部 PASS（failover/l1/transfer/partition/bounce/replay）；控制器 kill 场景（multinode_ctrl_kill.py）⬜——根因：心跳发送目标恒为静态 node0 地址，node0 死后存活节点收不到彼此心跳 → failover_check 无心跳数据。修复方向：心跳目标跟随 raft leader（engine.leader_id 原子量已就位）
 
 ## 5. 风险
 - **tick 驱动选举未生效（实施发现，2026-09-14）**：openraft 0.9.25 内嵌

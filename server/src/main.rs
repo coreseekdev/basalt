@@ -54,14 +54,25 @@ async fn async_main(cfg: Config) {
     // 内部端口：client port + 1
     let internal_port = cfg.port + 1;
 
-    // 控制器 actor（仅控制器节点）
-    let controller_tx = if is_controller {
+    // 控制器 actor：传统模式仅控制器节点；引擎模式全节点各启
+    // （职权由 raft leader 门控 has_engine_authority——控制器 kill 后
+    //  新 raft leader 的 controller 自动接管）
+    let controller_tx = if is_controller || crate::ctrl_raft::raftrs_engine::engine_enabled() {
         // ADR-15/16：引擎运行时（BASALT_CTRL_RAFT_ENGINE=raftrs）下，
         // 先装配本节点 raft 引擎（voters = 全部 nodes），Controller 经
         // engine propose 复制元数据变更；仅 raft leader 行使职权。
         let engine_handle = if crate::ctrl_raft::raftrs_engine::engine_enabled() {
             let peers: Vec<i32> = cfg.nodes.iter().map(|(id, _, _)| *id).collect();
             let router = crate::ctrl_raft::raftrs_engine::RaftRsRouter::new();
+            // TCP peer 地址表（跨进程 raft 消息路由）
+            for (id, host, port) in &cfg.nodes {
+                if *id != cfg.node_id {
+                    router.tcp_peers.lock().unwrap().insert(
+                        *id,
+                        format!("{host}:{}", port + 1),
+                    );
+                }
+            }
             Some(crate::ctrl_raft::raftrs_engine::spawn_with_dir(
                 cfg.node_id,
                 peers,

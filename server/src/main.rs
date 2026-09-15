@@ -192,12 +192,11 @@ async fn async_main(cfg: Config) {
                     break;
                 }
                 if let Ok(Some(data)) = rxr.await {
-                    if data.len() > 1 {
-                        if let Some(state) = basalt_metadata::cluster::ClusterState::decode(&data[1..]) {
-                            if state.version > last_version {
-                                last_version = state.version;
-                                let _ = meta_tx_sync.send(meta::MetaCmd::ApplyCluster(Box::new(state))).await;
-                            }
+                    // Controller::Sync 回复 = state.encode() 纯编码字节（无 marker）
+                    if let Some(state) = basalt_metadata::cluster::ClusterState::decode(&data) {
+                        if state.version > last_version || state.assignments.len() > 0 {
+                            last_version = state.version;
+                            let _ = meta_tx_sync.send(meta::MetaCmd::ApplyCluster(Box::new(state))).await;
                         }
                     }
                 }
@@ -211,6 +210,8 @@ async fn async_main(cfg: Config) {
             let hb_ms: u64 = std::env::var("BASALT_HEARTBEAT_MS").ok().and_then(|v| v.parse().ok()).unwrap_or(300);
             let engine_mode = crate::ctrl_raft::raftrs_engine::engine_enabled();
             let hb_node = sync_cfg.node_id;
+            // 引擎模式：心跳广播到全部 peers（每节点 controller 本地记账，
+            // 仅 raft leader 行使 failover 职权）
             let hb_peers: Vec<(i32, String)> = if engine_mode {
                 sync_cfg.nodes.iter()
                     .filter(|(id, _, _)| *id != hb_node)

@@ -244,12 +244,12 @@ impl Controller {
                 self.last_heartbeat.insert(node_id, Instant::now());
             }
             ControllerCmd::Sync { version, reply } => {
-                // 引擎模式：读引擎 apply 后的状态（版本 = applied index + 状态内 version）
+                // 引擎模式：读引擎 apply 后的状态（raft 复制的一致性快照）
                 let state_snap = match &self.engine {
                     Some(e) => e.shared.lock().unwrap().clone(),
                     None => self.state.clone(),
                 };
-                let _ = reply.send(if state_snap.version > version {
+                let _ = reply.send(if state_snap.version > version || state_snap.assignments.len() > 0 {
                     Some(state_snap.encode())
                 } else {
                     None

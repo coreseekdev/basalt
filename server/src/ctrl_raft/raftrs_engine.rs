@@ -291,18 +291,20 @@ pub fn spawn_with_dir(id: i32, peers: Vec<i32>, router: RaftRsRouter, dir: PathB
     let applied_t = applied.clone();
     let snapshot_dir = dir.clone();
 
-    router.register(id, msg_tx);
+    // raft_id 偏移（raft-rs INVALID_ID=0）：raft_id = broker_id + 1
+    let raft_id = id + 1;
+    let raft_peers: Vec<i32> = peers.iter().map(|&p| p + 1).collect();
+    router.register(raft_id, msg_tx);
 
     std::thread::spawn(move || {
-        let mut cfg = Config::new(id as u64);
+        let mut cfg = Config::new(raft_id as u64);
         cfg.heartbeat_tick = 2;
         cfg.election_tick = 10;
         cfg.validate().unwrap();
 
         let mem_store = MemStorage::new();
-        // 初始投票成员 = 全部 peers（v1 无成员变更）
         mem_store.wl().set_conf_state(ConfState {
-            voters: peers.iter().map(|&x| x as u64).collect(),
+            voters: raft_peers.iter().map(|x| *x as u64).collect(),
             ..Default::default()
         });
         let node = RawNode::new(&cfg, mem_store, &logger()).unwrap();
@@ -327,7 +329,7 @@ pub fn spawn_with_dir(id: i32, peers: Vec<i32>, router: RaftRsRouter, dir: PathB
             }
         });
         driver(
-            id,
+            raft_id,
             node,
             router,
             cmd_rx,

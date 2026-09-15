@@ -5,6 +5,7 @@
 //! advance() 确认。MemStorage 起步（v1：控制器重启后由 leader 日志重放
 //! 追平；快照持久化为后续增强）。
 
+use std::path::PathBuf;
 use std::sync::mpsc;
 use std::sync::Arc;
 use std::sync::Mutex;
@@ -113,6 +114,7 @@ fn driver(
     is_leader: Arc<std::sync::atomic::AtomicBool>,
     leader_id: Arc<std::sync::atomic::AtomicI32>,
     applied: Arc<std::sync::atomic::AtomicU64>,
+    snap_dir: PathBuf,
 ) {
     use std::sync::atomic::Ordering;
     let mut last_tick = Instant::now();
@@ -270,10 +272,22 @@ fn driver(
 
 /// 启动引擎驱动线程。返回共享句柄（router 由调用方统一装配三节点）。
 pub fn spawn(id: i32, peers: Vec<i32>, router: RaftRsRouter) -> RaftRsHandle {
+    spawn_with_dir(id, peers, router, std::env::temp_dir().join(format!("basalt-ctrl-raftrs-{id}")))
+}
+
+/// 带快照目录的装配（data/ctrl-raftrs/）。
+pub fn spawn_with_dir(id: i32, peers: Vec<i32>, router: RaftRsRouter, dir: PathBuf) -> RaftRsHandle {
     let (cmd_tx, cmd_rx) = mpsc::channel();
     let _ = engine_cmd_tx().set(cmd_tx.clone());
     let (msg_tx, msg_rx) = mpsc::channel();
-    let shared = Arc::new(Mutex::new(ClusterState::default()));
+    std::fs::create_dir_all(&dir).ok();
+    // 重启恢复：快照文件优先（applied 状态），否则空态由 leader 日志重放追平
+    let shared = Arc::new(Mutex::new(
+        std::fs::read_to_string(dir.join("state.json"))
+            .ok()
+            .and_then(|d| serde_json::from_str::<ClusterState>(&d).ok())
+            .unwrap_or_default(),
+    ));
     let is_leader = Arc::new(std::sync::atomic::AtomicBool::new(false));
     let leader_id = Arc::new(std::sync::atomic::AtomicI32::new(0));
     let applied = Arc::new(std::sync::atomic::AtomicU64::new(0));
@@ -281,6 +295,7 @@ pub fn spawn(id: i32, peers: Vec<i32>, router: RaftRsRouter) -> RaftRsHandle {
     let is_leader_t = is_leader.clone();
     let leader_id_t = leader_id.clone();
     let applied_t = applied.clone();
+    let snapshot_dir = dir.clone();
 
     router.register(id, msg_tx);
 
@@ -298,7 +313,37 @@ pub fn spawn(id: i32, peers: Vec<i32>, router: RaftRsRouter) -> RaftRsHandle {
         });
         let node = RawNode::new(&cfg, mem_store, &logger()).unwrap();
 
-        driver(id, node, router, cmd_rx, msg_rx, shared_clone, is_leader_t, leader_id_t, applied_t);
+        let shared_snap = shared_clone.clone();
+        let last_ver = Arc::new(std::sync::atomic::AtomicU64::new(0));
+        let last_ver_t = last_ver.clone();
+        let snap_dir = snapshot_dir.clone();
+        let snap_dir_t = snap_dir.clone();
+        std::thread::spawn(move || {
+            // 快照落盘循环：状态 version 有变更才写（每 2s 检查）
+            loop {
+                std::thread::sleep(Duration::from_secs(2));
+                let st = shared_snap.lock().unwrap().clone();
+                if st.version != last_ver_t.load(std::sync::atomic::Ordering::Relaxed) {
+                    let _ = std::fs::write(
+                        snap_dir_t.join("state.json"),
+                        serde_json::to_string(&st).unwrap(),
+                    );
+                    last_ver_t.store(st.version, std::sync::atomic::Ordering::Relaxed);
+                }
+            }
+        });
+        driver(
+            id,
+            node,
+            router,
+            cmd_rx,
+            msg_rx,
+            shared_clone,
+            is_leader_t,
+            leader_id_t,
+            applied_t,
+            snap_dir.clone(),
+        );
     });
 
     RaftRsHandle { id, tx: cmd_tx, shared, is_leader, leader_id, applied }

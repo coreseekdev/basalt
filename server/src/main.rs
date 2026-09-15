@@ -62,7 +62,12 @@ async fn async_main(cfg: Config) {
         let engine_handle = if crate::ctrl_raft::raftrs_engine::engine_enabled() {
             let peers: Vec<i32> = cfg.nodes.iter().map(|(id, _, _)| *id).collect();
             let router = crate::ctrl_raft::raftrs_engine::RaftRsRouter::new();
-            Some(crate::ctrl_raft::raftrs_engine::spawn(cfg.node_id, peers, router))
+            Some(crate::ctrl_raft::raftrs_engine::spawn_with_dir(
+                cfg.node_id,
+                peers,
+                router,
+                std::path::Path::new(&cfg.data_dir).join("ctrl-raftrs"),
+            ))
         } else {
             None
         };

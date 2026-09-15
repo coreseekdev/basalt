@@ -771,7 +771,7 @@ mod failover_tests {
         let dir = std::env::temp_dir().join(format!("ctrl-test-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         let log = dir.join("ctrl.log");
-        let mut ctrl = Controller::open(0, log.clone(), Duration::from_millis(4000), rx);
+        let mut ctrl = Controller::open(0, log.clone(), Duration::from_millis(4000), rx, None);
         for i in 0..3 {
             ctrl.apply_and_persist(&ClusterRecord::RegisterBroker(BrokerInfo {
                 node_id: i, host: "h".into(), port: 9000 + i as u16,

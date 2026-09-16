@@ -594,8 +594,8 @@ impl FollowerPull {
                             Err(_) => {}
                         }
                     } else {
-                        // leader 无新数据：等 leader HW 或下一个间隔
-                        tokio::time::sleep(std::time::Duration::from_millis(150)).await;
+                        // leader 无新数据：长轮询（FetchSlice 250ms 兜底）已
+                        // 在 leader 侧挂起——立即重新发起，数据到达即刻响应
                     }
                 }
                 Err(e) => {

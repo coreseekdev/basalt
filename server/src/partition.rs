@@ -109,6 +109,17 @@ struct PendingFetch {
     reply: oneshot::Sender<FetchOutcome>,
 }
 
+/// 副本拉取长轮询（T-M2.4）：follower 的 FetchSlice 在 leader 无新数据时
+/// 挂起，数据到达（append/advance）即刻响应——消除 150ms 轮询节拍对
+/// acks=all 延迟的主导（基线 p50=152ms 实证）。
+struct PendingReplica {
+    follower: i32,
+    offset: i64,
+    max_bytes: usize,
+    deadline: Instant,
+    reply: oneshot::Sender<SliceOutcome>,
+}
+
 struct ParkedAck {
     base_offset: i64,
     last_offset: i64,
@@ -145,6 +156,7 @@ pub struct PartitionActor {
     /// 收缩 = isr_lag 内无上报（显式移除，advance_hw 扫描）；重回 = 上报
     /// offset ≥ next_offset（完全追平）。HW = min(ISR LEO)。
     isr: std::collections::BTreeSet<i32>,
+    pending_replica: Vec<PendingReplica>,
     /// batch_io 窗口内的 produce 应答（ADR-14）：flush 成功后才发放；
     /// flush 失败改发错误——杜绝"ack 而未写文件"（持久化点纪律）。
     deferred_produce: Vec<(oneshot::Sender<ProduceOutcome>, ProduceOutcome)>,
@@ -188,6 +200,7 @@ impl PartitionActor {
             follower_leos: HashMap::new(),
             parked_acks: Vec::new(),
             isr: std::collections::BTreeSet::new(),
+            pending_replica: Vec::new(),
             deferred_produce: Vec::new(),
             repl,
         };
@@ -215,12 +228,14 @@ impl PartitionActor {
             self.settle_deferred_produce(flush_result.is_ok());
             self.on_deadline();
             self.serve_pending();
-            // 唤醒时机：fetch 截止 / ack 停等超时，二者取最近
+            self.serve_replica_pends();
+            // 唤醒时机：fetch 截止 / ack 停等超时 / 副本长轮询超时，取最近
             let next_deadline = self
                 .pending
                 .iter()
                 .map(|p| p.deadline)
                 .chain(self.parked_acks.iter().map(|p| p.deadline))
+                .chain(self.pending_replica.iter().map(|p| p.deadline))
                 .min();
             if let Some(next_deadline) = next_deadline {
                 let now = Instant::now();
@@ -238,6 +253,7 @@ impl PartitionActor {
                             self.settle_deferred_produce(flush_ok);
                             self.on_deadline();
                             self.serve_pending();
+                            self.serve_replica_pends();
                         }
                         Ok(None) => break,
                         Err(_elapsed) => self.on_deadline(),
@@ -263,6 +279,8 @@ impl PartitionActor {
                 i += 1;
             }
         }
+        // 副本长轮询到期：返回空切片（follower 立即重新发起）
+        self.serve_replica_pends();
         // ack 停等超时：NotEnoughReplicas
         let mut i = 0;
         while i < self.parked_acks.len() {
@@ -391,6 +409,7 @@ impl PartitionActor {
                     };
                     // acks=all 且有其他副本：停等 HW 追上（follower 上报驱动；超时 NotEnoughReplicas）
                     let followers: Vec<i32> = self.replicas.iter().copied().filter(|r| *r != self.node_id).collect();
+                    self.serve_replica_pends();
                     if acks == -1 && !followers.is_empty() && outcome.error.is_none() {
                         self.parked_acks.push(ParkedAck {
                             base_offset: outcome.base_offset,
@@ -460,22 +479,21 @@ impl PartitionActor {
                         }
                         self.follower_leos.insert(follower, (offset, Instant::now()));
                     }
-                    let out = if offset < self.log.next_offset {
-                        self.log.read_ex(offset, max_bytes, &self.pool, ReadCap::LogEnd).ok()
-                    } else {
-                        Some(ReadResult {
-                            data: Bytes::new(),
-                            first_offset: offset,
-                            high_watermark: self.log.high_watermark,
-                            log_start_offset: self.log.log_start_offset,
-                        })
-                    };
-                    let slice = SliceOutcome {
-                        error: None,
-                        high_watermark: self.log.high_watermark,
-                        next_offset: self.log.next_offset,
-                        data: out.map(|r| r.data).unwrap_or_else(Bytes::new),
-                    };
+                    if offset >= self.log.next_offset {
+                        // 长轮询（T-M2.4）：无新数据 → 挂起到数据到达或 250ms
+                        // 兜底到期（事件唤醒主路径，150ms 轮询节拍退役）
+                        self.pending_replica.push(PendingReplica {
+                            follower,
+                            offset,
+                            max_bytes,
+                            deadline: Instant::now() + Duration::from_millis(250),
+                            reply,
+                        });
+                        self.advance_hw();
+                        self.release_acks();
+                        continue;
+                    }
+                    let slice = self.read_slice_for(offset, max_bytes);
                     let _ = reply.send(slice);
                     self.advance_hw();
                     self.release_acks();
@@ -491,6 +509,7 @@ impl PartitionActor {
                         .is_ok();
                     if r {
                         self.advance_hw();
+                        self.serve_replica_pends(); // 拉齐落盘也是"新数据到达"
                     }
                     let _ = reply.send(r);
                 }
@@ -611,6 +630,51 @@ impl PartitionActor {
             } else {
                 i += 1;
             }
+        }
+    }
+
+    /// 副本长轮询服务：有新数据即按 LogEnd 读取返回；到期返回空
+    /// （follower 的 150ms 兜底退化为纯保险）。
+    fn serve_replica_pends(&mut self) {
+        let mut i = 0;
+        while i < self.pending_replica.len() {
+            let expired = self.pending_replica[i].deadline <= Instant::now();
+            let ready = self.pending_replica[i].offset < self.log.next_offset;
+            if !expired && !ready {
+                i += 1;
+                continue;
+            }
+            let p = self.pending_replica.remove(i);
+            let slice = if ready {
+                self.read_slice_for(p.offset, p.max_bytes)
+            } else {
+                SliceOutcome {
+                    error: None,
+                    high_watermark: self.log.high_watermark,
+                    next_offset: self.log.next_offset,
+                    data: Bytes::new(),
+                }
+            };
+            let _ = p.reply.send(slice);
+        }
+    }
+
+    fn read_slice_for(&mut self, offset: i64, max_bytes: usize) -> SliceOutcome {
+        let out = if offset < self.log.next_offset {
+            self.log.read_ex(offset, max_bytes, &self.pool, ReadCap::LogEnd).ok()
+        } else {
+            Some(ReadResult {
+                data: Bytes::new(),
+                first_offset: offset,
+                high_watermark: self.log.high_watermark,
+                log_start_offset: self.log.log_start_offset,
+            })
+        };
+        SliceOutcome {
+            error: None,
+            high_watermark: self.log.high_watermark,
+            next_offset: self.log.next_offset,
+            data: out.map(|r| r.data).unwrap_or_else(Bytes::new),
         }
     }
 

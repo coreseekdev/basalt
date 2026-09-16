@@ -83,3 +83,17 @@ p99=153.4ms**。两个观察：
 ② 单条延迟三者几乎相等且恒定 ⇒ 由 follower pull 节拍主导（非抖动），
 **T-M2.4 调优靶子 = pull 间隔/聚批**（按 follower 聚批、拉取节拍缩短）。
 基准脚本入库：benches/throughput_replicated.py。
+
+## T-M2.4 调优落地（2026-09-16，副本拉取长轮询）
+
+152ms 恒定 acks 延迟的根因 = follower"无新数据 sleep(150ms)"轮询节拍钉死
+LEO 上报。改为 **FetchSlice 长轮询**（Kafka 同款）：leader 无新数据时把
+拉取请求挂起（PendingReplica 队列，事件唤醒 + 250ms 兜底），数据到达
+（produce append / reconcile append / advance_hw）即刻响应；follower 端
+删除 150ms 空转 sleep，形成持续挂起的拉取流。
+
+复测（挂起队列 deadline 路径漏服务导致的 actor 忙循环修复后）：
+produce **249,446 msg/s（243.6 MB/s）**——较 152ms 时代 120K 提升 **~2.1×**、
+达单节点（473K）的 53%；acks=all 延迟 p50=1.0ms / p90=1.1ms / p99=1.7ms
+——**152ms → 1.0ms（150×）**。挂起路径的 deadline 服务遗漏以
+frozen_face 挂死实证并修复（on_deadline 补 serve_replica_pends）。

@@ -43,7 +43,7 @@ Basalt：Rust 版 Kafka 兼容消息流平台
 **版本分界（2026-09-08 决策）**：
 
 - **v1 = M0–M2 + T-M3.1（幂等 producer）**：3 节点集群、acks=all、Classic 消费组、ELR 选举、failover L1。对外发布的第一个可用版本。
-- **v2（依序）**：T-M3.2 事务（直接 TV2）→ T-M3.3/3.4 KIP-848 + cooperative → T-M4.3 分层存储 + 存储模式插件（ADR-11）→ share groups 评估（触发条件：librdkafka 支持落地）。**T-M3.2 与 T-M4.3 启动设计前先读 [Arroyo §11](../docs/12-arroyo.md)**（对象存储 manifest/fencing/两段提交协议专项精读，ADR-11 路线的现成参照实现）。
+- **v2（依序）**：T-M3.2 事务（直接 TV2）→ T-M3.3/3.4 KIP-848 + cooperative → T-M4.3 分层存储 + 存储模式插件（ADR-11）→ share groups 评估（触发条件：librdkafka 支持落地）。**T-M3.2 与 T-M4.3 启动设计前先读 [Arroyo §11](../docs/12-arroyo.md)**（对象存储 manifest/fencing/两段提交协议专项精读，ADR-11 路线的现成参照实现；2026-09-16 增补对照：[Morax §6](../docs/16-morax.md)——RDS 权威 + 不可变对象的另一端点路线，T-M4.3 启动时两路并排评审）。
 
 ---
 

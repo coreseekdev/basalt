@@ -77,8 +77,9 @@ pub enum ErrorCode {
     InvalidRequest = 42,
     UnsupportedForMessageFormat = 43,
     PolicyViolation = 44,
-    UnknownLeaderEpoch = 45, // 4.5: FENCED_LEADER_EPOCH=74? 顺序按 Kafka：45=UnknownLeaderEpoch? 见下注
+    OutOfOrderSequence = 45, // Kafka 官方：45=OUT_OF_ORDER_SEQUENCE（此前误标 UnknownLeaderEpoch 且与 74 撞号）
     FencedLeaderEpoch = 74,
+    UnknownLeaderEpoch = 75,
     UnknownTopicId = 100,
     DuplicateSequenceNumber = 46,
     InvalidProducerEpoch = 47,

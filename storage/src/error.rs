@@ -14,6 +14,8 @@ pub enum StorageError {
     NotLeader,
     #[error("not enough replicas (isr below min.insync)")]
     NotEnoughReplicas,
+    #[error("out of order sequence {0} (expected {1})")]
+    OutOfOrderSequence(i32, i32),
     #[error("{0}")]
     Other(String),
 }

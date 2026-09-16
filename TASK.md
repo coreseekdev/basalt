@@ -95,7 +95,7 @@ Basalt：Rust 版 Kafka 兼容消息流平台
 
 | ID | 状态 | 任务 | 产出物 | 验收标准 | 依赖 | 参考 |
 |---|---|---|---|---|---|---|
-| T-M3.1 | ⬜ | 幂等 producer | InitProducerId；PID+epoch+sequence 服务端去重（最近 5 批缓存）；in-flight 限制 | 客户端重试风暴下零重复（仿真+rdkafka 幂等模式） | T-M2.3 | [Kafka §6](../docs/01-apache-kafka.md) |
+| T-M3.1 | 🟨 | 幂等 producer | **服务端去重已落地（2026-09-16）**：InitProducerId（进程内 PID 计数，跨 broker 唯一性 POC 边界）+ partition actor 幂等状态机（PID → epoch/last_seq/最近 5 批缓存：重复回放缓存偏移、乱序回 OutOfOrderSequence(45)、epoch 升级重置会话）+ 错误码 45/74/75 撞号修复；franz-go（默认幂等）e2e ✅、确定性单测 ×2 ✅ | 剩余：rdkafka enable.idempotence=true 显式 e2e；跨 broker PID 唯一性（经控制器分配）；重试风暴仿真 | T-M2.3 | [Kafka §6](../docs/01-apache-kafka.md) |
 | T-M3.2 | ⬜ | 事务 | txn coordinator + 内部日志；事务版本直接 TV2（KIP-890，ADR-9）不做 TV1 兼容；LSO 推进；control record 占 offset 不投递；read_committed 过滤；KIP-447 验证；接管恢复判定纯函数化（Ready/ReplayCommit/Orphaned 三态） | read_uncommitted/read_committed 对比专项；abort 后数据不可见但 offset 已消耗 | T-M3.1 | [Kafka §5/§6](../docs/01-apache-kafka.md) [Arroyo §11](../docs/12-arroyo.md) |
 | T-M3.3 | ⬜ | KIP-848 新消费组协议 | ConsumerGroupHeartbeat、服务端分配、增量 rebalance；Range/RoundRobin/Sticky 分配器 | 新旧协议混布 rebalance 收敛；客户端（kafka-clients 4.x）跑通 | T-M1.1 | [Kafka §5](../docs/01-apache-kafka.md) |
 | T-M3.4 | ⬜ | cooperative-sticky rebalance | 增量 partition 交接协议 | franz-go/rdkafka cooperative 模式跑通且无停顿式双全量 rebalance | T-M3.3 | [生态 §C](../docs/08-ecosystem.md) |

@@ -303,6 +303,7 @@ pub async fn produce(version: i16, acks: i16, targets: Vec<ProduceTarget>, ctx: 
                     let err = match &out.error {
                         Some(basalt_storage::StorageError::CorruptBatch { .. }) => ErrorCode::CorruptMessage,
                         Some(StorageError::NotEnoughReplicas) => ErrorCode::NotEnoughReplicas,
+                        Some(StorageError::OutOfOrderSequence(..)) => ErrorCode::OutOfOrderSequence,
                         Some(StorageError::NotLeader) => ErrorCode::NotLeaderOrFollower,
                         Some(StorageError::OffsetOutOfRange(_)) => ErrorCode::OffsetOutOfRange,
                         Some(_) => ErrorCode::UnknownServer,

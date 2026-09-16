@@ -112,6 +112,22 @@ struct PendingFetch {
     reply: oneshot::Sender<FetchOutcome>,
 }
 
+/// 幂等 producer 状态（T-M3.1，KIP-130）：PID → 最近 5 批的序列与偏移。
+/// 重复批次（base_sequence ∈ [last-4, last]）返回原偏移不重复追加；
+/// 乱序（> last+1）回 OutOfOrderSequence；epoch 升级重置会话。
+struct IdemBatch {
+    base_seq: i32,
+    base_offset: i64,
+    last_offset: i64,
+}
+
+#[derive(Default)]
+struct IdemState {
+    epoch: i16,
+    last_seq: Option<i32>,
+    recent: std::collections::VecDeque<IdemBatch>, // back = 最新
+}
+
 /// 副本拉取长轮询（T-M2.4）：follower 的 FetchSlice 在 leader 无新数据时
 /// 挂起，数据到达（append/advance）即刻响应——消除 150ms 轮询节拍对
 /// acks=all 延迟的主导（基线 p50=152ms 实证）。
@@ -159,6 +175,7 @@ pub struct PartitionActor {
     /// 收缩 = isr_lag 内无上报（显式移除，advance_hw 扫描）；重回 = 上报
     /// offset ≥ next_offset（完全追平）。HW = min(ISR LEO)。
     isr: std::collections::BTreeSet<i32>,
+    idem: std::collections::HashMap<i64, IdemState>,
     pending_replica: Vec<PendingReplica>,
     /// batch_io 窗口内的 produce 应答（ADR-14）：flush 成功后才发放；
     /// flush 失败改发错误——杜绝"ack 而未写文件"（持久化点纪律）。
@@ -203,6 +220,7 @@ impl PartitionActor {
             follower_leos: HashMap::new(),
             parked_acks: Vec::new(),
             isr: std::collections::BTreeSet::new(),
+            idem: std::collections::HashMap::new(),
             pending_replica: Vec::new(),
             deferred_produce: Vec::new(),
             repl,
@@ -314,6 +332,75 @@ impl PartitionActor {
             .collect()
     }
 
+    /// 幂等去重检查（T-M3.1，KIP-130 服务器侧）。
+    /// 返回 Some(outcome) = 重复批（回放缓存偏移）或序列错误（不落盘）；
+    /// None = 新批次，继续 append。producer_id < 0 走非幂等路径。
+    fn idem_check(&mut self, batches: &Bytes) -> Option<ProduceOutcome> {
+        let h = basalt_record::BatchHeader::parse(batches)?;
+        if h.producer_id < 0 {
+            return None;
+        }
+        let st = self.idem.entry(h.producer_id).or_default();
+        // epoch 升级：新会话（重置序列）；epoch 倒退 = fence
+        if h.producer_epoch > st.epoch {
+            st.epoch = h.producer_epoch;
+            st.last_seq = None;
+            st.recent.clear();
+        } else if h.producer_epoch < st.epoch {
+            return Some(ProduceOutcome {
+                base_offset: -1, last_offset: -1, log_append_time: now_ms(),
+                error: Some(StorageError::Other("invalid producer epoch".into())),
+            });
+        }
+        let Some(last) = st.last_seq else {
+            // 会话首批：任意 base_sequence 皆可（客户端从 0 起）
+            st.last_seq = Some(h.base_sequence);
+            return None;
+        };
+        if h.base_sequence == last + 1 {
+            st.last_seq = Some(h.base_sequence);
+            return None; // 新批次 → 正常 append（偏移由 append 后记录）
+        }
+        if h.base_sequence <= last {
+            // 重复或过期：最近 5 批内 → 回放缓存偏移（客户端重试语义）
+            if h.base_sequence > last - 5 {
+                if let Some(b) = st.recent.iter().rev().find(|b| b.base_seq == h.base_sequence) {
+                    return Some(ProduceOutcome {
+                        base_offset: b.base_offset, last_offset: b.last_offset,
+                        log_append_time: now_ms(), error: None,
+                    });
+                }
+            }
+            return Some(ProduceOutcome {
+                base_offset: -1, last_offset: -1, log_append_time: now_ms(),
+                error: Some(StorageError::Other("duplicate sequence too old".into())),
+            });
+        }
+        // 乱序（base > last+1）：gap
+        Some(ProduceOutcome {
+            base_offset: -1, last_offset: -1, log_append_time: now_ms(),
+            error: Some(StorageError::OutOfOrderSequence(h.base_sequence, last + 1)),
+        })
+    }
+
+    /// append 成功后记录幂等缓存（最近 5 批）。
+    fn idem_record(&mut self, batches: &Bytes, outcome: &ProduceOutcome) {
+        let Some(h) = basalt_record::BatchHeader::parse(batches) else { return };
+        if h.producer_id < 0 {
+            return;
+        }
+        let st = self.idem.entry(h.producer_id).or_default();
+        st.last_seq = Some(h.base_sequence);
+        st.recent.push_back(IdemBatch {
+            base_seq: h.base_sequence,
+            base_offset: outcome.base_offset,
+            last_offset: outcome.last_offset,
+        });
+        while st.recent.len() > 5 {
+            st.recent.pop_front();
+        }
+    }
+
     /// ADR-14：batch_io 窗口收口——flush 结果决定延后应答的最终状态。
     fn settle_deferred_produce(&mut self, flush_ok: bool) {
         let deferred = std::mem::take(&mut self.deferred_produce);
@@ -390,6 +477,12 @@ impl PartitionActor {
                         });
                         continue;
                     }
+                    // 幂等去重（T-M3.1）：重复批回放缓存偏移（立即应答，
+                    // 不进停等/窗口）；乱序回 OutOfOrderSequence（可重试）
+                    if let Some(dup) = self.idem_check(&batches) {
+                        let _ = reply.send(dup);
+                        continue;
+                    }
                     let now = now_ms();
                     let m = crate::partition::metrics();
                     m.produce_requests.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
@@ -410,6 +503,7 @@ impl PartitionActor {
                             ProduceOutcome { base_offset: -1, last_offset: -1, log_append_time: now, error: Some(e) }
                         }
                     };
+                    self.idem_record(&batches, &outcome);
                     // acks=all 且有其他副本：停等 HW 追上（follower 上报驱动；超时 NotEnoughReplicas）
                     let followers: Vec<i32> = self.replicas.iter().copied().filter(|r| *r != self.node_id).collect();
                     self.serve_replica_pends();
@@ -1008,6 +1102,111 @@ mod frozen_face_tests {
         assert!(o.error.is_none(), "{:?}", o.error);
         assert_eq!(o.last_offset, 0);
 
+        drop(tx);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+}
+
+#[cfg(test)]
+mod idempotence_tests {
+    //! T-M3.1 幂等 producer：服务端去重（KIP-130 服务器侧）。
+    //! 重复批回放缓存偏移不重复追加；乱序回 OutOfOrderSequence；
+    //! epoch 升级重置会话。
+
+    use super::*;
+    use basalt_record::{encode_batch, Rec};
+    use basalt_storage::log::{FsyncSchedule, LogOptions};
+    use bytes::{Bytes, BytesMut};
+
+    fn batch_bytes_idem(pid: i64, epoch: i16, seq: i32, tag: &str) -> Bytes {
+        let recs: Vec<Rec> = (0..1)
+            .map(|i| Rec {
+                timestamp_delta: i as i64,
+                key: Some(Bytes::from(format!("k{i}"))),
+                value: Some(Bytes::from(format!("{tag}-{i}"))),
+                headers: vec![],
+            })
+            .collect();
+        let mut b = BytesMut::new();
+        encode_batch(0, 0, 1000, 0, pid, epoch, seq, &recs, &mut b);
+        b.freeze()
+    }
+
+    async fn spawn_leader(tag: &str) -> (mpsc::Sender<PartitionCmd>, std::path::PathBuf) {
+        let dir = std::env::temp_dir().join(format!(
+            "basalt-idem-{tag}-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let pool = std::sync::Arc::new(BufferPool::new());
+        let tx = PartitionActor::spawn(
+            "idem".into(), 0, 0, dir.clone(),
+            LogOptions { segment_max_bytes: 1 << 30, fsync: FsyncSchedule::Os, retention_ms: 0, retention_max_bytes: 0 },
+            ReplicaConfig { min_insync: 1, isr_lag: Duration::from_millis(500) },
+            pool,
+        ).unwrap();
+        tx.send(PartitionCmd::SetRole { leader: true, epoch: 1, replicas: vec![0] }).await.unwrap();
+        (tx, dir)
+    }
+
+    async fn produce(tx: &mpsc::Sender<PartitionCmd>, pid: i64, epoch: i16, seq: i32, tag: &str) -> ProduceOutcome {
+        let (ptx, prx) = oneshot::channel();
+        tx.send(PartitionCmd::Produce {
+            batches: batch_bytes_idem(pid, epoch, seq, tag),
+            policy: AssignPolicy::Assign,
+            acks: 1,
+            reply: ptx,
+        }).await.unwrap();
+        prx.await.unwrap()
+    }
+
+    async fn leo(tx: &mpsc::Sender<PartitionCmd>) -> i64 {
+        let (ltx, lrx) = oneshot::channel();
+        tx.send(PartitionCmd::LocalLeo { reply: ltx }).await.unwrap();
+        lrx.await.unwrap()
+    }
+
+    #[tokio::test]
+    async fn idempotent_dedup_and_out_of_order() {
+        let (tx, dir) = spawn_leader("dedup").await;
+
+        // seq 0：新会话首批
+        let o0 = produce(&tx, 100, 0, 0, "m0").await;
+        assert!(o0.error.is_none(), "{:?}", o0.error);
+        assert_eq!(o0.base_offset, 0);
+        // seq 1：顺序新批
+        let o1 = produce(&tx, 100, 0, 1, "m1").await;
+        assert!(o1.error.is_none() && o1.base_offset == 1);
+        assert_eq!(leo(&tx).await, 2);
+
+        // 重复 seq 0：回放缓存偏移，不重复追加
+        let od = produce(&tx, 100, 0, 0, "dup").await;
+        assert!(od.error.is_none(), "重复批应成功回放");
+        assert_eq!(od.base_offset, 0, "重复批应回放原偏移");
+        assert_eq!(leo(&tx).await, 2, "重复批不得推进 LEO");
+
+        // 乱序 seq 3（gap）：OutOfOrderSequence 错误
+        let og = produce(&tx, 100, 0, 3, "gap").await;
+        assert!(og.error.is_some(), "gap 必须报错");
+        assert_eq!(leo(&tx).await, 2, "gap 不得推进 LEO");
+
+        // 补上 seq 2：恢复正常
+        let o2 = produce(&tx, 100, 0, 2, "m2").await;
+        assert!(o2.error.is_none() && o2.base_offset == 2);
+
+        drop(tx);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn epoch_bump_resets_session() {
+        let (tx, dir) = spawn_leader("epoch").await;
+        let o0 = produce(&tx, 200, 0, 5, "e0").await;  // 任意首序列皆可
+        assert!(o0.error.is_none());
+        // epoch 升级：会话重置，序列从 0 重新开始
+        let o1 = produce(&tx, 200, 1, 0, "e1").await;
+        assert!(o1.error.is_none() && o1.base_offset == 1);
         drop(tx);
         let _ = std::fs::remove_dir_all(&dir);
     }

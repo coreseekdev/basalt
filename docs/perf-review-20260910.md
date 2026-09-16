@@ -72,3 +72,14 @@ conn.rs 请求并发派发的响应乱序修复（写任务按请求序重排缓
 produce 441K / 473K msg/s（两轮，基准区间 437-605K 内）、consume 234K / 244K msg/s
 （基准 254K 的 -4~8%，单次采样方差量级）、individual latency p50=0.0ms p99=0.1ms
 （持平）。重排缓冲为每响应一次 BTreeMap 插入，µs 级，不构成瓶颈。
+
+## 三副本 acks=all 基线（2026-09-16，T-M2.4 首次实测）
+
+benches/throughput_replicated.py 对 3 节点引擎模式集群（raftrs）：
+produce **120,237 msg/s（117.4 MB/s）**（acks=all 经复制面放行）、
+consume 72,788 msg/s、**单条 acks=all 延迟 p50=152.0ms / p90=152.9ms /
+p99=153.4ms**。两个观察：
+① 复制面吞吐为单节点（473K）的 ~1/4——pull 复制 + 提交面放行的固有成本；
+② 单条延迟三者几乎相等且恒定 ⇒ 由 follower pull 节拍主导（非抖动），
+**T-M2.4 调优靶子 = pull 间隔/聚批**（按 follower 聚批、拉取节拍缩短）。
+基准脚本入库：benches/throughput_replicated.py。

@@ -29,6 +29,14 @@ replication-commit-recovery:      ; $(TLC) -deadlock -config replication-commit-
 # 无 reconciliation 突变体必须被 InvLeaderServingHasAcked 检出
 replication-commit-norecon: ; $(TLC) -config replication-commit-norecon.cfg ReplicationCommit.tla
 
+# 事务协议（ADR-18 §11，T-M3.2 块 d）：名义全空间绿（1,088 态）；
+# 两只判别力阴性对照必须红——①无 Prepare 持久化（InvCommitEffectDurable，
+# lost writes）②无终态 fence（InvFenceClosed，僵尸续写复活开事务）
+transaction-commit:           ; $(TLC) -config transaction-commit.cfg TransactionCommit.tla
+transaction-commit-noprepare: ; $(TLC) -config transaction-commit-noprepare.cfg TransactionCommit.tla
+transaction-commit-nofence:   ; $(TLC) -config transaction-commit-nofence.cfg TransactionCommit.tla
+.PHONY: transaction-commit transaction-commit-noprepare transaction-commit-nofence
+
 # 数据面活性（P2-2 闭合）：稳定变体期望绿；churn 变体期望红（负结果已入账）
 dp-liveness-stable: ; $(TLC) -deadlock -config dp-liveness-stable.cfg BasaltDataPlaneLiveness.tla
 dp-liveness:         ; $(TLC) -deadlock -config dp-liveness.cfg BasaltDataPlaneLiveness.tla

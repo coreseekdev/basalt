@@ -275,7 +275,11 @@ UnknownServer 会让 java 客户端无限重试，fence 形同虚设）。
   前件必须是「效果已现」而非「Complete 已落」，否则无 Prepare 突变体平凡绿）。
 
 **判别力阴性对照（两只，防平凡绿/恒绿 cfg——账本 ㊼ 教训；review 预判
-修正后的可达窗口）**：
+修正后的可达窗口）✅ 已落地（2026-09-17）：名义 1,088 态全空间绿；
+①突变体 142 态被 InvCommitEffectDurable 检出、②突变体 170 态被
+InvFenceClosed 检出——各自被指定不变式抓到，无恒绿无平凡绿；三 cfg 以
+CONSTANT 突变（PrepareDurable/FenceEnabled）替代 cfg 参数漂移，
+Makefile `transaction-commit{,-noprepare,-nofence}` 入 CI。**
 ① 无 Prepare 持久化突变体：崩溃窗口 = **Prepare 落盘后至 Complete 前**
    （含部分 marker 已落/效果已现的时点）——必须被 InvCommitEffectDurable
    检出（「Prepare 前崩溃」无可见效果，不算数）；
@@ -317,7 +321,9 @@ UnknownServer 会让 java 客户端无限重试，fence 形同虚设）。
   （㊿：IsolationLevel/KeyType 两处）；另有 FindCoordinator v1-3 扁平响应
   位即协调器地址的形状缺陷（探针实证后修复——Coordinators[] 是 v4+ 字段，
   librdkafka/kafka-python 事务查找读扁平位）。**待做**：franz-go 事务档；
-  TLA+ 三门禁（§11）；T-M3.6 Jepsen 三场景进仿真 harness（≥500 seeds）；
+  TLA+ 三门禁 ✅（TransactionCommit.tla：6 不变式全空间绿 1,088 态 +
+  两只阴性对照红 142/170 态——CONSTANT 突变体制，CI 三步接线）；
+  T-M3.6 Jepsen 三场景进仿真 harness（≥500 seeds）；
   Describe/List 相位串已对齐官方命名（PrepareCommit 等）。
 
 ## 13. 与既有账本/机制的衔接

@@ -63,6 +63,20 @@ jobs:
           fi
       - name: 提交协议活性（㉟ 产出终被 ack；崩溃终恢复服务）
         run: make -C spec replication-commit-liveness replication-commit-recovery
+      - name: 事务协议名义（ADR-18 §11，全空间）
+        run: make -C spec transaction-commit
+      - name: 阴性对照——无 Prepare 持久化突变体必须被检出（ADR-18，lost writes）
+        run: |
+          if make -C spec transaction-commit-noprepare; then
+            echo "::error::无 Prepare 持久化突变体未检出——提交效果可被吞（lost writes）"
+            exit 1
+          fi
+      - name: 阴性对照——无终态 fence 突变体必须被检出（ADR-18，僵尸续写）
+        run: |
+          if make -C spec transaction-commit-nofence; then
+            echo "::error::无 fence 突变体未检出——僵尸续写复活开事务（LSO 永锚）"
+            exit 1
+          fi
 
 
   verus:

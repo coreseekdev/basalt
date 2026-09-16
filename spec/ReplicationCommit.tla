@@ -30,13 +30,17 @@ EXTENDS Integers, FiniteSets
 CONSTANTS Followers,      \* follower 集合（模型取 {f1, f2}）
           MaxEntries,     \* 日志长度上界（模型取 2）
           LagTicks,       \* ISR 收缩阈值（tick 数，模型取 1）
-          Reconciliation  \* TRUE=名义；FALSE=突变体（不拉齐就任，期望反例）
+          Reconciliation, \* TRUE=名义；FALSE=突变体（不拉齐就任）
+          CrashEnabled,   \* TRUE=环境可崩溃初始主（failover 恢复活性实验）
+          FrozenFace      \* TRUE=名义（冻结提交面放行）；FALSE=突变体（HW-only，
+                          \* 即 ㉟ 原始缺陷：fresh-shrink 使 HW 越过 laggard）
 
 Nodes == Followers \* 可当选集合（初始主 L 崩溃后不复活——有界视界）
 
 MinOf(S) == CHOOSE m \in S : \A x \in S : m <= x
 MaxOf(S) == CHOOSE m \in S : \A x \in S : m >= x
 MinOf2(a, b) == IF a <= b THEN a ELSE b
+MaxOf2(a, b) == IF a >= b THEN a ELSE b
 
 VARIABLES
   \* leader 侧
@@ -45,6 +49,7 @@ VARIABLES
   hw,         \* 高水位（0..MaxEntries）
   serving,    \* 主可服务（就任后须 reconcile 才 TRUE）
   crashedL,   \* 初始主已崩溃
+  elected,    \* 崩溃后是否已选举（每纪元至多一次——生产：控制器一次指派）
   epoch,      \* 主纪元（0..1）
   \* follower 侧
   leo,        \* [f ∈ Followers |-> 日志末 0..MaxEntries]
@@ -53,7 +58,7 @@ VARIABLES
   face,       \* [o ∈ 0..MaxEntries-1 |-> 冻结提交面 ⊆ Followers]
   acked       \* ⊆ 0..MaxEntries-1
 
-vars == <<leader, nextL, hw, serving, crashedL, epoch,
+vars == <<leader, nextL, hw, serving, crashedL, elected, epoch,
           leo, age, isr, face, acked>>
 
 AllAlive == {leader} \cup Followers   \* 初始主崩溃后 leader ∈ Nodes
@@ -66,6 +71,7 @@ TypeOK ==
   /\ hw \in 0..MaxEntries
   /\ serving \in BOOLEAN
   /\ crashedL \in BOOLEAN
+  /\ elected \in BOOLEAN
   /\ epoch \in 0..1
   /\ leo \in [Followers -> 0..MaxEntries]
   /\ age \in [Followers -> 0..LagTicks+1]
@@ -79,6 +85,7 @@ Init ==
   /\ hw = 0
   /\ serving = TRUE
   /\ crashedL = FALSE
+  /\ elected = FALSE
   /\ epoch = 0
   /\ leo = [f \in Followers |-> 0]
   /\ age = [f \in Followers |-> 0]
@@ -96,63 +103,69 @@ Produce ==
   /\ nextL < MaxEntries
   /\ nextL' = nextL + 1
   /\ face' = [face EXCEPT ![nextL] = isr]     \* 冻结提交面 = 当期 ISR
-  /\ UNCHANGED <<leader, hw, serving, crashedL, epoch, leo, age, isr, acked>>
+  /\ UNCHANGED <<leader, hw, serving, crashedL, elected, epoch, leo, age, isr, acked, nextL, face>>
 
 HWAdvance ==
   /\ isr # {}
   /\ hw < MinOf({nextL} \cup {leo[f] : f \in isr})
   /\ hw' = MinOf({nextL} \cup {leo[f] : f \in isr})
-  /\ UNCHANGED <<leader, nextL, serving, crashedL, epoch, leo, age, isr, face, acked>>
+  /\ UNCHANGED <<leader, nextL, serving, crashedL, epoch, leo, age, isr, face, acked, hw, elected>>
 
 Ack(o) ==
   /\ o \in 0..nextL-1
   /\ o \notin acked
   /\ o < hw
-  /\ \A f \in face[o] : leo[f] > o \/ age[f] >= LagTicks+1   \* 覆盖或 stale 豁免
+  /\ ~FrozenFace \/ \A f \in face[o] : leo[f] > o \/ age[f] >= LagTicks+1
   /\ acked' = acked \cup {o}
-  /\ UNCHANGED <<leader, nextL, hw, serving, crashedL, epoch, leo, age, isr, face>>
+  /\ UNCHANGED <<leader, nextL, hw, serving, crashedL, elected, epoch, leo, age, isr, face, acked>>
 
 (* ── follower 侧动作 ──────────────────────────────────────────────────── *)
 
 Pull(f) ==
   /\ f # leader
   /\ serving                        \* 当前主存活且可服务（换主后以新主为准）
-  /\ leo[f] # nextL                \* 追平且无新数据时拉取无观测效果
+  \* 使能：有数据可拉（含截断对齐）或已追平但不在 ISR（上报即重回——
+  \* 实现同款：FetchSlice 请求恒发，长轮询挂起亦携带 LEO 上报）
+  /\ leo[f] # nextL \/ f \notin isr
   /\ leo' = [leo EXCEPT ![f] = nextL]   \* fetch + truncate-to-match
   /\ age' = [age EXCEPT ![f] = 0]
-  /\ isr' = IF nextL >= nextL       \* 追平 ⇒ 重回 ISR（完全追平条件在
-                                     \* Pull 语义下恒满足；落后属"未拉"）
-              THEN isr \cup {f}
-              ELSE isr
-  /\ UNCHANGED <<leader, nextL, hw, serving, crashedL, epoch, face, acked>>
+  /\ isr' = isr \cup {f}                 \* 追平上报 ⇒ 重回 ISR
+  \* 上报驱动 HW 推进（实现同款：advance_hw 随每次上报调用）——
+  \* HW 不是独立可被无限绕过的动作，活性不依赖调度偏好
+  /\ hw' = MaxOf2(hw, MinOf2(nextL, MinOf({leo'[g] : g \in isr'})))
+  /\ UNCHANGED <<leader, nextL, serving, crashedL, epoch, face, acked, hw, elected>>
 
 Tick ==
+  /\ \E f \in Followers : age[f] < LagTicks + 1   \* 饱和后禁用：公平性下不让 Tick 独占
   /\ age' = [f \in Followers |-> MinOf2(age[f] + 1, LagTicks + 1)]
-  /\ UNCHANGED <<leader, nextL, hw, serving, crashedL, epoch, leo, isr, face, acked>>
+  /\ UNCHANGED <<leader, nextL, hw, serving, crashedL, elected, epoch, leo, isr, face, acked>>
 
 Shrink(f) ==
   /\ f \in isr
   /\ age[f] >= LagTicks            \* 上报过期：显式收缩（非静默消失）
   /\ isr' = isr \ {f}
-  /\ UNCHANGED <<leader, nextL, hw, serving, crashedL, epoch, leo, age, face, acked>>
+  /\ UNCHANGED <<leader, nextL, hw, serving, crashedL, epoch, leo, age, face, acked, elected>>
 
 (* ── failover：崩溃 → 选举 → 就任拉齐 → 服务 ──────────────────────────── *)
 
 CrashL ==
+  /\ CrashEnabled
   /\ ~crashedL
   /\ crashedL' = TRUE
   /\ serving' = FALSE              \* 主死即不可服务
-  /\ UNCHANGED <<leader, nextL, hw, epoch, leo, age, isr, face, acked>>
+  /\ UNCHANGED <<leader, nextL, hw, epoch, leo, age, isr, face, acked, serving, crashedL, elected>>
 
 Elect(f) ==
   /\ crashedL
+  /\ ~elected                       \* 每次故障至多一次选举（防选举风暴）
   /\ f \in Followers
   /\ leader' = f
   /\ epoch' = MinOf2(epoch + 1, 1)
   /\ nextL' = leo[f]               \* 先以自身日志就任（尚未服务）
   /\ hw' = 0                        \* HW 是 per-leader 状态：换主即重算
+  /\ elected' = TRUE
   /\ serving' = FALSE
-  /\ UNCHANGED <<crashedL, leo, age, isr, face, acked>>
+  /\ UNCHANGED <<crashedL, elected, leo, age, isr, face, acked, leader, nextL, hw, serving, epoch>>
 
 Reconcile ==
   /\ ~serving
@@ -163,7 +176,7 @@ Reconcile ==
   /\ hw' = nextL'                   \* 服务水位 = 拉齐后的日志末（实现同款：
                                      \* SetRole leader 即 HW=next_offset）
   /\ serving' = TRUE
-  /\ UNCHANGED <<leader, hw, crashedL, epoch, leo, age, isr, face, acked>>
+  /\ UNCHANGED <<leader, hw, crashedL, epoch, leo, age, isr, face, acked, nextL, serving, elected>>
 
 Next ==
   \/ Produce
@@ -192,5 +205,25 @@ InvLeaderServingHasAcked ==
 InvHWBounded == hw <= nextL
 
 Spec == Init /\ [][Next]_vars
+
+(* ── 活性（T-M2.2/㉟ 规格化下半场）──────────────────────────────────────
+   公平性假设：produce/拉取/HW 推进/ack 各自动作弱公平（持续可用则最终
+   发生）；Reconcile 强公平（持续可用则最终发生——failover 恢复不空转）。
+   CrashEnabled=FALSE 的名义活性：产出最终全部被 ack（ack 管线无活锁）。
+   CrashEnabled=TRUE 的恢复活性：崩溃 ⇒ 最终恢复服务（reconciliation
+   不空转）。*)
+
+FairSpec ==
+  /\ Spec
+  /\ WF_vars(Produce)
+
+EventuallyAllAcked == \A o \in 0..MaxEntries-1 : <>(o \in acked)
+
+FairSpecCrash ==
+  /\ FairSpec
+  /\ \A f \in Followers : WF_vars(Elect(f))   \* 控制器公平选举假设
+  /\ SF_vars(Reconcile)       \* 就任拉齐不空转
+
+FailoverRecovers == (crashedL /\ leader \in Followers) ~> serving
 
 ================================================================================

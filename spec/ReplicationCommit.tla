@@ -103,7 +103,7 @@ Produce ==
   /\ nextL < MaxEntries
   /\ nextL' = nextL + 1
   /\ face' = [face EXCEPT ![nextL] = isr]     \* 冻结提交面 = 当期 ISR
-  /\ UNCHANGED <<leader, hw, serving, crashedL, elected, epoch, leo, age, isr, acked, nextL, face>>
+  /\ UNCHANGED <<leader, hw, serving, crashedL, elected, epoch, leo, age, isr, acked>>
 
 HWAdvance ==
   /\ isr # {}
@@ -213,9 +213,20 @@ Spec == Init /\ [][Next]_vars
    CrashEnabled=TRUE 的恢复活性：崩溃 ⇒ 最终恢复服务（reconciliation
    不空转）。*)
 
+(* 🚧 WIP（2026-09-16）：名义活性（EventuallyAllAcked）反例未解。
+   反例形态：Produce×2 → Tick×2（age 饱和）→ 永久 stutter——follower 从不
+   pull、ack 从不发生。该 stutter 尾部中 Pull 持续 ENABLED 却从不发生，
+   WF/SF 均应排除之（已试 WF/ disjunctive/ SF 三种公平性形态 + 单
+   follower 最小模型，均复现）。怀疑点：TLC tableau 与「\E 动作上的
+   SF」/量化 WF 合取的交互，或活性性质需要条件化（稳定环境假设）。
+   下一步：fresh/ISR 双阈值分离建模 + 条件化活性重述（稳定 pull 环境
+   ⇒ ack 推进），参考 BasaltDataPlaneLiveness 的 FairDP 结构。 *)
 FairSpec ==
   /\ Spec
   /\ WF_vars(Produce)
+  /\ WF_vars(HWAdvance)
+  /\ SF_vars(\E f \in Followers : Pull(f))   \* 拉取循环永不退出（实现现实）
+  /\ \A o \in 0..MaxEntries-1 : WF_vars(Ack(o))
 
 EventuallyAllAcked == \A o \in 0..MaxEntries-1 : <>(o \in acked)
 

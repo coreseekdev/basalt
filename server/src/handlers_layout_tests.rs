@@ -691,7 +691,7 @@ pub mod handlers_layout_tests {
             _ => panic!("TransactionStates not array"),
         };
         assert_eq!(states.len(), 1);
-        assert_eq!(sfield(&states[0], "TransactionState").as_str(), "Complete");
+        assert_eq!(sfield(&states[0], "TransactionState").as_str(), "CompleteCommit");
 
         // ListTransactions v0 → 含 t1
         let k_lt = basalt_protocol::api::key::LIST_TRANSACTIONS;
@@ -782,6 +782,35 @@ pub mod handlers_layout_tests {
             let resp = handlers_groups::find_coordinator(1, &req, &ctx).await;
             let r = resp_decode(k_fc, 1, &resp_bytes(k_fc, 1, &resp));
             assert_eq!(fld(&r, "NodeId").as_i32(), 0);
+        }
+
+        // 块 c review P0 回归：KeyType 用 as_i8 解析 + 非自身 controller 经
+        // BrokerAddr 查运行期地址（此前 as_i32 对 Value::I8 静默返 0，事务
+        // 查找恒走组路径——单节点 controller==self 的恒真断言曾漏网）
+        {
+            use basalt_metadata::cluster::{BrokerInfo, ClusterState};
+            let mut state = ClusterState::default();
+            state.brokers.insert(0, BrokerInfo { node_id: 0, host: "localhost".into(), port: 9092 });
+            state.brokers.insert(1, BrokerInfo { node_id: 1, host: "localhost".into(), port: 9093 });
+            ctx.meta_tx.send(MetaCmd::ApplyCluster(Box::new(state))).await.unwrap();
+            let mut ctx_ctrl1 = ctx.clone();
+            ctx_ctrl1.controller_id = 1;
+            // 事务查找（v1 KeyType=1）→ broker 1 的运行期地址
+            let req = req_at(k_fc, 1, &as_struct_owned(s([
+                ("Key", Value::str("t1")), ("KeyType", Value::I8(1)),
+            ])));
+            let resp = handlers_groups::find_coordinator(1, &req, &ctx_ctrl1).await;
+            let r = resp_decode(k_fc, 1, &resp_bytes(k_fc, 1, &resp));
+            eprintln!("DBG fc resp: {:?} ec={}", fld(&r, "NodeId").as_i32(), fld(&r, "ErrorCode").as_i16());
+            assert_eq!(fld(&r, "NodeId").as_i32(), 1, "事务查找必须回 controller(1) 而非自身");
+            assert_eq!(fld(&r, "Port").as_i32(), 9093, "运行期地址（BrokerAddr 查询）");
+            // 组查找（KeyType=0）→ 自身
+            let req = req_at(k_fc, 1, &as_struct_owned(s([
+                ("Key", Value::str("g1")), ("KeyType", Value::I8(0)),
+            ])));
+            let resp = handlers_groups::find_coordinator(1, &req, &ctx_ctrl1).await;
+            let r = resp_decode(k_fc, 1, &resp_bytes(k_fc, 1, &resp));
+            assert_eq!(fld(&r, "NodeId").as_i32(), 0, "组查找回自身");
         }
 
         // 非 controller 面（txn_tx = None）：InitProducerId/AddPartitions 回 16

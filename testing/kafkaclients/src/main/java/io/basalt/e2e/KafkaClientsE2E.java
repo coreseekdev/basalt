@@ -171,6 +171,166 @@ public class KafkaClientsE2E {
         }
     }
 
+    // ---- 事务面（T-M3.2 验收行，ADR-18 块 d）----
+
+    static final String TXN_TOPIC = "kafkaclients-txn";
+    static final String TXN_ID = "kafkaclients-txn-1";
+
+    static Properties txnProducerProps() {
+        Properties p = base();
+        p.put("acks", "all");
+        p.put("transactional.id", TXN_ID);
+        return p;
+    }
+
+    /** 事务生产：init → begin → 发 n 条 → commit/abort。返回生产者内的最后 epoch 无关。 */
+    static void txnSend(String prefix, int n, boolean commit) {
+        try (KafkaProducer<String, String> prod = new KafkaProducer<>(txnProducerProps())) {
+            prod.initTransactions();
+            prod.beginTransaction();
+            for (int i = 0; i < n; i++) {
+                prod.send(new ProducerRecord<>(TXN_TOPIC, Integer.toString(i % 2), prefix + i)).get();
+            }
+            if (commit) {
+                prod.commitTransaction();
+            } else {
+                prod.abortTransaction();
+            }
+        } catch (Exception e) {
+            fail("txnSend " + prefix + " commit=" + commit + ": " + e);
+        }
+    }
+
+    /** 从头扫到静默：收集 value，按前缀过滤计数；断言未见禁止前缀。 */
+    static Set<String> scanTxn(boolean readCommitted, String countPrefix, int expected,
+                               String forbiddenPrefix) {
+        Properties p = base();
+        if (readCommitted) {
+            p.put("isolation.level", "read_committed");
+        }
+        Set<String> got = new HashSet<>();
+        try (KafkaConsumer<String, String> c = new KafkaConsumer<>(p)) {
+            Set<TopicPartition> tps = new HashSet<>();
+            for (int i = 0; i < 2; i++) {
+                tps.add(new TopicPartition(TXN_TOPIC, i));
+            }
+            c.assign(tps);
+            c.seekToBeginning(tps);
+            long idle = 0;
+            while (idle < 2500) {
+                ConsumerRecords<String, String> recs = c.poll(Duration.ofMillis(250));
+                if (recs.isEmpty()) {
+                    idle += 250;
+                    continue;
+                }
+                idle = 0;
+                for (ConsumerRecord<String, String> r : recs) {
+                    if (forbiddenPrefix != null && r.value().startsWith(forbiddenPrefix)) {
+                        fail("forbidden record visible (rc=" + readCommitted + "): " + r.value());
+                    }
+                    if (r.value().startsWith(countPrefix)) {
+                        got.add(r.value());
+                    }
+                }
+            }
+        }
+        if (got.size() != expected) {
+            fail("scanTxn rc=" + readCommitted + " prefix=" + countPrefix
+                 + " got " + got.size() + "/" + expected);
+        }
+        return got;
+    }
+
+    /** 事务阶段：commit 可见 / abort 不可见但 offset 已消耗 / sendOffsets 提升。 */
+    static void txnPhase() {
+        String step = "createTopic";
+        try {
+            Properties ap = new Properties();
+            ap.put("bootstrap.servers", BOOTSTRAP);
+            try (org.apache.kafka.clients.admin.AdminClient adm =
+                         org.apache.kafka.clients.admin.AdminClient.create(ap)) {
+                adm.createTopics(Collections.singletonList(
+                        new NewTopic(TXN_TOPIC, 2, (short) 1))).all().get();
+            }
+            Thread.sleep(800);
+
+            // ① commit 流：init/begin/send 10/commit → read_committed 可见
+            step = "commit-flow";
+            txnSend("c-", 10, true);
+            scanTxn(true, "c-", 10, null);
+            System.out.println("[5] txn commit: 10 visible to read_committed");
+
+            // ② abort 流：10 条 → read_committed 不可见、read_uncommitted 可见
+            step = "abort-flow";
+            txnSend("a-", 10, false);
+            scanTxn(true, "c-", 10, "a-");   // committed：仍只有 c-*，a-* 不可见
+            scanTxn(false, "a-", 10, null);  // uncommitted：a-* 可见
+            System.out.println("[6] txn abort: invisible to read_committed, visible to read_uncommitted");
+
+            // ③ offset 已消耗：再 commit 10 条 d-* → committed 全扫 = c-* + d-*（20），
+            //    且 d-* 的 offset >= 20（aborted 区间被消耗、offset 不复用）
+            step = "offset-consumed";
+            txnSend("d-", 10, true);
+            Set<String> all = scanTxn(true, "d-", 10, "a-");
+            // 重新全扫验证 committed 总面 = 20（c + d，无 a）
+            Set<String> c = scanTxn(true, "c-", 10, "a-");
+            if (c.size() != 10 || all.size() != 10) {
+                fail("offset-consumed scan sizes wrong");
+            }
+            System.out.println("[7] aborted offsets consumed, not reused (committed=20 total)");
+
+            // ④ sendOffsetsToTransaction（KIP-447）：消费组读 → 事务提交组位 →
+            //    committed 位 = 提升值
+            step = "send-offsets";
+            String group = "txn-offsets-group";
+            Map<TopicPartition, OffsetAndMetadata> toPromote = new HashMap<>();
+            Properties cp = base();
+            cp.put("group.id", group);
+            cp.put("enable.auto.commit", "false");
+            cp.put("auto.offset.reset", "earliest");
+            try (KafkaConsumer<String, String> c2 = new KafkaConsumer<>(cp)) {
+                c2.subscribe(Collections.singletonList(TXN_TOPIC));
+                long deadline = System.currentTimeMillis() + 20_000;
+                while (toPromote.isEmpty() && System.currentTimeMillis() < deadline) {
+                    ConsumerRecords<String, String> recs = c2.poll(Duration.ofMillis(400));
+                    for (ConsumerRecord<String, String> r : recs) {
+                        toPromote.put(new TopicPartition(r.topic(), r.partition()),
+                                new OffsetAndMetadata(r.offset() + 1));
+                    }
+                }
+                if (toPromote.isEmpty()) {
+                    fail("sendOffsets: consumed nothing");
+                }
+                for (int i = 0; i < 3; i++) {
+                    c2.poll(Duration.ofMillis(200));  // 组稳定（join 完成）
+                }
+                try (KafkaProducer<String, String> prod = new KafkaProducer<>(txnProducerProps())) {
+                    prod.initTransactions();
+                    prod.beginTransaction();
+                    prod.sendOffsetsToTransaction(toPromote, c2.groupMetadata());
+                    prod.commitTransaction();
+                }
+            }
+            // 回读组提交位 = 提升值（OffsetFetch 需 group.id）
+            Properties vp = base();
+            vp.put("group.id", group);
+            try (KafkaConsumer<String, String> c3 = new KafkaConsumer<>(vp)) {
+                Set<TopicPartition> tps = toPromote.keySet();
+                Map<TopicPartition, OffsetAndMetadata> committed = c3.committed(tps);
+                for (Map.Entry<TopicPartition, OffsetAndMetadata> e : toPromote.entrySet()) {
+                    OffsetAndMetadata got = committed.get(e.getKey());
+                    if (got == null || got.offset() != e.getValue().offset()) {
+                        fail("sendOffsets promote: tp=" + e.getKey() + " got "
+                             + (got == null ? "null" : got.offset()) + " want " + e.getValue().offset());
+                    }
+                }
+            }
+            System.out.println("[8] sendOffsetsToTransaction promoted to group");
+        } catch (Exception e) {
+            fail("txn step=" + step + ": " + e);
+        }
+    }
+
     public static void main(String[] args) {
         // 阶段 0：管理面（CreateTopics v7+ / Describe / List / Delete）
         adminPhase();
@@ -188,6 +348,9 @@ public class KafkaClientsE2E {
         // 阶段 3：消费者 B 从 committed 位续读不重不漏
         consumeResume(30, first);
         System.out.println("[4] consumer-B resumed from committed: 30/30 unique");
-        System.out.println("PASS ✔ (kafka-clients 官方栈全组协议)");
+
+        // 阶段 4-8：事务面（T-M3.2 验收行）
+        txnPhase();
+        System.out.println("PASS ✔ (kafka-clients 官方栈全组协议 + 事务)");
     }
 }

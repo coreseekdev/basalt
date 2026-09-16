@@ -17,20 +17,20 @@ fn coord_err(e: CoordError) -> Value {
 
 pub async fn find_coordinator(version: i16, req: &basalt_protocol::value::Struct, ctx: &Ctx) -> Value {
     // v0-3：Key（单 string）；v4+：CoordinatorKeys（[]string 批量）。
-    // 响应 v4+ Coordinators[].Key 必须逐条回显请求 key（franz-go 按其匹配，
-    // 回显空串 = "coordinator was not returned"）。
     let keys: Vec<String> = match req.get("CoordinatorKeys") {
         Some(Value::Array(ks)) => ks.iter().map(|k| k.as_str().to_string()).collect(),
         _ => vec![req.get("Key").map(|v| v.as_str().to_string()).unwrap_or_default()],
     };
-    let _ = version;
     // KeyType=1（Transaction）：事务协调器驻 controller（ADR-18 §9）。
     // 无版本门（review P0-2 实证）：KeyType 字段 v1+ 恒存在，Java 3.x/
-    // franz-go 的事务查找按 broker 宣告版本发 v4+（keys 折入
-    // CoordinatorKeys）——v<=3 之门会让它们 lookupCoordinator 无限自旋
-    let key_type = req.get("KeyType").map(|v| v.as_i32()).unwrap_or(0);
+    // franz-go 的事务查找按 broker 宣告版本发 v4+。
+    // 响应形状（review 探针实证）：v1-3 客户端读扁平 NodeId/Host/Port（=
+    // 协调器地址），v4+ 读 Coordinators[]——扁平位在事务查找时必须回
+    // controller，否则 v1-3 档（librdkafka/kafka-python）拿到自身无限重试
+    let key_type = req.get("KeyType").map(|v| v.as_i8()).unwrap_or(0) as i32;
     let txn_lookup = key_type == 1;
     let mut coordinators = Vec::new();
+    let mut top = (ctx.node_id, ctx.host.clone(), ctx.port as i32, ErrorCode::None);
     for k in &keys {
         let (nid, host, port, ec) = if txn_lookup {
             match crate::handlers_txn::controller_endpoint(ctx).await {
@@ -40,6 +40,10 @@ pub async fn find_coordinator(version: i16, req: &basalt_protocol::value::Struct
         } else {
             (ctx.node_id, ctx.host.clone(), ctx.port as i32, ErrorCode::None)
         };
+        if txn_lookup && version <= 3 {
+            // v1-3：扁平位即协调器（单 key 语义）
+            top = (nid, host.clone(), port, ec);
+        }
         coordinators.push(s([
             ("Key", Value::str(k.clone())),
             ("NodeId", Value::I32(nid)),
@@ -53,9 +57,9 @@ pub async fn find_coordinator(version: i16, req: &basalt_protocol::value::Struct
         ("ThrottleTimeMs", Value::I32(0)),
         ("ErrorCode", Value::I16(ErrorCode::None as i16)),
         ("ErrorMessage", Value::Null),
-        ("NodeId", Value::I32(ctx.node_id)),
-        ("Host", Value::str(ctx.host.clone())),
-        ("Port", Value::I32(ctx.port as i32)),
+        ("NodeId", Value::I32(top.0)),
+        ("Host", Value::str(top.1)),
+        ("Port", Value::I32(top.2)),
         ("Coordinators", Value::Array(coordinators)),
     ])
 }

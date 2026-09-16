@@ -108,6 +108,10 @@ pub enum GroupCmd {
     Heartbeat { group: String, generation: i32, member_id: String, reply: tokio::sync::oneshot::Sender<CoordError> },
     LeaveGroup { group: String, member_id: String, reply: tokio::sync::oneshot::Sender<CoordError> },
     CommitOffsets { group: String, generation: i32, member_id: String, offsets: Vec<CommittedOffset>, reply: tokio::sync::oneshot::Sender<CoordError> },
+    /// 事务消费位提升（ADR-18 §7，KIP-447 essential）：pending 在协调器侧
+    /// 已过 epoch fence（TxnLog 为权威），此处免成员/generation 校验直接
+    /// 落 OffsetLog——EndTxn(commit) 完成路径的生效点。
+    PromoteTxnOffsets { group: String, offsets: Vec<CommittedOffset>, reply: tokio::sync::oneshot::Sender<()> },
     FetchOffsets { group: String, topics: Option<Vec<String>>, reply: tokio::sync::oneshot::Sender<Vec<CommittedOffset>> },
     DeleteGroup { group: String },
     /// 管理面：列出全部组（ListGroups v0-4）。
@@ -340,6 +344,10 @@ impl GroupManager {
             GroupCmd::CommitOffsets { group, generation, member_id, offsets, reply } => {
                 let e = self.commit(&group, generation, &member_id, offsets);
                 let _ = reply.send(e);
+            }
+            GroupCmd::PromoteTxnOffsets { group, offsets, reply } => {
+                self.promote(&group, offsets);
+                let _ = reply.send(());
             }
             GroupCmd::FetchOffsets { group, topics, reply } => {
                 let out: Vec<CommittedOffset> = self
@@ -591,6 +599,16 @@ impl GroupManager {
             g.state = GroupState::PreparingRebalance;
         }
         CoordError::None
+    }
+
+    /// 事务提升：与 commit 同一持久化点（OffsetLog + 内存 map），但以
+    /// 协调器 TxnLog 的 epoch fence 为准——不做成员/generation 校验。
+    fn promote(&mut self, group: &str, offsets: Vec<CommittedOffset>) {
+        for o in &offsets {
+            self.offset_log.append(group, o);
+            self.offsets.insert((group.to_string(), o.topic.clone(), o.partition), o.clone());
+        }
+        tracing::info!(group=%group, promoted=offsets.len(), "txn offsets promoted");
     }
 
     fn commit(&mut self, group: &str, generation: i32, member_id: &str, offsets: Vec<CommittedOffset>) -> CoordError {

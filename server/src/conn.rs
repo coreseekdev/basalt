@@ -239,6 +239,7 @@ async fn dispatch(frame_bytes: Bytes, ctx: &Ctx) -> Result<Option<Bytes>, Dispat
         key::DELETE_RECORDS => (handlers_groups::delete_records_handler(&req, ctx).await, false),
         key::INIT_PRODUCER_ID => (handlers_groups::init_producer_id(&req, ctx).await, false),
         key::ADD_PARTITIONS_TO_TXN => (handlers_txn::add_partitions_to_txn(api_version, &req, ctx).await, false),
+        key::ADD_OFFSETS_TO_TXN => (handlers_txn::add_offsets_to_txn(&req, ctx).await, false),
         key::END_TXN => (handlers_txn::end_txn(&req, ctx).await, false),
         key::TXN_OFFSET_COMMIT => (handlers_txn::txn_offset_commit(api_version, &req, ctx).await, false),
         key::DESCRIBE_TRANSACTIONS => (handlers_txn::describe_transactions(&req, ctx).await, false),
@@ -307,8 +308,10 @@ async fn handle_produce(
 fn parse_fetch(req: &Struct, version: i16) -> Result<Vec<FetchTarget>, DispatchError> {
     let max_wait = req.get("MaxWaitMs").map(|v| v.as_i32()).unwrap_or(500);
     let min_bytes = req.get("MinBytes").map(|v| v.as_i32()).unwrap_or(1);
-    // Fetch v4+ IsolationLevel（v4 之前无字段 = read_uncommitted）
-    let isolation = match req.get("IsolationLevel").map(|v| v.as_i32()) {
+    // Fetch v4+ IsolationLevel（v4 之前无字段 = read_uncommitted）。
+    // int8 字段必须 as_i8——as_i32 对 Value::I8 静默返 0（read_committed
+    // 被静默降级为 read_uncommitted，Java 事务 e2e 实证）
+    let isolation = match req.get("IsolationLevel").map(|v| v.as_i8()) {
         Some(1) if version >= 4 => crate::partition::Isolation::ReadCommitted,
         _ => crate::partition::Isolation::ReadUncommitted,
     };

@@ -144,11 +144,43 @@ async fn async_main(cfg: Config) {
         if let Some(parent) = log_path.parent() {
             let _ = std::fs::create_dir_all(parent);
         }
+        // 提升桥接（ADR-18 §7）：EndTxn(commit) 的 pending 生效点 = 组
+        // 协调器 OffsetLog（PromoteTxnOffsets 免成员校验——fence 已在
+        // 协调器 TxnLog 的 epoch 校验完成）
+        let (promote_tx, mut promote_rx) = tokio::sync::mpsc::channel::<txn::PromotedOffsets>(64);
+        let bridge_group = group_tx.clone();
+        tokio::spawn(async move {
+            while let Some(p) = promote_rx.recv().await {
+                // 按 PendingOffset 自带的消费组分组（提升目标是消费组，非事务 ID）
+                let mut by_group: std::collections::HashMap<String, Vec<basalt_coordinator::CommittedOffset>> =
+                    std::collections::HashMap::new();
+                for o in p.offsets {
+                    by_group.entry(o.group.clone()).or_default().push(basalt_coordinator::CommittedOffset {
+                        topic: o.topic,
+                        partition: o.partition,
+                        offset: o.offset,
+                        metadata: o.metadata,
+                        commit_ts: crate::partition::now_ms(),
+                    });
+                }
+                for (group, offsets) in by_group {
+                    let (rtx, rrx) = tokio::sync::oneshot::channel();
+                    let _ = bridge_group
+                        .send(basalt_coordinator::GroupCmd::PromoteTxnOffsets {
+                            group,
+                            offsets,
+                            reply: rtx,
+                        })
+                        .await;
+                    let _ = rrx.await;
+                }
+            }
+        });
         let coord = txn::TxnCoordinator::spawn(
             &log_path,
             cfg.node_id,
             marker_tx,
-            None, // pending 提升钩子：块 d 接 group OffsetLog（§7）
+            Some(promote_tx),
             std::time::Duration::from_millis(cfg.txn_timeout_ms),
         );
         Some(coord)

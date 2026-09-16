@@ -310,10 +310,15 @@ UnknownServer 会让 java 客户端无限重试，fence 形同虚设）。
   broker 宣告版本发 v4+（KeyType 字段 v1+ 恒在）——查找无版本门。
   P1：storage_err_to_code 兜底改 15（83 常量实为 EligibleLeadersNot
   Available，事务面误用会给出错误重试语义）。
-- **d. 验收面**：java kafka-clients 事务 e2e（initTransactions/commit/abort/
-  sendOffsets + read_committed 消费对比专项——TASK.md T-M3.2 验收行）；
-  franz-go 事务档；T-M3.6 Jepsen 三场景进仿真 harness（≥500 seeds）；
-  TLA+ 三门禁（§11）。
+- **d. 验收面 🟨（2026-09-16 java 档通过）**：java kafka-clients 事务 e2e ✅
+  （txnPhase ×4 验收：commit 流 read_committed 可见 / abort 流 rc 不可见 +
+  uncommitted 可见 / aborted offset 消耗不复用 / sendOffsetsToTransaction
+  提升到组——KIP-447 全链）；暴露并修复协议 int8 字段 as_i32 静默返零缺陷
+  （㊿：IsolationLevel/KeyType 两处）；另有 FindCoordinator v1-3 扁平响应
+  位即协调器地址的形状缺陷（探针实证后修复——Coordinators[] 是 v4+ 字段，
+  librdkafka/kafka-python 事务查找读扁平位）。**待做**：franz-go 事务档；
+  TLA+ 三门禁（§11）；T-M3.6 Jepsen 三场景进仿真 harness（≥500 seeds）；
+  Describe/List 相位串已对齐官方命名（PrepareCommit 等）。
 
 ## 13. 与既有账本/机制的衔接
 

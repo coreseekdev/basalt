@@ -162,6 +162,43 @@ pub async fn add_partitions_to_txn(version: i16, req: &basalt_protocol::value::S
     ])
 }
 
+/// AddOffsetsToTxn (25)：sendOffsetsToTransaction(groupMetadata)（KIP-447）
+/// 的前导——把消费组挂进事务。协调器侧与 AddPartitionsToTxn 同语义
+/// （Empty→Begin 空分区清单开启服务端事务；Ongoing 幂等 Ok；Prepare 拒），
+/// 组挂靠的实际承载在 TxnOffsetCommit 的 pending 记录。
+pub async fn add_offsets_to_txn(req: &basalt_protocol::value::Struct, ctx: &crate::handlers::Ctx) -> Value {
+    let txn_id = req.get("TransactionalId").map(|v| v.as_str().to_string()).unwrap_or_default();
+    let pid = req.get("ProducerId").map(|v| v.as_i64()).unwrap_or(-1);
+    let epoch = req.get("ProducerEpoch").map(|v| v.as_i16()).unwrap_or(-1);
+    let err = match &ctx.txn_tx {
+        None => ErrorCode::NotCoordinator,
+        Some(tx) => {
+            let (atx, arx) = oneshot::channel();
+            let sent = tx
+                .send(TxnCmd::AddPartitionsToTxn {
+                    txn_id: txn_id.clone(),
+                    pid,
+                    epoch,
+                    partitions: vec![],
+                    reply: atx,
+                })
+                .await;
+            match sent {
+                Err(_) => ErrorCode::CoordinatorNotAvailable,
+                Ok(()) => match arx.await {
+                    Ok(Ok(())) => ErrorCode::None,
+                    Ok(Err(e)) => storage_err_to_code(&e),
+                    Err(_) => ErrorCode::CoordinatorNotAvailable,
+                },
+            }
+        }
+    };
+    s([
+        ("ThrottleTimeMs", Value::I32(0)),
+        ("ErrorCode", Value::I16(err as i16)),
+    ])
+}
+
 /// EndTxn (26)：两段提交/放弃的客户端入口。
 pub async fn end_txn(req: &basalt_protocol::value::Struct, ctx: &crate::handlers::Ctx) -> Value {
     let txn_id = req.get("TransactionalId").map(|v| v.as_str().to_string()).unwrap_or_default();

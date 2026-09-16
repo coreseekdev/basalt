@@ -49,12 +49,20 @@ pub enum TxnPhase {
 }
 
 impl TxnPhase {
+    /// 官方相位名（Kafka TransactionState；review P2-3）——Java AdminClient
+    /// 的 StateFilter 按此查询，内部名直出会让过滤器失配。
     pub fn as_str(&self) -> &'static str {
         match self {
             TxnPhase::Empty => "Empty",
             TxnPhase::Ongoing => "Ongoing",
-            TxnPhase::Prepare { .. } => "Prepare",
-            TxnPhase::Complete { .. } => "Complete",
+            TxnPhase::Prepare { outcome } => match outcome {
+                TxnOutcome::Commit => "PrepareCommit",
+                TxnOutcome::Abort => "PrepareAbort",
+            },
+            TxnPhase::Complete { outcome } => match outcome {
+                TxnOutcome::Commit => "CompleteCommit",
+                TxnOutcome::Abort => "CompleteAbort",
+            },
         }
     }
 }
@@ -806,7 +814,7 @@ mod coordinator_tests {
         end(&coord, "t1", pid, epoch, true).await.unwrap();
         assert!(committed_data(&ptx, 0).await, "commit 后 committed 可见");
         let (phase, _, _, _) = describe(&coord, "t1").await.unwrap();
-        assert_eq!(phase, "Complete");
+        assert_eq!(phase, "CompleteCommit");
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -820,7 +828,7 @@ mod coordinator_tests {
         end(&coord, "t1", pid, epoch, false).await.unwrap();
         assert!(!committed_data(&ptx, 0).await, "abort 后 committed 不可见");
         let (phase, _, _, _) = describe(&coord, "t1").await.unwrap();
-        assert_eq!(phase, "Complete");
+        assert_eq!(phase, "CompleteAbort");
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -838,7 +846,7 @@ mod coordinator_tests {
         let r = end(&coord, "t1", pid, epoch, true).await;
         assert!(r.is_err(), "marker 不可达时 EndTxn 必须失败（Prepare 保留）");
         let (phase, _, _, _) = describe(&coord, "t1").await.unwrap();
-        assert_eq!(phase, "Prepare", "失败保留 Prepare（重驱入口）");
+        assert_eq!(phase, "PrepareCommit", "失败保留 Prepare（重驱入口）");
         drop(coord);
 
         // 新协调器（工作路由）接管同一 TxnLog：ReplayCommit → 补发 → Complete
@@ -860,7 +868,7 @@ mod coordinator_tests {
             }
         });
         let coord2 = TxnCoordinator::spawn(&dir.join("txn.log"), 0, mtx, None, txn_cfg().0);
-        wait_phase(&coord2, "t1", "Complete").await;
+        wait_phase(&coord2, "t1", "CompleteCommit").await;
         assert!(committed_data(&ptx, 0).await, "接管重放后提交效果存活");
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -892,7 +900,7 @@ mod coordinator_tests {
             }
         });
         let coord2 = TxnCoordinator::spawn(&dir.join("txn.log"), 0, mtx, None, txn_cfg().0);
-        wait_phase(&coord2, "t1", "Complete").await;
+        wait_phase(&coord2, "t1", "CompleteAbort").await;
         assert!(!committed_data(&ptx, 0).await, "孤儿事务强制 abort（安全方向）");
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -905,7 +913,7 @@ mod coordinator_tests {
         add(&coord, "t1", pid, epoch).await.unwrap();
         produce_txn(&ptx, pid, epoch, 0, "m").await;
 
-        wait_phase(&coord, "t1", "Complete").await;
+        wait_phase(&coord, "t1", "CompleteAbort").await;
         assert!(!committed_data(&ptx, 0).await);
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -923,7 +931,7 @@ mod coordinator_tests {
 
         assert!(end(&coord, "t1", pid, epoch, true).await.is_err(), "marker 不可达 → Prepare 残留");
         let (phase, _, _, _) = describe(&coord, "t1").await.unwrap();
-        assert_eq!(phase, "Prepare");
+        assert_eq!(phase, "PrepareCommit");
 
         let r = add(&coord, "t1", pid, epoch).await;
         assert!(matches!(r, Err(StorageError::Other(_))), "Prepare 残留期新事务必须拒（CONCURRENT）：{:?}", r);
@@ -1080,7 +1088,7 @@ mod coordinator_review_fixes_tests {
             let (dtx, drx) = oneshot::channel();
             coord2.send(TxnCmd::Describe { txn_id: "t1".into(), reply: dtx }).await.unwrap();
             let (phase, _, _, _) = drx.await.unwrap().unwrap();
-            assert_eq!(phase, "Prepare", "P0：接管重驱失败不得写 Complete（吞提交决定）");
+            assert_eq!(phase, "PrepareCommit", "P0：接管重驱失败不得写 Complete（吞提交决定）");
         }
         drop(coord2);
 
@@ -1157,7 +1165,7 @@ mod coordinator_review_fixes_tests {
             let (dtx, drx) = oneshot::channel();
             coord.send(TxnCmd::Describe { txn_id: "t1".into(), reply: dtx }).await.unwrap();
             let (phase, _, _, _) = drx.await.unwrap().unwrap();
-            if phase == "Complete" {
+            if phase == "CompleteCommit" {
                 done = true;
                 break;
             }

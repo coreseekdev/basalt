@@ -61,7 +61,7 @@ def main():
     import socket, struct
 
     def transfer(topic: str, partition: int, to: int):
-        sock = socket.create_connection(("localhost", 9093), timeout=5)
+        sock = socket.create_connection(("localhost", 9093), timeout=2)
         name = topic.encode()
         payload = struct.pack(">h", len(name)) + name + struct.pack(">ii", partition, to)
         sock.sendall(struct.pack(">I", len(payload) + 1) + bytes([6]) + payload)
@@ -80,13 +80,15 @@ def main():
         return struct.unpack(">h", body)[0]
 
     for part in (0, 1):
-        deadline = time.monotonic() + 3
+        # 重试总窗 10s > 单次 2s（负载下 5s 超时一次即吃光 3s 窗的 flake，
+        # 两日两现——SIGCONT 后 alive 门控恢复心跳需一拍，重试必须覆盖它）
+        deadline = time.monotonic() + 10
         code = -1
         while time.monotonic() < deadline:
             code = transfer(TOPIC, part, 2)
             if code == 0:
                 break
-            time.sleep(0.1)  # node2 心跳恢复（alive 门控）需要一拍
+            time.sleep(0.2)  # node2 心跳恢复（alive 门控）需要一拍
         assert code == 0, f"transfer p{part} -> node2 失败 code={code}"
 
     producer = KafkaProducer(bootstrap_servers=B, acks=-1, retries=5,

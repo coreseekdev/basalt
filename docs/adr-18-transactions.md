@@ -323,8 +323,10 @@ Makefile `transaction-commit{,-noprepare,-nofence}` 入 CI。**
   librdkafka/kafka-python 事务查找读扁平位）。**待做**：franz-go 事务档；
   TLA+ 三门禁 ✅（TransactionCommit.tla：6 不变式全空间绿 1,088 态 +
   两只阴性对照红 142/170 态——CONSTANT 突变体制，CI 三步接线）；
-  T-M3.6 Jepsen 三场景进仿真 harness（≥500 seeds）；
-  Describe/List 相位串已对齐官方命名（PrepareCommit 等）。
+  franz-go 事务档 ✅（txnProduce/txnScan 三验收面：commit 可见 / abort
+  rc 不可见 + ru 可见 / offset 消耗不复用——v6 FindCoordinator +
+  Fetch v13+ 协商路径的第二真客户端）。T-M3.6 Jepsen 三场景进仿真
+  harness（≥500 seeds）；Describe/List 相位串已对齐官方命名（PrepareCommit 等）。
 
 ## 13. 与既有账本/机制的衔接
 

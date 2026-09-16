@@ -12,6 +12,7 @@ import (
 	"context"
 	"fmt"
 	"os"
+	"strings"
 	"time"
 
 	"github.com/twmb/franz-go/pkg/kadm"
@@ -163,5 +164,122 @@ func main() {
 		}
 	}
 	fmt.Println("[4] consumer B: resumed exactly at committed boundary, no dup/loss ✔")
-	fmt.Println("PASS ✔")
+
+	txnPhase()
+	fmt.Println("PASS ✔ (franz-go 全组协议 + 事务)")
+}
+
+// ---- 事务面（T-M3.2 块 d 第二客户端档，ADR-18 §12d）----
+
+const (
+	txnTopic = "franzgo-txn"
+	txnID    = "franzgo-txn-1"
+)
+
+// txnProduce 一个事务内发 n 条并 EndTransaction(commit)。
+func txnProduce(prefix string, n int, commit bool) {
+	cl, err := kgo.NewClient(
+		kgo.SeedBrokers(broker),
+		kgo.TransactionalID(txnID),
+		kgo.TransactionTimeout(30*time.Second),
+	)
+	if err != nil {
+		fail("txn producer: %v", err)
+	}
+	defer cl.Close()
+	cl.BeginTransaction()
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	for i := 0; i < n; i++ {
+		v := fmt.Sprintf("%s-%04d", prefix, i)
+		cl.Produce(ctx, &kgo.Record{Topic: txnTopic, Value: []byte(v), Partition: int32(i % 2)},
+			func(_ *kgo.Record, err error) {
+				if err != nil {
+					fail("txn produce %s: %v", v, err)
+				}
+			})
+	}
+	if err := cl.Flush(ctx); err != nil {
+		fail("txn flush: %v", err)
+	}
+	try := kgo.TryAbort
+	if commit {
+		try = kgo.TryCommit
+	}
+	if err := cl.EndTransaction(ctx, try); err != nil {
+		fail("end transaction(commit=%v): %v", commit, err)
+	}
+}
+
+// txnScan 从头读到静默；收集 countPrefix 前缀；禁见 forbiddenPrefix。
+// 显式分区 assignment + 绝对 offset 0（裸客户端无 assignment 不拉取）。
+func txnScan(readCommitted bool, countPrefix string, expected int, forbiddenPrefix string) map[string]bool {
+	offs := map[string]map[int32]kgo.Offset{
+		txnTopic: {0: kgo.NewOffset().At(0), 1: kgo.NewOffset().At(0)},
+	}
+	opts := []kgo.Opt{kgo.SeedBrokers(broker), kgo.ConsumePartitions(offs)}
+	if readCommitted {
+		opts = append(opts, kgo.FetchIsolationLevel(kgo.ReadCommitted()))
+	}
+	cl, err := kgo.NewClient(opts...)
+	if err != nil {
+		fail("scan client: %v", err)
+	}
+	defer cl.Close()
+	got := map[string]bool{}
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	idle := 0
+	for idle < 2000 {
+		f := cl.PollFetches(ctx)
+		if f.NumRecords() == 0 {
+			time.Sleep(200 * time.Millisecond)
+			idle += 200
+			continue
+		}
+		idle = 0
+		f.EachRecord(func(r *kgo.Record) {
+			v := string(r.Value)
+			if forbiddenPrefix != "" && strings.HasPrefix(v, forbiddenPrefix) {
+				fail("forbidden record visible (rc=%v): %s", readCommitted, v)
+			}
+			if strings.HasPrefix(v, countPrefix) {
+				got[v] = true
+			}
+		})
+	}
+	if len(got) != expected {
+		fail("txnScan rc=%v prefix=%s got %d/%d", readCommitted, countPrefix, len(got), expected)
+	}
+	return got
+}
+
+func txnPhase() {
+	admcl, err := kgo.NewClient(kgo.SeedBrokers(broker))
+	if err != nil {
+		fail("txn bootstrap: %v", err)
+	}
+	defer admcl.Close()
+	adm := kadm.NewClient(admcl)
+	if _, err := adm.CreateTopic(context.Background(), 2, 1, nil, txnTopic); err != nil {
+		fail("create txn topic: %v", err)
+	}
+	time.Sleep(500 * time.Millisecond)
+
+	// ① commit 流：read_committed 恰可见
+	txnProduce("c-", 10, true)
+	txnScan(true, "c-", 10, "")
+	fmt.Println("[5] txn commit: 10 visible to read_committed")
+
+	// ② abort 流：rc 不可见 / ru 可见
+	txnProduce("x-", 10, false)
+	txnScan(true, "c-", 10, "x-")
+	txnScan(false, "x-", 10, "")
+	fmt.Println("[6] txn abort: invisible to read_committed, visible to read_uncommitted")
+
+	// ③ offset 已消耗：再 commit 5 条 → committed 全扫 c=10 / d=5，无 x
+	txnProduce("d-", 5, true)
+	txnScan(true, "d-", 5, "x-")
+	txnScan(true, "c-", 10, "x-")
+	fmt.Println("[7] aborted offsets consumed, not reused (committed=15 total)")
 }

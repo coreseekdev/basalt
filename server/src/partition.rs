@@ -1056,6 +1056,9 @@ impl PartitionActor {
 
     /// 事务批成功 append 后的开/续事务登记。
     fn txn_register(&mut self, pid: i64, epoch: i16, base: i64, last: i64) {
+        if std::env::var("BASALT_LEO_PROBE").is_ok() {
+            eprintln!("DBG-REG t={} p={} pid={} epoch={} base={} last={}", self.name, self.index, pid, epoch, base, last);
+        }
         match self.txn_open.get(&pid).map(|t| (t.epoch, t.first_offset, t.last_offset)) {
             Some((e, _first, _)) if e == epoch => {
                 if let Some(t) = self.txn_open.get_mut(&pid) {
@@ -1167,6 +1170,10 @@ impl PartitionActor {
     fn apply_marker_book(&mut self, b: MarkerBook) {
         if b.pid < 0 {
             return; // noop 载荷
+        }
+        if std::env::var("BASALT_LEO_PROBE").is_ok() {
+            eprintln!("DBG-APPLY t={} p={} pid={} epoch={} oc={:?} open={:?} hw={}",
+                self.name, self.index, b.pid, b.epoch, b.outcome, self.txn_open.get(&b.pid).map(|t| (t.epoch, t.first_offset)), self.log.high_watermark);
         }
         self.last_marker.insert(b.pid, (b.epoch, b.outcome));
         if let Some(t) = self.txn_open.remove(&b.pid) {

@@ -16,6 +16,10 @@ pub enum StorageError {
     NotEnoughReplicas,
     #[error("out of order sequence {0} (expected {1})")]
     OutOfOrderSequence(i32, i32),
+    #[error("invalid producer epoch (zombie fenced, ADR-18)")]
+    InvalidProducerEpoch,
+    #[error("invalid txn state (terminal marker conflict / stale epoch marker)")]
+    InvalidTxnState,
     #[error("{0}")]
     Other(String),
 }

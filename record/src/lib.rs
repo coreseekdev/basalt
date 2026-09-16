@@ -17,6 +17,38 @@ use bytes::{BufMut, Bytes, BytesMut};
 
 pub const MAGIC_V2: i8 = 2;
 
+/// attributes bit4：事务批（ADR-18）。
+pub const ATTR_TRANSACTIONAL: i16 = 0b0001_0000;
+/// attributes bit5：控制批（txn marker 等，应用永不可见）。
+pub const ATTR_CONTROL: i16 = 0b0010_0000;
+
+/// 控制记录类型（EndTransactionMarker，KIP-98）。
+/// wire：record key = [version:i16=0][type:i16]（key 非空正是控制记录的
+/// 判别特征——java 事务消费者从 key 解析本类型），value 空/不透明。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[repr(i16)]
+pub enum ControlRecordType {
+    Abort = 0,
+    Commit = 1,
+}
+
+impl ControlRecordType {
+    pub fn from_i16(v: i16) -> Option<ControlRecordType> {
+        match v {
+            0 => Some(ControlRecordType::Abort),
+            1 => Some(ControlRecordType::Commit),
+            _ => None,
+        }
+    }
+
+    fn key(&self) -> Bytes {
+        let mut k = BytesMut::with_capacity(4);
+        k.put_i16(0); // version
+        k.put_i16(*self as i16);
+        k.freeze()
+    }
+}
+
 /// 批头（到 recordsCount 为止）的固定长度。
 pub const RECORD_BATCH_HEADER_LEN: usize = 61;
 /// CRC 覆盖起点相对批头的偏移（attributes 起，= magic 16 + crc 4 + 1）。
@@ -154,6 +186,55 @@ pub fn batch_len_at(buf: &[u8]) -> Option<usize> {
     let total = BatchHeader::parse(buf)?.total_len();
     if total < RECORD_BATCH_HEADER_LEN { return None; }
     Some(total)
+}
+
+/// 编码一个事务 marker 控制批（单记录，ADR-18 §4.2）。
+/// attributes = transactional|control；key = [version:0][type]；value 空。
+#[allow(clippy::too_many_arguments)]
+pub fn encode_control_batch(
+    base_offset: i64,
+    leader_epoch: i32,
+    first_timestamp: i64,
+    producer_id: i64,
+    producer_epoch: i16,
+    base_sequence: i32,
+    ty: ControlRecordType,
+    out: &mut BytesMut,
+) {
+    let rec = Rec { timestamp_delta: 0, key: Some(ty.key()), value: None, headers: vec![] };
+    encode_batch(
+        base_offset,
+        leader_epoch,
+        first_timestamp,
+        ATTR_TRANSACTIONAL | ATTR_CONTROL,
+        producer_id,
+        producer_epoch,
+        base_sequence,
+        &[rec],
+        out,
+    );
+}
+
+/// 读出控制批的 marker 类型（非控制批/解析失败返回 None）。
+/// 只需首条记录的 key——记录布局：len(zigzag)|attrs:i8|tsDelta|offsetDelta|
+/// keyLen(zigzag)|key。
+pub fn control_record_type_of(batch: &[u8]) -> Option<ControlRecordType> {
+    let h = BatchHeader::parse(batch)?;
+    if !h.is_control() {
+        return None;
+    }
+    let mut pos = RECORD_BATCH_HEADER_LEN;
+    let _len = read_zigzag(batch, &mut pos)?;
+    let _attrs = *batch.get(pos)?;
+    pos += 1;
+    let _ts = read_zigzag(batch, &mut pos)?;
+    let _od = read_zigzag(batch, &mut pos)?;
+    let klen = read_zigzag(batch, &mut pos)?;
+    if klen < 4 {
+        return None;
+    }
+    let key = batch.get(pos..pos + 4)?;
+    ControlRecordType::from_i16(i16::from_be_bytes([key[2], key[3]]))
 }
 
 // ---------- 构造（测试与内部复制/标记用） ----------
@@ -413,6 +494,28 @@ mod tests {
             let unpacked = decompress(codec, &packed, body.len()).unwrap();
             assert_eq!(&unpacked[..], body, "{codec:?}");
         }
+    }
+
+    /// ADR-18：控制批编解码往返——attributes 双位置位、类型从 key 解出。
+    #[test]
+    fn control_batch_roundtrip() {
+        for (ty, wire) in [(ControlRecordType::Abort, 0i16), (ControlRecordType::Commit, 1)] {
+            let mut buf = BytesMut::new();
+            encode_control_batch(7, 0, 1_000, 42, 3, 9, ty, &mut buf);
+            let buf = buf.freeze();
+            let h = BatchHeader::parse(&buf).unwrap();
+            assert!(h.is_control() && h.is_transactional());
+            assert_eq!(h.producer_id, 42);
+            assert_eq!(h.producer_epoch, 3);
+            assert_eq!(h.record_count, 1);
+            assert!(validate_crc(&buf));
+            assert_eq!(control_record_type_of(&buf), Some(ty));
+            let _ = wire;
+        }
+        // 非控制批 → None
+        let mut plain = BytesMut::new();
+        encode_batch(0, 0, 0, 0, -1, -1, -1, &sample_records(), &mut plain);
+        assert_eq!(control_record_type_of(&plain.freeze()), None);
     }
 }
 

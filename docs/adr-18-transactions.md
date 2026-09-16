@@ -72,15 +72,32 @@ last_marker: HashMap<pid, (epoch, outcome)>     // 终态 fence + 重放幂等�
 lso = min(HW, min(first_offset of txn_open))    // 无开事务 = HW
 ```
 
-事务性批（transactional 位 1）append 校验链：role/提交面（原有）→ `idem_check`
-（原有）→ **终态 fence**：`last_marker` 命中同 (pid, epoch) ⇒ 拒绝
+事务性批（transactional 位 1）**produce 路径**（Assign）校验链：role/提交面
+（原有）→ `idem_check`（原有）→ **终态 fence**：`last_marker` 命中同 (pid, epoch) ⇒ 拒绝
 （InvalidTxnState/47 族）——封「marker 落地后僵尸同 epoch 续写复活开事务」
 （review 实洞：无此规则 idem 放行 seq+1，txn_open 复活且无人补 marker →
-LSO 永久停滞）。分区侧另挂 **txn_open deadline 自 abort**：开事务超时走与
-coordinator 同一 marker 内部通道自弃（「未登记漂移批」的兜底不在 coordinator
-的 TxnLog 分区清单内，只能靠分区侧——§10 发散边界的封口前提）。
+LSO 永久停滞）。**复制路径（Absolute，follower pull）**不重查 idem/fence（信任 leader 已
+fencing——marker seq 恰为数据 last+1，重查幂等会楔死多批切片复制），
+改为切片内逐批收割式推进事务视图（控制批 → 终态簿记；事务数据批 →
+开/续事务）——follower 的 txn_open/last_marker/aborted 与 leader 一致，
+升任继承不腐化（review P1×2 实证后定案）。
 
-**WriteTxnMarker 落定语义（review P1，§13 一致性）**：marker 是数据——
+分区侧另挂 **txn_open deadline 自 abort**：开事务超时走与
+coordinator 同一 marker 内部通道自弃（「未登记漂移批」的兜底不在 coordinator
+的 TxnLog 分区清单内，只能靠分区侧——§10 发散边界的封口前提）。纪律：
+follower 不自 abort（绕过复制层写日志 = 副本分叉，TruncateTo fencing 同款
+纪律），过期 deadline 前推退避（否则主循环 deadline 风暴热旋），升任刷新
+新任期超时；sweep 失败同款退避。
+
+**marker 纪律（块 a 落地补强，review 实证）**：① acks=all 前置门与 produce
+同款（新鲜 ISR 低于 max(min.insync, 多数派) 不受理——否则空冻结面「停等」
+全称真即放行，coordinator 拿到成功而零副本持字节）；② 在途互斥——同 pid
+已有 marker 在停等/窗口内未结算时拒绝新 marker（可重试错误），保证簿记
+顺序与字节顺序一致；③ produce 终态 fence 用序判定（last_marker.epoch ≥
+批 epoch 即拒）且同样查在途——封「marker 飞行中僵尸续写逃出 aborted
+区间」；④ Commit 落账清除同会话 aborted 残留（末写胜出，防竞态）；
+⑤ aborted 区间落账取 txn_open 现值（append 与 release 之间被扩大的区间
+不漏）。**WriteTxnMarker 落定语义（review P1，§13 一致性）**：marker 是数据——
 acks 全部生效前不得应答 coordinator，落定判据 = 冻结提交面放行（ParkedAck
 同型：面内全员 LEO 追平；单副本 = flush 即放行）。ReconcileAppend 只引为
 「内部命令管道」先例（跨节点 meta actor 落到本地 PartitionCmd），
@@ -94,10 +111,16 @@ acks 全部生效前不得应答 coordinator，落定判据 = 冻结提交面放
   → LSO 跳到下一锚或 HW；abort 同时把 (pid, epoch, first, last) 追加进内存
   aborted 集。
 - Fetch（现有 handler 响应占位转正）：`LastStableOffset` = lso；
-  `AbortedTransactions` = 返回区间内命中的 (pid, epoch, last_offset) 列表；
   isolation_level=read_committed → 读上限从 HW 换 LSO + 按 aborted 集丢批；
-  read_uncommitted → HW 上限（现状）。**控制批对两种隔离级都永不投递**
-  （Kafka 语义：应用永不见控制记录）。
+  read_uncommitted → HW 上限（现状）。
+  **投递模型（块 a 定案，review P0 实证后修正）**：服务端预过滤 aborted 批 +
+  `AbortedTransactions` 恒发空数组——java 客户端的 aborted 区间跟踪按
+  (pid, FirstOffset) 入集、**只靠收到 ABORT 控制批终结**，而 Kafka 的
+  控制批剥离在客户端库层（wire 上投递）——「服务端剥离控制批 + 发非空
+  条目」组合会让同 pid 后续已提交批被客户端误丢（aborted reads 反向：
+  丢真数据）；「服务端滤数据 + 空列表」是唯一自洽组合，对客户端能力
+  无假设（四档解析层兼容；read_committed 专项 e2e 在块 d 落地后转实测）。若未来改走 Kafka 忠实模型（wire 投递控制批 +
+  客户端过滤），必须两者同改。
 - **挂起 fetch 三接触点全改（review P1）**：PendingFetch 增隔离级字段；
   唤醒谓词（serve_pending 的 `offset < high_watermark`）与**超时空回路径
   （on_deadline 的 read_ex(…, ReadCap::HighWatermark)——现状硬编码）**均按
@@ -111,8 +134,9 @@ acks 全部生效前不得应答 coordinator，落定判据 = 冻结提交面放
 
 ### 4.3 marker 幂等（重放安全）
 
-append 前查：内存 txn_open/last_marker 命中同 (pid, epoch) 且 outcome 相同
-→ no-op ack（不占新 offset）；**outcome 相异（COMMIT vs ABORT）→ 拒绝后到
+append 前查（以无在途 marker 为前提——在途互斥见 §4.1 纪律②，回可重试
+错误而非终态冲突）：内存 txn_open/last_marker 命中同 (pid, epoch) 且
+outcome 相同 → no-op ack（不占新 offset）；**outcome 相异（COMMIT vs ABORT）→ 拒绝后到
 marker、应答错误令 coordinator 转入 abort 重对齐——COMMIT 永不覆盖 ABORT
 终态（abort 是安全方向；可达场景：分区侧自 abort 已落地后 coordinator 接管
 重发 COMMIT，若无此规则已 abort 数据将转可见 = aborted reads）**；恢复后由

@@ -301,6 +301,11 @@ async fn handle_produce(
 fn parse_fetch(req: &Struct, version: i16) -> Result<Vec<FetchTarget>, DispatchError> {
     let max_wait = req.get("MaxWaitMs").map(|v| v.as_i32()).unwrap_or(500);
     let min_bytes = req.get("MinBytes").map(|v| v.as_i32()).unwrap_or(1);
+    // Fetch v4+ IsolationLevel（v4 之前无字段 = read_uncommitted）
+    let isolation = match req.get("IsolationLevel").map(|v| v.as_i32()) {
+        Some(1) if version >= 4 => crate::partition::Isolation::ReadCommitted,
+        _ => crate::partition::Isolation::ReadUncommitted,
+    };
     let top_max = req.get("MaxBytes").map(|v| v.as_i32()).unwrap_or(i32::MAX).max(0) as usize;
     let mut out = Vec::new();
     if let Some(Value::Array(topics)) = req.get("Topics") {
@@ -322,6 +327,7 @@ fn parse_fetch(req: &Struct, version: i16) -> Result<Vec<FetchTarget>, DispatchE
                         max_bytes: pmax.min(top_max.max(1)),
                         max_wait_ms: max_wait,
                         min_bytes,
+                        isolation,
                     });
                 }
             }

@@ -10,7 +10,7 @@
 
 use crate::disk::DiskIo;
 use crate::error::{Result, StorageError};
-use basalt_record::{BatchHeader, CRC_PAYLOAD_OFFSET, RECORD_BATCH_HEADER_LEN};
+use basalt_record::{BatchHeader, ControlRecordType, CRC_PAYLOAD_OFFSET, RECORD_BATCH_HEADER_LEN};
 use crate::segment::{base_of_filename, Segment};
 use bytes::{Bytes, BytesMut};
 
@@ -73,11 +73,84 @@ pub enum AssignPolicy {
 }
 
 /// 读封顶：consumer 读不得越过 HW（未提交数据不可见）；
-/// 复制拉取读到 LEO（这正是复制的意义）。
+/// 复制拉取读到 LEO（这正是复制的意义）；
+/// 显式上界 = read_committed 的 LSO（partition actor 维护，ADR-18 §4.2）。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ReadCap {
     HighWatermark,
     LogEnd,
+    At(i64),
+}
+
+/// 恢复扫描的事务状态收割（ADR-18 §4.4）：分区 actor 无需额外持久化，
+/// 打开日志时从批头（控制批另读首记录 key）重建事务视图。
+#[derive(Debug, Default, Clone)]
+pub struct TxnHarvest {
+    /// 每 pid 最后可见 epoch（喂幂等状态机的 fence 基线）。
+    pub pid_epoch: std::collections::HashMap<i64, i16>,
+    /// 未关事务：pid -> (epoch, first_offset, last_offset)。LSO 锚点来源。
+    pub open: std::collections::HashMap<i64, (i16, i64, i64)>,
+    /// 终态 marker：pid -> (epoch, outcome)——marker 幂等/终态 fence 的依据。
+    pub last_marker: std::collections::HashMap<i64, (i16, ControlRecordType)>,
+    /// 已 abort 区间 (pid, epoch, first, last)：read_committed 过滤依据。
+    pub aborted: Vec<(i64, i16, i64, i64)>,
+}
+
+impl TxnHarvest {
+    fn harvest_batch(&mut self, h: &BatchHeader, control: Option<ControlRecordType>) {
+        let pid = h.producer_id;
+        if pid < 0 {
+            return;
+        }
+        self.pid_epoch.insert(pid, h.producer_epoch);
+        let last = h.base_offset + h.last_offset_delta as i64;
+        if h.is_control() {
+            let Some(t) = control else { return };
+            if let Some(&(e, first, last_open)) = self.open.get(&pid) {
+                if e == h.producer_epoch && t == ControlRecordType::Abort {
+                    self.aborted.push((pid, e, first, last_open));
+                }
+            }
+            self.last_marker.insert(pid, (h.producer_epoch, t));
+            self.open.remove(&pid);
+        } else if h.is_transactional() {
+            match self.open.get(&pid).copied() {
+                Some((e, first, _)) if e == h.producer_epoch => {
+                    self.open.insert(pid, (e, first, last));
+                }
+                Some((e, first, old_last)) => {
+                    // epoch 更替：旧会话开事务被 fence——不再会有其 marker，
+                    // 安全方向 = 直接计入 aborted（数据不可见，LSO 锚释放）
+                    self.aborted.push((pid, e, first, old_last));
+                    self.open.insert(pid, (h.producer_epoch, h.base_offset, last));
+                }
+                None => {
+                    self.open.insert(pid, (h.producer_epoch, h.base_offset, last));
+                }
+            }
+        }
+    }
+
+    fn merge(&mut self, other: TxnHarvest) {
+        self.pid_epoch.extend(other.pid_epoch);
+        for (k, v) in other.open {
+            self.open.insert(k, v);
+        }
+        for (k, v) in other.last_marker {
+            self.last_marker.insert(k, v);
+        }
+        self.aborted.extend(other.aborted);
+    }
+}
+
+/// 从段文件 pos 处读整批并解出控制记录类型（仅控制批需要，罕见路径）。
+fn control_type_at<D: DiskIo>(disk: &D, path: &std::path::Path, pos: u64, total: usize) -> Option<ControlRecordType> {
+    let mut buf = vec![0u8; total];
+    let got = disk.read_at(path, pos, &mut buf).ok()?;
+    if got < total {
+        return None;
+    }
+    basalt_record::control_record_type_of(&buf)
 }
 
 pub struct Log<D: DiskIo> {
@@ -97,6 +170,8 @@ pub struct Log<D: DiskIo> {
     batch_staging: BytesMut,
     /// leader epoch 历史：(epoch, start_offset)。追加式，用于 OffsetForLeaderEpoch。
     pub epoch_history: Vec<(i32, i64)>,
+    /// 恢复扫描收割的事务状态（open 时填充；运行期由 partition actor 独占推进）。
+    pub txn_harvest: TxnHarvest,
 }
 
 impl<D: DiskIo> Log<D> {
@@ -141,6 +216,9 @@ impl<D: DiskIo> Log<D> {
         // 逐段扫描校验/重建：坏尾截断（torn write 防线）+ 段间连续性校验
         let mut next_offset: i64 = segs.first().map(|s| s.base_offset).unwrap_or(0);
         let mut sealed: Vec<Segment> = Vec::new();
+        // 事务收割（ADR-18 §4.4）：只收保留段的——空段/空洞段被删时其收割
+        // 随段丢弃（数据不在日志里，marker/锚点同理）
+        let mut harvest = TxnHarvest::default();
         let active_base = segs.last().map(|s| s.base_offset).unwrap_or(-1);
         for seg in &mut segs {
             // checkpoint 匹配（sealed 段大小未变）→ 跳过 CRC 全扫
@@ -157,14 +235,20 @@ impl<D: DiskIo> Log<D> {
                             let next_rel: i64 = {
                                 // 批头扫描计数（不读全文件，只读 61B 头，快 10x）
                                 let mut nr = 0i64; let mut pp = 0u64;
+                                let mut seg_h = TxnHarvest::default();
                                 while pp + RECORD_BATCH_HEADER_LEN as u64 <= seg.bytes {
                                     let mut tmp = [0u8; RECORD_BATCH_HEADER_LEN];
                                     if disk.read_at(&seg.path, pp, &mut tmp).unwrap_or(0) < RECORD_BATCH_HEADER_LEN { break; }
                                     if let Some(hh) = BatchHeader::parse(&tmp) {
+                                        let ctl = if hh.is_control() {
+                                            control_type_at(&disk, &seg.path, pp, hh.total_len())
+                                        } else { None };
+                                        seg_h.harvest_batch(&hh, ctl);
                                         nr += hh.record_count.max(0) as i64;
                                         pp += hh.total_len() as u64;
                                     } else { break; }
                                 }
+                                harvest.merge(seg_h);
                                 nr
                             };
                             seg.next_rel = next_rel;
@@ -175,7 +259,8 @@ impl<D: DiskIo> Log<D> {
                     }
                 }
             }
-            scan_and_truncate(&disk, seg, next_offset)?;
+            let mut seg_h = TxnHarvest::default();
+            scan_and_truncate(&disk, seg, next_offset, &mut seg_h)?;
             if seg.next_rel == 0 && seg.bytes == 0 && !sealed.is_empty() {
                 // 空段且有前驱：不入列表。文件必须删除——保留会让后续恢复
                 // 重新收养（opfuzz 实证 LEO 复活）。
@@ -200,6 +285,7 @@ impl<D: DiskIo> Log<D> {
             }
             next_offset = seg.base_offset + seg.next_rel;
             sealed.push(seg.clone());
+            harvest.merge(seg_h);
         }
         // 删除/截断可能移除全部段文件（数据合法位于 log_start 之下）：
         // LEO 不得低于持久化的 log_start——否则重开后 append 从 0 重新
@@ -237,6 +323,7 @@ impl<D: DiskIo> Log<D> {
             batch_io: false,
             batch_staging: BytesMut::new(),
             epoch_history: vec![(0, next_offset)],
+            txn_harvest: harvest,
         };
         // 写恢复 checkpoint（下次启动跳过 CRC 全扫；含 log_start 持久化）
         log.persist_checkpoint();
@@ -597,6 +684,7 @@ impl<D: DiskIo> Log<D> {
         let upper = match cap {
             ReadCap::HighWatermark => self.high_watermark,
             ReadCap::LogEnd => self.next_offset,
+            ReadCap::At(v) => v,
         };
         if from_offset > upper {
             return Err(StorageError::OffsetOutOfRange(from_offset));
@@ -656,8 +744,8 @@ impl<D: DiskIo> Log<D> {
                 }
                 break;
             }
-            // 消费读不得越过 HW（未提交数据不可见）
-            if cap == ReadCap::HighWatermark && (h.base_offset as i64) >= upper {
+            // 消费读不得越过上界（HW / 显式 LSO；未提交数据不可见）
+            if cap != ReadCap::LogEnd && (h.base_offset as i64) >= upper {
                 break;
             }
             // 整批粒度：预算不足但已读到数据 → 停；首批即便超预算也带上（Kafka 同义）
@@ -996,9 +1084,11 @@ impl<D: DiskIo> Log<D> {
     }
 }
 
-/// 截断后的段内索引重建（与恢复扫描共用语义）。
+/// 截断后的段内索引重建（与恢复扫描共用语义）。截断路径不产出收割——
+/// 事务状态由 partition actor 内存持有，截掉的数据随截断语义消失。
 fn rescan_segment<D: DiskIo>(disk: &D, seg: &mut Segment) {
-    let _ = crate::log::scan_and_rescan(disk, seg);
+    let mut _throwaway = TxnHarvest::default();
+    let _ = crate::log::scan_and_rescan(disk, seg, &mut _throwaway);
 }
 
 // checkpoint 回滚所需的最小内存快照
@@ -1054,12 +1144,12 @@ impl<D: DiskIo> Log<D> {
 }
 
 /// 恢复/截断后重建段内索引。
-pub(crate) fn scan_and_rescan<D: DiskIo>(disk: &D, seg: &mut Segment) -> Result<()> {
-    scan_and_truncate(disk, seg, seg.base_offset)
+pub(crate) fn scan_and_rescan<D: DiskIo>(disk: &D, seg: &mut Segment, harvest: &mut TxnHarvest) -> Result<()> {
+    scan_and_truncate(disk, seg, seg.base_offset, harvest)
 }
 
-/// 恢复扫描：CRC 校验走批，坏尾截断；重建段内索引。
-fn scan_and_truncate<D: DiskIo>(disk: &D, seg: &mut Segment, expect_base: i64) -> Result<()> {
+/// 恢复扫描：CRC 校验走批，坏尾截断；重建段内索引 + 事务收割（ADR-18 §4.4）。
+fn scan_and_truncate<D: DiskIo>(disk: &D, seg: &mut Segment, expect_base: i64, harvest: &mut TxnHarvest) -> Result<()> {
     let data = disk.read_all(&seg.path)?;
     let mut pos = 0usize;
     let mut next_rel: i64 = 0;
@@ -1086,6 +1176,12 @@ fn scan_and_truncate<D: DiskIo>(disk: &D, seg: &mut Segment, expect_base: i64) -
         if h.base_offset != run_off {
             break;
         }
+        let ctl = if h.is_control() {
+            basalt_record::control_record_type_of(&data[pos..pos + total])
+        } else {
+            None
+        };
+        harvest.harvest_batch(&h, ctl);
         run_off += h.record_count.max(0) as i64;
         if pos == 0 {
             offset_ix.push(0, 0);

@@ -304,6 +304,8 @@ pub async fn produce(version: i16, acks: i16, targets: Vec<ProduceTarget>, ctx: 
                         Some(basalt_storage::StorageError::CorruptBatch { .. }) => ErrorCode::CorruptMessage,
                         Some(StorageError::NotEnoughReplicas) => ErrorCode::NotEnoughReplicas,
                         Some(StorageError::OutOfOrderSequence(..)) => ErrorCode::OutOfOrderSequence,
+                        Some(StorageError::InvalidProducerEpoch) => ErrorCode::InvalidProducerEpoch,
+                        Some(StorageError::InvalidTxnState) => ErrorCode::InvalidTxnState,
                         Some(StorageError::NotLeader) => ErrorCode::NotLeaderOrFollower,
                         Some(StorageError::OffsetOutOfRange(_)) => ErrorCode::OffsetOutOfRange,
                         Some(_) => ErrorCode::UnknownServer,
@@ -362,6 +364,8 @@ pub struct FetchTarget {
     pub max_wait_ms: i32,
     #[allow(dead_code)]
     pub min_bytes: i32,
+    /// Fetch v4+ IsolationLevel（0=read_uncommitted, 1=read_committed）。
+    pub isolation: crate::partition::Isolation,
 }
 
 pub async fn fetch(targets: Vec<FetchTarget>, ctx: &Ctx) -> Value {
@@ -408,6 +412,7 @@ pub async fn fetch(targets: Vec<FetchTarget>, ctx: &Ctx) -> Value {
                         offset: t.offset,
                         max_bytes: t.max_bytes,
                         deadline,
+                        isolation: t.isolation,
                         reply: txr,
                     })
                     .await;
@@ -422,8 +427,8 @@ pub async fn fetch(targets: Vec<FetchTarget>, ctx: &Ctx) -> Value {
     let mut topic_groups: Vec<(String, u128, Vec<Value>)> = Vec::new();
     for f in futs {
         let t = &targets[f.idx];
-        let (err, data, hw, log_start) = match f.rx {
-            None => (f.err, Bytes::new(), -1, -1),
+        let (err, data, hw, log_start, lso) = match f.rx {
+            None => (f.err, Bytes::new(), -1, -1, -1),
             Some(rx) => match rx.await {
                 Ok(out) => {
                     if let Some(e) = &out.error {
@@ -432,24 +437,33 @@ pub async fn fetch(targets: Vec<FetchTarget>, ctx: &Ctx) -> Value {
                             StorageError::OffsetOutOfRange(_) => ErrorCode::OffsetOutOfRange,
                             _ => ErrorCode::UnknownServer,
                         };
-                        (code, Bytes::new(), -1, -1)
+                        (code, Bytes::new(), -1, -1, -1)
                     } else {
                         match out.result {
-                            Some(r) => (ErrorCode::None, r.data, r.high_watermark, r.log_start_offset),
-                            None => (ErrorCode::OffsetOutOfRange, Bytes::new(), -1, -1),
+                            Some(r) => (
+                                ErrorCode::None,
+                                r.data,
+                                r.high_watermark,
+                                r.log_start_offset,
+                                out.last_stable_offset,
+                            ),
+                            None => (ErrorCode::OffsetOutOfRange, Bytes::new(), -1, -1, -1),
                         }
                     }
                 }
-                Err(_) => (ErrorCode::BrokerNotAvailable, Bytes::new(), -1, -1),
+                Err(_) => (ErrorCode::BrokerNotAvailable, Bytes::new(), -1, -1, -1),
             },
         };
+        // AbortedTransactions（ADR-18 §4.2 投递模型 (b)）：服务端已预过滤
+        // aborted 批，恒发空数组——客户端无需条目（四档实测兼容）。
+        let aborted_val = Value::Array(vec![]);
         let entry = s([
             ("PartitionIndex", Value::I32(t.partition)),
             ("ErrorCode", Value::I16(err as i16)),
             ("HighWatermark", Value::I64(hw)),
-            ("LastStableOffset", Value::I64(if hw < 0 { -1 } else { hw })),
+            ("LastStableOffset", Value::I64(lso)),
             ("LogStartOffset", Value::I64(log_start)),
-            ("AbortedTransactions", Value::Null),
+            ("AbortedTransactions", aborted_val),
             ("PreferredReadReplica", Value::I32(-1)),
             ("Records", Value::Bytes(data)),
         ]);

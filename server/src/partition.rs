@@ -11,7 +11,7 @@ use basalt_storage::disk::StdDisk;
 use basalt_storage::error::StorageError;
 use basalt_storage::log::{AssignPolicy, Log, LogOptions, ReadCap, ReadResult};
 use basalt_storage::pool::BufferPool;
-use bytes::Bytes;
+use bytes::{Bytes, BytesMut};
 use std::collections::HashMap;
 use std::time::{Duration, Instant};
 use tokio::sync::{mpsc, oneshot};
@@ -28,6 +28,22 @@ pub struct ProduceOutcome {
 pub struct FetchOutcome {
     pub result: Option<ReadResult>,
     pub error: Option<StorageError>,
+    /// 最后稳定 offset（ADR-18 §4.2）：read_committed 的可见上界；
+    /// 无开事务 = HW。
+    pub last_stable_offset: i64,
+}
+
+impl FetchOutcome {
+    fn err(e: StorageError, lso: i64) -> FetchOutcome {
+        FetchOutcome { result: None, error: Some(e), last_stable_offset: lso }
+    }
+}
+
+/// 消费隔离级（Fetch v4+ IsolationLevel）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Isolation {
+    ReadUncommitted,
+    ReadCommitted,
 }
 
 #[derive(Debug)]
@@ -57,6 +73,7 @@ pub enum PartitionCmd {
         offset: i64,
         max_bytes: usize,
         deadline: Instant,
+        isolation: Isolation,
         reply: oneshot::Sender<FetchOutcome>,
     },
     /// follower 拉取（内部协议）：读取（可越 HW 至 LEO）+ 记录 follower LEO + 推进 HW。
@@ -103,13 +120,55 @@ pub enum PartitionCmd {
         offset: i64,
         reply: oneshot::Sender<Result<i64, StorageError>>,
     },
+    /// 事务 marker 落盘（ADR-18 §4.1，coordinator 编排路径；块 a 先行——
+    /// 内部注入可用）。应答语义 = 冻结提交面放行（marker 也是数据，§13）；
+    /// Ok(-1) = 幂等 no-op（同 (pid,epoch,outcome) marker 已存在）。
+    WriteTxnMarker {
+        producer_id: i64,
+        producer_epoch: i16,
+        outcome: basalt_record::ControlRecordType,
+        reply: oneshot::Sender<Result<i64, StorageError>>,
+    },
 }
 
 struct PendingFetch {
     offset: i64,
     max_bytes: usize,
     deadline: Instant,
+    isolation: Isolation,
     reply: oneshot::Sender<FetchOutcome>,
+}
+
+/// 开事务（ADR-18 §4.1）：first_offset = LSO 锚点；deadline = 分区侧自
+/// abort 上限（coordinator 侧超时的双保险，兜 TxnLog 清单外漂移批）。
+struct OpenTxn {
+    epoch: i16,
+    first_offset: i64,
+    last_offset: i64,
+    deadline: Instant,
+}
+
+/// marker 应答的簿记载荷：字节确认后才落账（release/settle/即时三路），
+/// 防「内存说已 abort、盘上无 marker」的重放 no-op 假 ack（ADR-18 §4.3）。
+struct MarkerBook {
+    pid: i64,
+    epoch: i16,
+    outcome: basalt_record::ControlRecordType,
+}
+
+impl MarkerBook {
+    fn noop() -> MarkerBook {
+        MarkerBook { pid: -1, epoch: -1, outcome: basalt_record::ControlRecordType::Abort }
+    }
+}
+
+/// 过冻结提交面落定的 marker 应答（ParkedAck 同型，ADR-18 §4.1）。
+struct ParkedMarker {
+    offset: i64,
+    book: MarkerBook,
+    reply: oneshot::Sender<Result<i64, StorageError>>,
+    deadline: Instant,
+    face: Vec<i32>,
 }
 
 /// 幂等 producer 状态（T-M3.1，KIP-130）：PID → 最近 5 批的序列与偏移。
@@ -177,6 +236,21 @@ pub struct PartitionActor {
     isr: std::collections::BTreeSet<i32>,
     idem: std::collections::HashMap<i64, IdemState>,
     pending_replica: Vec<PendingReplica>,
+    /// 开事务表（ADR-18 §4.1）：pid -> 开事务。first_offset 进 LSO 锚。
+    txn_open: std::collections::HashMap<i64, OpenTxn>,
+    /// 终态 marker（终态 fence + marker 幂等）。
+    last_marker: std::collections::HashMap<i64, (i16, basalt_record::ControlRecordType)>,
+    /// 已 abort 区间 (pid, epoch, first, last)：read_committed 过滤。
+    aborted: Vec<(i64, i16, i64, i64)>,
+    /// 最后稳定 offset = min(HW, 各开事务 first_offset)；无开事务 = HW。
+    lso: i64,
+    /// 过冻结提交面的 marker 应答。
+    parked_markers: Vec<ParkedMarker>,
+    /// batch_io 窗口内的 marker 应答（flush 成功后落账+应答）。
+    deferred_markers: Vec<(
+        oneshot::Sender<Result<i64, StorageError>>,
+        Result<(i64, MarkerBook), StorageError>,
+    )>,
     /// batch_io 窗口内的 produce 应答（ADR-14）：flush 成功后才发放；
     /// flush 失败改发错误——杜绝"ack 而未写文件"（持久化点纪律）。
     deferred_produce: Vec<(oneshot::Sender<ProduceOutcome>, ProduceOutcome)>,
@@ -206,7 +280,7 @@ impl PartitionActor {
             Err(e) => return Err(std::io::Error::other(e.to_string())),
         };
         tracing::info!(topic = %name, partition = index, "partition actor started");
-        let actor = PartitionActor {
+        let mut actor = PartitionActor {
             name,
             index,
             node_id,
@@ -222,17 +296,62 @@ impl PartitionActor {
             isr: std::collections::BTreeSet::new(),
             idem: std::collections::HashMap::new(),
             pending_replica: Vec::new(),
+            txn_open: std::collections::HashMap::new(),
+            last_marker: std::collections::HashMap::new(),
+            aborted: Vec::new(),
+            lso: 0,
+            parked_markers: Vec::new(),
+            deferred_markers: Vec::new(),
             deferred_produce: Vec::new(),
             repl,
         };
+        // 恢复收割（ADR-18 §4.4）：重启后事务视图从日志扫描重建——开事务
+        // 锚住 LSO（abort 落地前不泄露）、终态 fence 与 aborted 过滤跨重启有效。
+        let harvest = std::mem::take(&mut actor.log.txn_harvest);
+        actor.adopt_harvest(harvest);
         tokio::spawn(actor.run());
         Ok(tx)
     }
 
     async fn run(mut self) {
         loop {
-            let Some(first) = self.rx.recv().await else { break };
-            let mut group = vec![first];
+            // 唯一等待点：下一条命令，或最近 deadline（挂起 fetch 截止 /
+            // ack 与 marker 停等超时 / 副本长轮询 / 开事务自 abort）。
+            // 此前 deadline 感知等待只挂在循环尾部一次，超时分支处理完
+            // 命令后回到顶部裸 recv——定时器失联，安静 actor 上挂起项
+            // 永不超时（本轮 txn 泄露探针测试实证）。
+            let next_deadline = self
+                .pending
+                .iter()
+                .map(|p| p.deadline)
+                .chain(self.parked_acks.iter().map(|p| p.deadline))
+                .chain(self.parked_markers.iter().map(|p| p.deadline))
+                .chain(self.pending_replica.iter().map(|p| p.deadline))
+                .chain(self.txn_open.values().map(|t| t.deadline))
+                .min();
+            let first = match next_deadline {
+                Some(d) => {
+                    let now = Instant::now();
+                    if d > now {
+                        match tokio::time::timeout(d - now, self.rx.recv()).await {
+                            Ok(Some(cmd)) => Some(cmd),
+                            Ok(None) => break,
+                            Err(_elapsed) => {
+                                self.on_deadline();
+                                continue;
+                            }
+                        }
+                    } else {
+                        self.on_deadline();
+                        continue;
+                    }
+                }
+                None => match self.rx.recv().await {
+                    Some(cmd) => Some(cmd),
+                    None => break,
+                },
+            };
+            let mut group = vec![first.unwrap()];
             while let Ok(cmd) = self.rx.try_recv() {
                 group.push(cmd);
             }
@@ -250,52 +369,21 @@ impl PartitionActor {
             self.on_deadline();
             self.serve_pending();
             self.serve_replica_pends();
-            // 唤醒时机：fetch 截止 / ack 停等超时 / 副本长轮询超时，取最近
-            let next_deadline = self
-                .pending
-                .iter()
-                .map(|p| p.deadline)
-                .chain(self.parked_acks.iter().map(|p| p.deadline))
-                .chain(self.pending_replica.iter().map(|p| p.deadline))
-                .min();
-            if let Some(next_deadline) = next_deadline {
-                let now = Instant::now();
-                if next_deadline > now {
-                    match tokio::time::timeout(next_deadline - now, self.rx.recv()).await {
-                        Ok(Some(cmd)) => {
-                            let mut group = vec![cmd];
-                            while let Ok(c) = self.rx.try_recv() {
-                                group.push(c);
-                            }
-                            self.log.batch_io = true;
-                            self.process(group);
-                            let flush_ok = self.log.end_batch_window().is_ok();
-                            self.log.batch_io = false;
-                            self.settle_deferred_produce(flush_ok);
-                            self.on_deadline();
-                            self.serve_pending();
-                            self.serve_replica_pends();
-                        }
-                        Ok(None) => break,
-                        Err(_elapsed) => self.on_deadline(),
-                    }
-                } else {
-                    self.on_deadline();
-                }
-            }
         }
         tracing::info!(topic = %self.name, partition = self.index, "partition actor stopped");
     }
 
     fn on_deadline(&mut self) {
         let now = Instant::now();
-        // fetch 超时：正常空回（带当前 HW），不可映射 OOR
+        // fetch 超时：正常空回（带上界内可读数据），不可映射 OOR。
+        // 上界按隔离级取（read_committed = LSO）——超时回包同样不得
+        // 泄露未提交/已 abort 数据（ADR-18 §4.2 三接触点之三）。
         let mut i = 0;
         while i < self.pending.len() {
             if self.pending[i].deadline <= now {
                 let p = self.pending.remove(i);
-                let out = self.log.read_ex(p.offset, p.max_bytes, &self.pool, ReadCap::HighWatermark);
-                let _ = p.reply.send(FetchOutcome { result: out.ok(), error: None });
+                let out = self.read_for(p.offset, p.max_bytes, p.isolation);
+                let _ = p.reply.send(out);
             } else {
                 i += 1;
             }
@@ -320,6 +408,19 @@ impl PartitionActor {
                 i += 1;
             }
         }
+        // marker 停等超时：NotEnoughReplicas（簿记不落——coordinator 收错误
+        // 后重发/重对齐；重复 marker 由幂等面收敛，ADR-18 §4.3）
+        let mut i = 0;
+        while i < self.parked_markers.len() {
+            if self.parked_markers[i].deadline <= now {
+                let p = self.parked_markers.remove(i);
+                let _ = p.reply.send(Err(StorageError::NotEnoughReplicas));
+            } else {
+                i += 1;
+            }
+        }
+        // 开事务分区侧自 abort（deadline 兜底：coordinator 失联/漂移批）
+        self.sweep_txn_deadlines();
     }
 
     /// 新鲜 ISR 内的 follower 数（不含 leader）。
@@ -402,6 +503,7 @@ impl PartitionActor {
     }
 
     /// ADR-14：batch_io 窗口收口——flush 结果决定延后应答的最终状态。
+    /// marker 同窗口结算：flush 成功才落账（字节确认后的簿记纪律，§4.3）。
     fn settle_deferred_produce(&mut self, flush_ok: bool) {
         let deferred = std::mem::take(&mut self.deferred_produce);
         for (reply, mut outcome) in deferred {
@@ -411,6 +513,21 @@ impl PartitionActor {
             }
             let _ = reply.send(outcome);
         }
+        let markers = std::mem::take(&mut self.deferred_markers);
+        for (reply, res) in markers {
+            match res {
+                Ok((offset, book)) if flush_ok => {
+                    self.apply_marker_book(book);
+                    let _ = reply.send(Ok(offset));
+                }
+                Ok((_offset, _book)) => {
+                    let _ = reply.send(Err(StorageError::Other("batch flush failed".into())));
+                }
+                Err(e) => {
+                    let _ = reply.send(Err(e));
+                }
+            }
+        }
     }
 
     fn process(&mut self, group: Vec<PartitionCmd>) {
@@ -419,6 +536,7 @@ impl PartitionActor {
                 PartitionCmd::SetRole { leader, epoch, replicas } => {
                     let new_role = if leader { Role::Leader } else { Role::Follower };
                     let multi = replicas.len() > 1;
+                    let epoch_changed = epoch != self.epoch;
                     if new_role != self.role || epoch != self.epoch || multi != self.log.replicated {
                         tracing::info!(topic=%self.name, partition=self.index, ?new_role, epoch, replicas=?replicas, "role updated");
                         // 角色翻转：清空上一任期状态（LEO 上报/停等/挂起 fetch 全部失效）
@@ -435,7 +553,7 @@ impl PartitionActor {
                             });
                         }
                         for p in self.pending.drain(..) {
-                            let _ = p.reply.send(FetchOutcome { result: None, error: Some(StorageError::NotLeader) });
+                            let _ = p.reply.send(FetchOutcome::err(StorageError::NotLeader, self.lso));
                         }
                     }
                     self.role = new_role;
@@ -451,6 +569,18 @@ impl PartitionActor {
                         // 新 follower：HW 归零，等从新 leader 拉齐后由上报驱动
                         self.log.high_watermark = 0;
                     }
+                    // 新任期刷新开事务 deadline（follower 期退避前推的锚由
+                    // 新任期全量超时接管），随后 LSO 锚随 HW/角色重算。
+                    // gate 在 epoch 变化上（review P2-b）：apply_cluster 对
+                    // 集群事件无条件重发 SetRole，同 epoch 重复刷新会把分区
+                    // 侧自 abort 无限推迟（coordinator 失联时兜底失效）
+                    if leader && epoch_changed {
+                        let now = Instant::now();
+                        for t in self.txn_open.values_mut() {
+                            t.deadline = now + self.repl.transaction_timeout;
+                        }
+                    }
+                    self.recompute_lso();
                 }
                 PartitionCmd::Produce { batches, policy, acks, reply } => {
                     if self.role != Role::Leader && policy == AssignPolicy::Assign {
@@ -477,11 +607,44 @@ impl PartitionActor {
                         });
                         continue;
                     }
+                    // 复制流（Absolute，follower pull）不走幂等/fence/登记——
+                    // 信任 leader 已 fencing；marker seq 恰为数据 last+1，
+                    // 重查幂等会楔死多批切片复制（review P1-B）。事务视图由
+                    // replication_txn_advance 按批推进（review P1-A）
+                    let replication = policy == AssignPolicy::Absolute;
                     // 幂等去重（T-M3.1）：重复批回放缓存偏移（立即应答，
                     // 不进停等/窗口）；乱序回 OutOfOrderSequence（可重试）
-                    if let Some(dup) = self.idem_check(&batches) {
+                    if let Some(dup) = if replication { None } else { self.idem_check(&batches) } {
                         let _ = reply.send(dup);
                         continue;
+                    }
+                    // 终态 fence（ADR-18 §4.1）：同 (pid, epoch) 已有终态
+                    // marker 后拒绝新事务批——封「marker 落地后僵尸同 epoch
+                    // 续写复活开事务」（LSO 永久停滞的可用性洞）
+                    let txn_header = basalt_record::BatchHeader::parse(&batches);
+                    let is_txn = txn_header.as_ref().map(|h| h.is_transactional()).unwrap_or(false);
+                    if is_txn && !replication {
+                        let (pid, ep) = txn_header.as_ref().map(|h| (h.producer_id, h.producer_epoch)).unwrap_or((-1, -1));
+                        // 序判定（review P2-1）+ 在途互斥（review P1-4）：终态
+                        // marker 停等/窗口内同样拒绝同 pid 僵尸续写——否则
+                        // 释放后 aborted 区间外出现已 abort 会话的数据（aborted
+                        // reads 的服务端洞）
+                        let in_flight = self
+                            .parked_markers
+                            .iter()
+                            .any(|p| p.book.pid == pid)
+                            || self
+                                .deferred_markers
+                                .iter()
+                                .any(|(_, r)| r.as_ref().ok().map(|(_, b)| b.pid == pid).unwrap_or(false));
+                        let fenced = self.last_marker.get(&pid).map(|&(e, _)| e >= ep).unwrap_or(false);
+                        if fenced || in_flight {
+                            let _ = reply.send(ProduceOutcome {
+                                base_offset: -1, last_offset: -1, log_append_time: now_ms(),
+                                error: Some(StorageError::InvalidTxnState),
+                            });
+                            continue;
+                        }
                     }
                     let now = now_ms();
                     let m = crate::partition::metrics();
@@ -503,7 +666,22 @@ impl PartitionActor {
                             ProduceOutcome { base_offset: -1, last_offset: -1, log_append_time: now, error: Some(e) }
                         }
                     };
-                    self.idem_record(&batches, &outcome);
+                    if replication {
+                        if outcome.error.is_none() {
+                            self.replication_txn_advance(&batches, outcome.base_offset);
+                        }
+                    } else {
+                        self.idem_record(&batches, &outcome);
+                        // 事务登记（ADR-18 §4.1）：事务批成功 append 后开/续事务，
+                        // first_offset 进 LSO 锚；epoch 更替的旧开事务入 aborted
+                        // （安全方向，同收割语义）
+                        if is_txn && outcome.error.is_none() {
+                            if let Some(h) = &txn_header {
+                                self.txn_register(h.producer_id, h.producer_epoch, outcome.base_offset, outcome.last_offset);
+                            }
+                        }
+                    }
+                    self.recompute_lso();
                     // acks=all 且有其他副本：停等 HW 追上（follower 上报驱动；超时 NotEnoughReplicas）
                     let followers: Vec<i32> = self.replicas.iter().copied().filter(|r| *r != self.node_id).collect();
                     self.serve_replica_pends();
@@ -518,6 +696,7 @@ impl PartitionActor {
                         });
                         self.advance_hw();
                         self.release_acks();
+                        self.release_markers();
                         continue;
                     }
                     // ADR-14：batch_io 窗口内应答延后到 flush 之后（flush 失败
@@ -528,24 +707,18 @@ impl PartitionActor {
                         let _ = reply.send(outcome);
                     }
                 }
-                PartitionCmd::Fetch { offset, max_bytes, deadline, reply } => {
+                PartitionCmd::Fetch { offset, max_bytes, deadline, isolation, reply } => {
                     crate::partition::metrics().fetch_requests.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                     if self.role != Role::Leader {
-                        let _ = reply.send(FetchOutcome { result: None, error: Some(StorageError::NotLeader) });
+                        let _ = reply.send(FetchOutcome::err(StorageError::NotLeader, self.lso));
                         continue;
                     }
-                    if offset < self.log.high_watermark {
-                        let out = self.log.read(offset, max_bytes, &self.pool);
-                        match out {
-                            Ok(r) => {
-                                let _ = reply.send(FetchOutcome { result: Some(r), error: None });
-                            }
-                            Err(e) => {
-                                let _ = reply.send(FetchOutcome { result: None, error: Some(e) });
-                            }
-                        }
+                    // 上界按隔离级（read_committed = LSO，ADR-18 §4.2）
+                    if offset < self.cap_for(isolation) {
+                        let out = self.read_for(offset, max_bytes, isolation);
+                        let _ = reply.send(out);
                     } else {
-                        self.pending.push(PendingFetch { offset, max_bytes, deadline, reply });
+                        self.pending.push(PendingFetch { offset, max_bytes, deadline, isolation, reply });
                     }
                 }
                 PartitionCmd::FetchSlice { follower, offset, max_bytes, reply } => {
@@ -587,11 +760,13 @@ impl PartitionActor {
                             reply,
                         });
                         self.advance_hw();
+                        self.release_markers();
                         self.release_acks();
                         continue;
                     }
                     let slice = self.read_slice_for(offset, max_bytes);
                     let _ = reply.send(slice);
+                    self.release_markers();
                     self.advance_hw();
                     self.release_acks();
                     self.serve_pending();
@@ -658,6 +833,10 @@ impl PartitionActor {
                             self.parked_acks.push(p);
                         }
                     }
+                    // 事务状态随截断收敛（ADR-18 §4.1 POC 边界）：截断点之下的
+                    // 开事务锚随数据消失；aborted 区间残留在删除区间之下无害
+                    self.txn_open.retain(|_, t| t.last_offset >= offset);
+                    self.recompute_lso();
                     let _ = reply.send(self.log.truncate_to(offset));
                 }
                 PartitionCmd::DeleteRecords { offset, reply } => {
@@ -669,6 +848,60 @@ impl PartitionActor {
                 PartitionCmd::Retention { reply } => {
                     let n = self.log.delete_old_segments();
                     let _ = reply.send(n);
+                }
+                PartitionCmd::WriteTxnMarker { producer_id, producer_epoch, outcome, reply } => {
+                    // coordinator 编排路径：仅 leader 受理（迟到路由 → NotLeader
+                    // 重对齐）；幂等/相异/迟到 epoch 判定在 append_txn_marker 内
+                    if self.role != Role::Leader {
+                        let _ = reply.send(Err(StorageError::NotLeader));
+                        continue;
+                    }
+                    // acks=all 前置门与 produce 同款（P1-2）：新鲜 ISR 低于
+                    // max(min.insync, 多数派) 不得受理——否则空 face「停等」
+                    // 全称真即放行，coordinator 拿到提交成功而零副本持字节
+                    if self.log.replicated && self.replicas.len() > 1 {
+                        let majority = (self.replicas.len() as i32) / 2 + 1;
+                        let effective_min = self.repl.min_insync.max(majority);
+                        let in_sync = (self.isr.len() + 1) as i32;
+                        if in_sync < effective_min {
+                            let _ = reply.send(Err(StorageError::NotEnoughReplicas));
+                            continue;
+                        }
+                    }
+                    match self.append_txn_marker(producer_id, producer_epoch, outcome) {
+                        Err(e) => {
+                            let _ = reply.send(Err(e));
+                        }
+                        // 幂等 no-op：直接应答（不占新 offset，ADR-18 §4.3）
+                        Ok((-1, _)) => {
+                            let _ = reply.send(Ok(-1));
+                        }
+                        Ok((offset, book)) => {
+                            let has_followers = self.log.replicated
+                                && self.replicas.iter().any(|r| *r != self.node_id);
+                            if has_followers {
+                                // marker 是数据：过冻结提交面落定后才应答
+                                // （ADR-18 §4.1/§13——提前应答 + failover 丢
+                                // marker = 已提交事务成孤儿 = lost writes）
+                                self.parked_markers.push(ParkedMarker {
+                                    offset,
+                                    book,
+                                    reply,
+                                    deadline: Instant::now() + Duration::from_secs(10),
+                                    face: self.isr.iter().copied().collect(),
+                                });
+                                self.advance_hw();
+                                self.release_acks();
+                                self.release_markers();
+                            } else if self.log.batch_io {
+                                // 窗口收口后落账+应答（字节确认纪律）
+                                self.deferred_markers.push((reply, Ok((offset, book))));
+                            } else {
+                                self.apply_marker_book(book);
+                                let _ = reply.send(Ok(offset));
+                            }
+                        }
+                    }
                 }
             }
         }
@@ -709,6 +942,8 @@ impl PartitionActor {
             }
             self.log.high_watermark = new_hw;
         }
+        // HW 推进 → LSO 上界随动（开事务锚不变时 LSO = min(HW, 锚)）
+        self.recompute_lso();
     }
 
     /// HW 追上的停等 acks 放行。
@@ -785,14 +1020,338 @@ impl PartitionActor {
     fn serve_pending(&mut self) {
         let mut i = 0;
         while i < self.pending.len() {
-            if self.pending[i].offset < self.log.high_watermark {
+            // 唤醒谓词按请求隔离级取上界（read_committed 等 LSO，非 HW）
+            if self.pending[i].offset < self.cap_for(self.pending[i].isolation) {
                 let p = self.pending.remove(i);
-                let out = self.log.read_ex(p.offset, p.max_bytes, &self.pool, ReadCap::HighWatermark);
-                let _ = p.reply.send(FetchOutcome { result: out.ok(), error: None });
+                let out = self.read_for(p.offset, p.max_bytes, p.isolation);
+                let _ = p.reply.send(out);
             } else {
                 i += 1;
             }
         }
+    }
+
+    // ---------- 事务面（ADR-18 §4，块 a） ----------
+
+    /// 请求隔离级的可见上界。
+    fn cap_for(&self, iso: Isolation) -> i64 {
+        match iso {
+            Isolation::ReadUncommitted => self.log.high_watermark,
+            Isolation::ReadCommitted => self.lso,
+        }
+    }
+
+    /// LSO = min(HW, 各开事务 first_offset)，无开事务 = HW；
+    /// 删除区间之下的锚钳制到 log_start（POC 边界，ADR-18 §10）。
+    fn recompute_lso(&mut self) {
+        let mut l = self.log.high_watermark;
+        for t in self.txn_open.values() {
+            l = l.min(t.first_offset);
+        }
+        if l < self.log.log_start_offset {
+            l = self.log.log_start_offset;
+        }
+        self.lso = l;
+    }
+
+    /// 事务批成功 append 后的开/续事务登记。
+    fn txn_register(&mut self, pid: i64, epoch: i16, base: i64, last: i64) {
+        match self.txn_open.get(&pid).map(|t| (t.epoch, t.first_offset, t.last_offset)) {
+            Some((e, _first, _)) if e == epoch => {
+                if let Some(t) = self.txn_open.get_mut(&pid) {
+                    t.last_offset = last;
+                }
+            }
+            Some((e, first, old_last)) => {
+                // 会话更替：旧开事务被 fence 且不再会有其 marker——安全方向
+                // 直接入 aborted（与恢复收割同语义）
+                self.aborted.push((pid, e, first, old_last));
+                self.txn_open.insert(pid, OpenTxn {
+                    epoch, first_offset: base, last_offset: last,
+                    deadline: Instant::now() + self.repl.transaction_timeout,
+                });
+            }
+            None => {
+                self.txn_open.insert(pid, OpenTxn {
+                    epoch, first_offset: base, last_offset: last,
+                    deadline: Instant::now() + self.repl.transaction_timeout,
+                });
+            }
+        }
+    }
+
+    /// 复制路径（Absolute）的事务推进（review P1-A）：切片内逐批收割式处理
+    /// ——控制批 → 终态簿记落账（复制落盘即字节确认）；事务数据批 → 开/续
+    /// 事务。follower 由此获得与 leader 一致的 txn_open/last_marker/aborted
+    /// 视图，升任继承不腐化。
+    fn replication_txn_advance(&mut self, batches: &Bytes, base: i64) {
+        let mut pos = 0usize;
+        let mut cum = base;
+        while let Some(h) = basalt_record::BatchHeader::parse(&batches[pos..]) {
+            let total = h.total_len();
+            if total == 0 || pos + total > batches.len() {
+                break;
+            }
+            if h.producer_id >= 0 {
+                let last = cum + h.record_count.max(0) as i64 - 1;
+                if h.is_control() {
+                    if let Some(ty) = basalt_record::control_record_type_of(&batches[pos..pos + total]) {
+                        self.apply_marker_book(MarkerBook { pid: h.producer_id, epoch: h.producer_epoch, outcome: ty });
+                    }
+                } else if h.is_transactional() {
+                    self.txn_register(h.producer_id, h.producer_epoch, cum, last);
+                }
+            }
+            cum += h.record_count.max(0) as i64;
+            pos += total;
+        }
+        self.recompute_lso();
+    }
+
+    /// marker 落盘核心：幂等 no-op（同 (pid,epoch,outcome)）、相异/迟到拒绝
+    /// （COMMIT 永不覆盖 ABORT 终态——abort 是安全方向，ADR-18 §4.3）、
+    /// 编码 append。**只 append 不落账**——簿记随字节确认路径
+    /// （release/settle/即时）走 apply_marker_book。
+    fn append_txn_marker(
+        &mut self,
+        pid: i64,
+        epoch: i16,
+        outcome: basalt_record::ControlRecordType,
+    ) -> Result<(i64, MarkerBook), StorageError> {
+        // 在途互斥（review P1-3c）：同 pid 已有 marker 在停等/窗口内未结算
+        // 时拒绝新 marker——保证簿记顺序与字节顺序一致（否则迟到 COMMIT
+        // 落账覆盖已落账 ABORT 的区间语义）。回可重试错误，coordinator 重试。
+        let in_flight = self
+            .parked_markers
+            .iter()
+            .any(|p| p.book.pid == pid)
+            || self
+                .deferred_markers
+                .iter()
+                .any(|(_, r)| r.as_ref().ok().map(|(_, b)| b.pid == pid).unwrap_or(false));
+        if in_flight {
+            return Err(StorageError::Other("txn marker in flight".into()));
+        }
+        if let Some(&(me, mo)) = self.last_marker.get(&pid) {
+            // 序判定（review P2-1）：me > epoch = 旧纪元 marker 回拨终态，
+            // 拒绝；相等才进入幂等/相异判定
+            if me > epoch {
+                return Err(StorageError::InvalidTxnState);
+            }
+            if me == epoch {
+                return if mo == outcome {
+                    Ok((-1, MarkerBook::noop()))
+                } else {
+                    Err(StorageError::InvalidTxnState)
+                };
+            }
+        }
+        if let Some(t) = self.txn_open.get(&pid) {
+            if t.epoch != epoch {
+                return Err(StorageError::InvalidTxnState); // 旧 epoch marker 迟到
+            }
+        }
+        let seq = self.idem.get(&pid).and_then(|s| s.last_seq).map(|s| s.wrapping_add(1)).unwrap_or(0);
+        let mut buf = BytesMut::new();
+        basalt_record::encode_control_batch(0, 0, now_ms(), pid, epoch, seq, outcome, &mut buf);
+        let raw = buf.freeze();
+        let r = self.log.append(&raw, AssignPolicy::Assign, now_ms())?;
+        Ok((r.last_offset, MarkerBook { pid, epoch, outcome }))
+    }
+
+    /// 簿记落账（字节确认后调用）：终态表、aborted 区间、LSO 重算。
+    /// aborted 区间取落账时 txn_open 现值（review P1-4：append 与 release
+    /// 之间被 fence 拦截失败的僵尸批不会扩大区间，但 epoch 更替等路径可能
+    /// 已扩——现值是超集，安全方向）；Commit 清除同会话 aborted 残留
+    /// （末写胜出，防 parked 竞态残留）。
+    fn apply_marker_book(&mut self, b: MarkerBook) {
+        if b.pid < 0 {
+            return; // noop 载荷
+        }
+        self.last_marker.insert(b.pid, (b.epoch, b.outcome));
+        if let Some(t) = self.txn_open.remove(&b.pid) {
+            if b.outcome == basalt_record::ControlRecordType::Abort && t.epoch == b.epoch {
+                self.aborted.push((b.pid, b.epoch, t.first_offset, t.last_offset));
+            }
+        }
+        if b.outcome == basalt_record::ControlRecordType::Commit {
+            self.aborted.retain(|&(p, e, _, _)| !(p == b.pid && e == b.epoch));
+        }
+        self.recompute_lso();
+        self.serve_pending();
+    }
+
+    /// 冻结提交面放行的 marker 应答（ParkedAck 同型判据）。
+    fn release_markers(&mut self) {
+        let mut i = 0;
+        while i < self.parked_markers.len() {
+            let need = self.parked_markers[i].offset + 1;
+            let covered = self.parked_markers[i].face.iter().all(|f| {
+                self.follower_leos.get(f).map(|(leo, _)| *leo >= need).unwrap_or(false)
+            });
+            if covered {
+                let p = self.parked_markers.remove(i);
+                self.apply_marker_book(p.book);
+                let _ = p.reply.send(Ok(p.offset));
+            } else {
+                i += 1;
+            }
+        }
+    }
+
+    /// 开事务 deadline 兜底：分区侧自 abort（与 coordinator 驱动同一
+    /// marker 管道；兜 coordinator 失联/TxnLog 清单外漂移批，ADR-18 §4.1）。
+    /// 结算与 WriteTxnMarker 同路（review P1-3a）：多副本必过冻结提交面
+    /// park，簿记随字节确认走——绝不绕过复制层直接落账。
+    fn sweep_txn_deadlines(&mut self) {
+        let now = Instant::now();
+        // follower 不落 marker（review P1-1）：绕过复制层写日志 = 副本分叉
+        //（TruncateTo fencing 同款纪律）；锚保留等重新升任后收敛。
+        // 但过期 deadline 必须前推——否则主循环 deadline 已过 → on_deadline
+        // → continue 热旋（P1-5 风暴的 follower 变体，本轮测试实证）
+        if self.role != Role::Leader {
+            for (pid, t) in self.txn_open.iter_mut() {
+                if t.deadline <= now {
+                    t.deadline = now + Duration::from_secs(1);
+                    tracing::debug!(pid, "txn deadline deferred (follower)");
+                }
+            }
+            return;
+        }
+        let expired: Vec<i64> = self
+            .txn_open
+            .iter()
+            .filter(|(_, t)| t.deadline <= now)
+            .map(|(p, _)| *p)
+            .collect();
+        for pid in expired {
+            let (epoch, outcome) = (self.txn_open[&pid].epoch, basalt_record::ControlRecordType::Abort);
+            match self.append_txn_marker(pid, epoch, outcome) {
+                Ok((-1, _)) => {
+                    // ㊾ 收敛契约闭合（review P2-a）：终态已同型而锚残留
+                    // （未来路径可能造成共存）→ 清锚防 deadline 风暴复辟
+                    self.txn_open.remove(&pid);
+                    self.recompute_lso();
+                }
+                Ok((_offset, book)) => {
+                    tracing::info!(topic = %self.name, partition = self.index, pid, "txn deadline self-abort");
+                    let has_followers = self.log.replicated
+                        && self.replicas.iter().any(|r| *r != self.node_id);
+                    // ISR 前置门与 WriteTxnMarker 同款（review P2-c）：不过门
+                    // 走 1s 退避（ABORT-only 后果良性，但纪律①须字面一致）
+                    if has_followers {
+                        let majority = (self.replicas.len() as i32) / 2 + 1;
+                        let effective_min = self.repl.min_insync.max(majority);
+                        let in_sync = (self.isr.len() + 1) as i32;
+                        if in_sync < effective_min {
+                            if let Some(t) = self.txn_open.get_mut(&pid) {
+                                t.deadline = now + Duration::from_secs(1);
+                            }
+                            continue;
+                        }
+                    }
+                    if has_followers {
+                        // 无应答方（oneshot 对端即刻丢弃）：簿记随 release 落
+                        let (trx, _rrx) = oneshot::channel();
+                        self.parked_markers.push(ParkedMarker {
+                            offset: _offset,
+                            book,
+                            reply: trx,
+                            deadline: Instant::now() + Duration::from_secs(10),
+                            face: self.isr.iter().copied().collect(),
+                        });
+                        self.advance_hw();
+                        self.release_acks();
+                        self.release_markers();
+                    } else if self.log.batch_io {
+                        let (trx, _rrx) = oneshot::channel();
+                        self.deferred_markers.push((trx, Ok((_offset, book))));
+                    } else {
+                        self.apply_marker_book(book);
+                    }
+                }
+                Err(e) => {
+                    // 失败退避（review P1-5）：不清条目也不前推 deadline 会
+                    // 让主循环 deadline 风暴（on_deadline→continue 热旋、
+                    // 饿死全部命令）——前推 1s 再试
+                    tracing::warn!(topic = %self.name, partition = self.index, pid, error = %e, "txn self-abort failed, backoff 1s");
+                    if let Some(t) = self.txn_open.get_mut(&pid) {
+                        t.deadline = now + Duration::from_secs(1);
+                    }
+                }
+            }
+        }
+    }
+
+    /// 消费读（隔离级感知）：上界 cap_for + 控制批剥离（两档隔离级都剥离，
+    /// 应用永不见控制记录）+ read_committed 再剥 aborted 区间并汇总条目。
+    fn read_for(&mut self, offset: i64, max_bytes: usize, iso: Isolation) -> FetchOutcome {
+        let cap = self.cap_for(iso);
+        match self.log.read_ex(offset, max_bytes, &self.pool, ReadCap::At(cap)) {
+            Err(e) => FetchOutcome::err(e, self.lso),
+            Ok(r) => {
+                let data = self.filter_batches(r.data, iso == Isolation::ReadCommitted);
+                FetchOutcome {
+                    result: Some(ReadResult { data, ..r }),
+                    error: None,
+                    last_stable_offset: self.lso,
+                }
+            }
+        }
+    }
+
+    /// 批走过滤：控制批恒剥离；read_committed 下命中 aborted 区间的事务批
+    /// 剥离。**投递模型（ADR-18 §4.2，review P0 定案）**：服务端预过滤 +
+    /// 响应恒发空 AbortedTransactions 数组——java/librdkafka/franz-go/
+    /// kafka-python 四档对空数组均按「无 abort」处理，数据已被服务端滤掉
+    /// 故客户端无需条目；Kafka 本尊的「wire 投递控制批 + 客户端按
+    /// (pid, FirstOffset) 丢批」模型与「服务端预过滤」组合必坏（客户端
+    /// 无 epoch、靠 ABORT 控制批终结区间——被剥离后无法收敛），二选一，
+    /// basalt 取服务端滤（对客户端能力无假设，纵深防御）。
+    fn filter_batches(&self, data: Bytes, committed: bool) -> Bytes {
+        let mut out = BytesMut::new();
+        let mut pos = 0usize;
+        while let Some(h) = basalt_record::BatchHeader::parse(&data[pos..]) {
+            let total = h.total_len();
+            if total == 0 || pos + total > data.len() {
+                break;
+            }
+            let mut skip = h.is_control();
+            if !skip && committed && h.is_transactional() && h.producer_id >= 0 {
+                let last = h.base_offset + h.last_offset_delta as i64;
+                if self
+                    .aborted
+                    .iter()
+                    .any(|&(p, e, f, l)| p == h.producer_id && e == h.producer_epoch && f <= last && h.base_offset <= l)
+                {
+                    skip = true;
+                }
+            }
+            if !skip {
+                out.extend_from_slice(&data[pos..pos + total]);
+            }
+            pos += total;
+        }
+        out.freeze()
+    }
+
+    /// 恢复收割采纳（ADR-18 §4.4）：spawn 时一次，事务视图从日志扫描重建。
+    fn adopt_harvest(&mut self, h: basalt_storage::log::TxnHarvest) {
+        let now = Instant::now();
+        for (pid, (epoch, first, last)) in h.open {
+            self.txn_open.insert(pid, OpenTxn {
+                epoch,
+                first_offset: first,
+                last_offset: last,
+                deadline: now + self.repl.transaction_timeout,
+            });
+        }
+        self.last_marker = h.last_marker;
+        self.aborted = h.aborted;
+        for (pid, epoch) in h.pid_epoch {
+            self.idem.entry(pid).or_default().epoch = epoch;
+        }
+        self.recompute_lso();
     }
 }
 
@@ -867,7 +1426,7 @@ mod truncate_fencing_tests {
             0,
             dir.clone(),
             LogOptions { segment_max_bytes: 1 << 30, fsync: FsyncSchedule::Os, retention_ms: 0, retention_max_bytes: 0 },
-            ReplicaConfig { min_insync: 1, isr_lag: Duration::from_millis(500) },
+            ReplicaConfig { min_insync: 1, isr_lag: Duration::from_millis(500), transaction_timeout: Duration::from_secs(60) },
             pool,
         )
         .unwrap();
@@ -934,7 +1493,7 @@ mod truncate_fencing_tests {
         let tx = PartitionActor::spawn(
             "t".into(), 0, 0, dir.clone(),
             LogOptions { segment_max_bytes: 1 << 30, fsync: FsyncSchedule::Os, retention_ms: 0, retention_max_bytes: 0 },
-            ReplicaConfig { min_insync: 1, isr_lag: Duration::from_millis(500) },
+            ReplicaConfig { min_insync: 1, isr_lag: Duration::from_millis(500), transaction_timeout: Duration::from_secs(60) },
             pool,
         ).unwrap();
         tx.send(PartitionCmd::SetRole { leader: true, epoch: 1, replicas: vec![0, 1, 2] }).await.unwrap();
@@ -986,7 +1545,7 @@ mod truncate_fencing_tests {
             0,
             dir.clone(),
             LogOptions { segment_max_bytes: 1 << 30, fsync: FsyncSchedule::Os, retention_ms: 0, retention_max_bytes: 0 },
-            ReplicaConfig { min_insync: 1, isr_lag: Duration::from_millis(500) },
+            ReplicaConfig { min_insync: 1, isr_lag: Duration::from_millis(500), transaction_timeout: Duration::from_secs(60) },
             pool,
         )
         .unwrap();
@@ -1060,7 +1619,7 @@ mod frozen_face_tests {
             0,
             dir.clone(),
             LogOptions { segment_max_bytes: 1 << 30, fsync: FsyncSchedule::Os, retention_ms: 0, retention_max_bytes: 0 },
-            ReplicaConfig { min_insync: 1, isr_lag: Duration::from_millis(500) },
+            ReplicaConfig { min_insync: 1, isr_lag: Duration::from_millis(500), transaction_timeout: Duration::from_secs(60) },
             pool,
         )
         .unwrap();
@@ -1143,7 +1702,7 @@ mod idempotence_tests {
         let tx = PartitionActor::spawn(
             "idem".into(), 0, 0, dir.clone(),
             LogOptions { segment_max_bytes: 1 << 30, fsync: FsyncSchedule::Os, retention_ms: 0, retention_max_bytes: 0 },
-            ReplicaConfig { min_insync: 1, isr_lag: Duration::from_millis(500) },
+            ReplicaConfig { min_insync: 1, isr_lag: Duration::from_millis(500), transaction_timeout: Duration::from_secs(60) },
             pool,
         ).unwrap();
         tx.send(PartitionCmd::SetRole { leader: true, epoch: 1, replicas: vec![0] }).await.unwrap();
@@ -1207,6 +1766,316 @@ mod idempotence_tests {
         // epoch 升级：会话重置，序列从 0 重新开始
         let o1 = produce(&tx, 200, 1, 0, "e1").await;
         assert!(o1.error.is_none() && o1.base_offset == 1);
+        drop(tx);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+}
+
+#[cfg(test)]
+mod txn_tests {
+    //! ADR-18 块 a（数据面）：LSO 锚定/释放、控制批剥离、aborted 过滤、
+    //! marker 幂等与终态 fence、恢复收割、deadline 自 abort、超时不泄露。
+
+    use super::*;
+    use basalt_record::{encode_batch, Rec, ATTR_TRANSACTIONAL};
+    use basalt_storage::log::{FsyncSchedule, LogOptions};
+
+    fn batch_bytes_txn(pid: i64, epoch: i16, seq: i32, tag: &str) -> Bytes {
+        let recs: Vec<Rec> = (0..1)
+            .map(|i| Rec {
+                timestamp_delta: i as i64,
+                key: Some(Bytes::from(format!("k{i}"))),
+                value: Some(Bytes::from(format!("{tag}-{i}"))),
+                headers: vec![],
+            })
+            .collect();
+        let mut b = BytesMut::new();
+        encode_batch(0, 0, 1000, ATTR_TRANSACTIONAL, pid, epoch, seq, &recs, &mut b);
+        b.freeze()
+    }
+
+    fn opts() -> LogOptions {
+        LogOptions { segment_max_bytes: 1 << 30, fsync: FsyncSchedule::Os, retention_ms: 0, retention_max_bytes: 0 }
+    }
+
+    fn cfg(txn_timeout: Duration) -> ReplicaConfig {
+        ReplicaConfig { min_insync: 1, isr_lag: Duration::from_millis(500), transaction_timeout: txn_timeout }
+    }
+
+    fn fresh_dir(tag: &str) -> std::path::PathBuf {
+        let dir = std::env::temp_dir().join(format!(
+            "basalt-txn-{tag}-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    async fn spawn_on(dir: std::path::PathBuf, txn_timeout: Duration) -> mpsc::Sender<PartitionCmd> {
+        let pool = std::sync::Arc::new(BufferPool::new());
+        let tx = PartitionActor::spawn("txn".into(), 0, 0, dir, opts(), cfg(txn_timeout), pool).unwrap();
+        tx.send(PartitionCmd::SetRole { leader: true, epoch: 1, replicas: vec![0] }).await.unwrap();
+        tx
+    }
+
+    async fn produce(tx: &mpsc::Sender<PartitionCmd>, batches: Bytes) -> ProduceOutcome {
+        let (ptx, prx) = oneshot::channel();
+        tx.send(PartitionCmd::Produce { batches, policy: AssignPolicy::Assign, acks: 1, reply: ptx }).await.unwrap();
+        prx.await.unwrap()
+    }
+
+    async fn marker(tx: &mpsc::Sender<PartitionCmd>, pid: i64, epoch: i16, out: basalt_record::ControlRecordType) -> Result<i64, StorageError> {
+        let (mtx, mrx) = oneshot::channel();
+        tx.send(PartitionCmd::WriteTxnMarker { producer_id: pid, producer_epoch: epoch, outcome: out, reply: mtx }).await.unwrap();
+        mrx.await.unwrap()
+    }
+
+    async fn fetch(tx: &mpsc::Sender<PartitionCmd>, offset: i64, iso: Isolation, wait: Duration) -> FetchOutcome {
+        let (ftx, frx) = oneshot::channel();
+        tx.send(PartitionCmd::Fetch { offset, max_bytes: 1 << 20, deadline: Instant::now() + wait, isolation: iso, reply: ftx }).await.unwrap();
+        frx.await.unwrap()
+    }
+
+    fn data_batches(out: &FetchOutcome) -> Vec<basalt_record::BatchHeader> {
+        let mut v = Vec::new();
+        let data = match &out.result { Some(r) => &r.data, None => return v };
+        let mut pos = 0usize;
+        while let Some(h) = basalt_record::BatchHeader::parse(&data[pos..]) {
+            let total = h.total_len();
+            if total == 0 || pos + total > data.len() { break; }
+            v.push(h);
+            pos += total;
+        }
+        v
+    }
+
+    /// LSO 锚定：开事务把 read_committed 上界钉在 first_offset；
+    /// read_uncommitted 不受影响；控制批/事务批标志位符合预期。
+    #[tokio::test]
+    async fn txn_open_anchors_lso_read_committed_hides() {
+        let dir = fresh_dir("anchor");
+        let tx = spawn_on(dir.clone(), Duration::from_secs(60)).await;
+        let o = produce(&tx, batch_bytes_txn(500, 0, 0, "m")).await;
+        assert!(o.error.is_none(), "{:?}", o.error);
+        assert_eq!(o.base_offset, 0);
+
+        // committed：offset 0 不小于 lso(0) → 挂起 → 零 deadline 立即超时空回
+        let f = fetch(&tx, 0, Isolation::ReadCommitted, Duration::from_secs(0)).await;
+        assert!(f.result.as_ref().map(|r| r.data.is_empty()).unwrap_or(true), "开事务数据不得对 committed 可见");
+        assert_eq!(f.last_stable_offset, 0);
+
+        // uncommitted：offset 0 < hw(1) → 立即读
+        let fu = fetch(&tx, 0, Isolation::ReadUncommitted, Duration::from_secs(1)).await;
+        let hs = data_batches(&fu);
+        assert_eq!(hs.len(), 1);
+        assert!(hs[0].is_transactional() && !hs[0].is_control());
+
+        drop(tx);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// commit marker：LSO 释放、数据对 committed 可见、控制批不投递。
+    #[tokio::test]
+    async fn commit_marker_releases_visibility_and_is_not_delivered() {
+        let dir = fresh_dir("commit");
+        let tx = spawn_on(dir.clone(), Duration::from_secs(60)).await;
+        produce(&tx, batch_bytes_txn(500, 0, 0, "m")).await;
+        let m = marker(&tx, 500, 0, basalt_record::ControlRecordType::Commit).await;
+        assert_eq!(m.unwrap(), 1, "marker 占 offset 1");
+
+        let f = fetch(&tx, 0, Isolation::ReadCommitted, Duration::from_secs(1)).await;
+        assert!(f.error.is_none());
+        assert_eq!(f.last_stable_offset, 2, "无开事务 → LSO = HW");
+        let hs = data_batches(&f);
+        assert_eq!(hs.len(), 1, "只回数据批，marker 控制批不投递");
+        assert!(!hs[0].is_control() && hs[0].is_transactional());
+
+        drop(tx);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// abort marker：数据对 committed 不可见、LSO 释放（投递模型 (b) 不发
+    /// 条目）；uncommitted 仍可读（且控制批同样剥离）。
+    #[tokio::test]
+    async fn abort_marker_filters_data_and_releases_lso() {
+        let dir = fresh_dir("abort");
+        let tx = spawn_on(dir.clone(), Duration::from_secs(60)).await;
+        produce(&tx, batch_bytes_txn(500, 0, 0, "m")).await;
+        assert_eq!(marker(&tx, 500, 0, basalt_record::ControlRecordType::Abort).await.unwrap(), 1);
+
+        let f = fetch(&tx, 0, Isolation::ReadCommitted, Duration::from_secs(1)).await;
+        assert!(f.result.as_ref().map(|r| r.data.is_empty()).unwrap_or(true), "aborted 数据对 committed 不可见（投递模型 (b)：服务端预过滤，列表恒空）");
+        assert_eq!(f.last_stable_offset, 2);
+
+        let fu = fetch(&tx, 0, Isolation::ReadUncommitted, Duration::from_secs(1)).await;
+        let hs = data_batches(&fu);
+        assert_eq!(hs.len(), 1, "uncommitted 读到数据批、控制批仍被剥离");
+        assert!(!hs[0].is_control());
+
+        drop(tx);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// marker 幂等（同 outcome no-op 不占 offset）+ 相异 outcome 拒绝
+    /// （COMMIT 永不覆盖 ABORT 终态，ADR-18 §4.3）。
+    #[tokio::test]
+    async fn marker_idempotent_and_mismatch_rejected() {
+        let dir = fresh_dir("idem");
+        let tx = spawn_on(dir.clone(), Duration::from_secs(60)).await;
+        produce(&tx, batch_bytes_txn(500, 0, 0, "m")).await;
+        assert_eq!(marker(&tx, 500, 0, basalt_record::ControlRecordType::Commit).await.unwrap(), 1);
+        assert_eq!(marker(&tx, 500, 0, basalt_record::ControlRecordType::Commit).await.unwrap(), -1, "重复 marker no-op");
+
+        let (ltx, lrx) = oneshot::channel();
+        tx.send(PartitionCmd::LocalLeo { reply: ltx }).await.unwrap();
+        assert_eq!(lrx.await.unwrap(), 2, "no-op 不占新 offset");
+
+        let r = marker(&tx, 500, 0, basalt_record::ControlRecordType::Abort).await;
+        assert!(matches!(r, Err(StorageError::InvalidTxnState)), "相异 outcome 必须拒绝：{:?}", r);
+
+        drop(tx);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 终态 fence：同 (pid,epoch) 终态后拒绝新事务批（LSO 永久停滞的
+    /// 可用性洞封口）；epoch 升级重置会话后放行。
+    #[tokio::test]
+    async fn terminal_fence_rejects_txn_data_after_marker() {
+        let dir = fresh_dir("fence");
+        let tx = spawn_on(dir.clone(), Duration::from_secs(60)).await;
+        produce(&tx, batch_bytes_txn(500, 0, 0, "m")).await;
+        marker(&tx, 500, 0, basalt_record::ControlRecordType::Commit).await.unwrap();
+
+        let o = produce(&tx, batch_bytes_txn(500, 0, 1, "zombie")).await;
+        assert!(matches!(o.error, Some(StorageError::InvalidTxnState)), "终态后同 epoch 事务批必须被拒：{:?}", o.error);
+        let (ltx, lrx) = oneshot::channel();
+        tx.send(PartitionCmd::LocalLeo { reply: ltx }).await.unwrap();
+        assert_eq!(lrx.await.unwrap(), 2, "被拒批不得推进 LEO");
+
+        let o2 = produce(&tx, batch_bytes_txn(500, 1, 0, "next")).await;
+        assert!(o2.error.is_none() && o2.base_offset == 2, "新 epoch 会话放行：{:?}", o2.error);
+
+        drop(tx);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 挂起 committed fetch 超时回包不得泄露（on_deadline 三接触点之三）。
+    #[tokio::test]
+    async fn committed_pending_fetch_timeout_does_not_leak() {
+        let dir = fresh_dir("leak");
+        let tx = spawn_on(dir.clone(), Duration::from_secs(60)).await;
+        produce(&tx, batch_bytes_txn(500, 0, 0, "m")).await;
+
+        let (ftx, mut frx) = oneshot::channel();
+        tx.send(PartitionCmd::Fetch {
+            offset: 0, max_bytes: 1 << 20,
+            deadline: Instant::now() + Duration::from_millis(120),
+            isolation: Isolation::ReadCommitted, reply: ftx,
+        }).await.unwrap();
+        tokio::time::sleep(Duration::from_millis(30)).await;
+        assert!(frx.try_recv().is_err(), "超时前不得应答");
+        let f = tokio::time::timeout(Duration::from_secs(2), frx).await.unwrap().unwrap();
+        assert!(f.error.is_none());
+        assert!(f.result.as_ref().map(|r| r.data.is_empty()).unwrap_or(true), "超时回包必须按 LSO 封顶，不得泄露开事务数据");
+        assert_eq!(f.last_stable_offset, 0);
+
+        drop(tx);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// review P1-1 回归：follower 上 deadline 到期不得自 abort（绕过复制层
+    /// 写日志 = 副本分叉，TruncateTo fencing 同款纪律）；锚保留待升任收敛。
+    #[tokio::test]
+    async fn follower_does_not_self_abort() {
+        let dir = fresh_dir("followersweep");
+        let tx = spawn_on(dir.clone(), Duration::from_millis(120)).await;
+        produce(&tx, batch_bytes_txn(800, 0, 0, "m")).await;
+        // 降为 follower：deadline 到期也不得写本地日志
+        tx.send(PartitionCmd::SetRole { leader: false, epoch: 2, replicas: vec![0, 1] }).await.unwrap();
+        tokio::time::sleep(Duration::from_millis(400)).await;
+
+        let (ltx, lrx) = oneshot::channel();
+        tx.send(PartitionCmd::LocalLeo { reply: ltx }).await.unwrap();
+        assert_eq!(lrx.await.unwrap(), 1, "follower 不得自 abort 推进 LEO（副本分叉）");
+
+        // 重新升任：锚仍在 → 升任后 sweep 收敛
+        tx.send(PartitionCmd::SetRole { leader: true, epoch: 3, replicas: vec![0] }).await.unwrap();
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        let (ltx2, lrx2) = oneshot::channel();
+        tx.send(PartitionCmd::LocalLeo { reply: ltx2 }).await.unwrap();
+        assert_eq!(lrx2.await.unwrap(), 2, "升任后 deadline 兜底收敛（ABORT marker 落 offset 1）");
+
+        drop(tx);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 恢复收割（§4.4）：aborted 过滤与终态 fence 跨重启有效。
+    #[tokio::test]
+    async fn recovery_harvest_rebuilds_filter_and_fence() {
+        let dir = fresh_dir("harvest");
+        let tx = spawn_on(dir.clone(), Duration::from_secs(60)).await;
+        produce(&tx, batch_bytes_txn(500, 0, 0, "keep")).await;
+        marker(&tx, 500, 0, basalt_record::ControlRecordType::Commit).await.unwrap();
+        produce(&tx, batch_bytes_txn(501, 0, 0, "drop")).await;
+        marker(&tx, 501, 0, basalt_record::ControlRecordType::Abort).await.unwrap();
+        drop(tx);
+
+        let tx2 = spawn_on(dir.clone(), Duration::from_secs(60)).await;
+        let f = fetch(&tx2, 0, Isolation::ReadCommitted, Duration::from_secs(1)).await;
+        let hs = data_batches(&f);
+        assert_eq!(hs.len(), 1, "重启后 aborted 批仍被过滤（收割重建 aborted 集）");
+        assert_eq!(hs[0].base_offset, 0, "留下的是 commit 会话数据");
+        assert_eq!(f.last_stable_offset, 4);
+
+        // 终态 fence 跨重启：harvest last_marker 拒绝同 epoch 僵尸续写
+        let o = produce(&tx2, batch_bytes_txn(500, 0, 1, "zombie")).await;
+        assert!(matches!(o.error, Some(StorageError::InvalidTxnState)), "{:?}", o.error);
+
+        drop(tx2);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 恢复收割：崩溃时未关事务的 LSO 锚保持（abort 落地前不泄露）。
+    #[tokio::test]
+    async fn recovery_harvest_anchors_lso_for_open_txn() {
+        let dir = fresh_dir("openharvest");
+        let tx = spawn_on(dir.clone(), Duration::from_secs(60)).await;
+        produce(&tx, batch_bytes_txn(600, 0, 0, "m")).await;
+        drop(tx);
+
+        let tx2 = spawn_on(dir.clone(), Duration::from_secs(60)).await;
+        let f = fetch(&tx2, 0, Isolation::ReadCommitted, Duration::from_secs(1)).await;
+        assert!(f.result.as_ref().map(|r| r.data.is_empty()).unwrap_or(true), "重启后开事务数据仍不可见");
+        assert_eq!(f.last_stable_offset, 0, "LSO 锚由收割重建");
+        // 无 marker：无终态 fence，同会话可续写
+        let o = produce(&tx2, batch_bytes_txn(600, 0, 1, "m2")).await;
+        assert!(o.error.is_none() && o.base_offset == 1, "{:?}", o.error);
+
+        drop(tx2);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 分区侧 deadline 自 abort：coordinator 失联/漂移批的兜底（§4.1）。
+    #[tokio::test]
+    async fn deadline_self_abort_releases_lso() {
+        let dir = fresh_dir("selfabort");
+        let tx = spawn_on(dir.clone(), Duration::from_millis(100)).await;
+        produce(&tx, batch_bytes_txn(700, 0, 0, "m")).await;
+
+        // deadline 纳入唤醒源：100ms 后 loop 超时 → on_deadline → sweep
+        tokio::time::sleep(Duration::from_millis(400)).await;
+
+        let f = fetch(&tx, 0, Isolation::ReadCommitted, Duration::from_secs(1)).await;
+        assert!(f.result.as_ref().map(|r| r.data.is_empty()).unwrap_or(true), "自 abort 后数据对 committed 不可见");
+        assert_eq!(f.last_stable_offset, 2, "自 abort 落 ABORT marker（offset 1）并释放 LSO");
+
+        let fu = fetch(&tx, 0, Isolation::ReadUncommitted, Duration::from_secs(1)).await;
+        assert_eq!(data_batches(&fu).len(), 1, "uncommitted 仍见数据批（marker 已剥离）");
+
+        let f2 = fetch(&tx, 1, Isolation::ReadCommitted, Duration::from_secs(1)).await;
+        assert_eq!(f2.last_stable_offset, 2, "LSO 释放 = HW");
+
         drop(tx);
         let _ = std::fs::remove_dir_all(&dir);
     }

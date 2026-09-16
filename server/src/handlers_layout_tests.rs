@@ -45,6 +45,7 @@ pub mod handlers_layout_tests {
             nodes: vec![],
             min_isr: 1,
             isr_lag_ms: 500,
+            txn_timeout_ms: 60_000,
         };
         let pool: Arc<basalt_storage::pool::BufferPool> = Arc::new(basalt_storage::pool::BufferPool::new());
         let (meta_tx, routes_rx) = crate::meta::MetaService::spawn(cfg, None, None, pool.clone());

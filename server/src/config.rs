@@ -5,6 +5,9 @@
 pub struct ReplicaConfig {
     pub min_insync: i32,
     pub isr_lag: std::time::Duration,
+    /// 开事务 deadline（分区侧 txn_open 自 abort，ADR-18 §4.1 双保险的
+    /// 分区半边；coordinator 侧 transaction.timeout 为另一半）。
+    pub transaction_timeout: std::time::Duration,
 }
 
 #[derive(Debug, Clone)]
@@ -22,6 +25,8 @@ pub struct Config {
     pub nodes: Vec<(i32, String, u16)>,
     pub min_isr: i32,
     pub isr_lag_ms: u64,
+    /// 事务超时（broker 侧分区自 abort 上限；Kafka 默认 60s）。
+    pub txn_timeout_ms: u64,
 }
 
 impl Config {
@@ -29,6 +34,7 @@ impl Config {
         ReplicaConfig {
             min_insync: self.min_isr,
             isr_lag: std::time::Duration::from_millis(self.isr_lag_ms),
+            transaction_timeout: std::time::Duration::from_millis(self.txn_timeout_ms),
         }
     }
 }
@@ -53,6 +59,7 @@ impl Config {
             nodes,
             min_isr: env("BASALT_MIN_ISR", "1").parse().unwrap_or(1),
             isr_lag_ms: env("BASALT_ISR_LAG_MS", "10000").parse().unwrap_or(10000),
+            txn_timeout_ms: env("BASALT_TXN_TIMEOUT_MS", "60000").parse().unwrap_or(60_000),
         }
     }
 

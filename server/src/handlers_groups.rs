@@ -502,8 +502,11 @@ pub async fn list_groups(req: &basalt_protocol::value::Struct, ctx: &Ctx) -> Val
 use std::sync::atomic::{AtomicI64, Ordering};
 static NEXT_PRODUCER_ID: AtomicI64 = AtomicI64::new(1000);
 
-pub async fn init_producer_id(_req: &basalt_protocol::value::Struct, _ctx: &Ctx) -> Value {
-    let pid = NEXT_PRODUCER_ID.fetch_add(1, Ordering::Relaxed);
+pub async fn init_producer_id(_req: &basalt_protocol::value::Struct, ctx: &Ctx) -> Value {
+    // 跨 broker 唯一性（T-M3.1）：PID = node_id(高 24 位) | 进程内计数器
+    // ——构造性唯一，零协调成本（经控制器分配的方案待 PID 语义扩展时再做）
+    let counter = NEXT_PRODUCER_ID.fetch_add(1, Ordering::Relaxed);
+    let pid = ((ctx.node_id as i64 & 0xFF) << 40) | (counter & 0xFF_FFFF_FFFF);
     s([
         ("ThrottleTimeMs", Value::I32(0)),
         ("ErrorCode", Value::I16(ErrorCode::None as i16)),
@@ -511,6 +514,7 @@ pub async fn init_producer_id(_req: &basalt_protocol::value::Struct, _ctx: &Ctx)
         ("ProducerEpoch", Value::I16(0)),
     ])
 }
+
 
 
 /// DeleteRecords (key 21) handler（委托到 handlers.rs）。

@@ -61,6 +61,8 @@ jobs:
             echo "::error::无 reconciliation 突变体未检出反例——InvLeaderServingHasAcked 判别力丢失"
             exit 1
           fi
+      - name: 提交协议活性（㉟ 产出终被 ack；崩溃终恢复服务）
+        run: make -C spec replication-commit-liveness replication-commit-recovery
 
 
   verus:

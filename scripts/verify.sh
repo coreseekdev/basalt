@@ -25,6 +25,9 @@ if make -C spec replication-commit-norecon TLATOOLS="$TLATOOLS" >/dev/null 2>&1;
 fi
 echo "反例按预期检出"
 
+echo "== TLA+ 提交协议活性（账本 ㉟：产出终被 ack；崩溃终恢复服务）=="
+make -C spec replication-commit-liveness replication-commit-recovery TLATOOLS="$TLATOOLS"
+
 echo "== Verus record 切片（账本 C5/C6/C6a）=="
 "${VERUS:-verus}" --crate-type=lib verification/verus/record_core.rs
 

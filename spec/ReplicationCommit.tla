@@ -227,11 +227,14 @@ Spec == Init /\ [][Next]_vars
    SF」/量化 WF 合取的交互，或活性性质需要条件化（稳定环境假设）。
    下一步：fresh/ISR 双阈值分离建模 + 条件化活性重述（稳定 pull 环境
    ⇒ ack 推进），参考 BasaltDataPlaneLiveness 的 FairDP 结构。 *)
+(* 逐 follower WF(Pull)：每个存活副本的 pull 循环持续运行（实现现实——
+   pull 循环永不退出）。f1 永不拉取的行为违反 WF(Pull(f1)) 而被排除——
+   冻结提交面等待其追平是系统诚实性，不是活锁。 *)
 FairSpec ==
   /\ Spec
   /\ WF_vars(Produce)
   /\ WF_vars(HWAdvance)
-  /\ SF_vars(\E f \in Followers : Pull(f))   \* 拉取循环永不退出（实现现实）
+  /\ \A f \in Followers : WF_vars(Pull(f))
   /\ \A o \in 0..MaxEntries-1 : WF_vars(Ack(o))
 
 EventuallyAllAcked == \A o \in 0..MaxEntries-1 : <>(o \in acked)

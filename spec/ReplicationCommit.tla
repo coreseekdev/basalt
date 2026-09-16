@@ -109,7 +109,7 @@ HWAdvance ==
   /\ isr # {}
   /\ hw < MinOf({nextL} \cup {leo[f] : f \in isr})
   /\ hw' = MinOf({nextL} \cup {leo[f] : f \in isr})
-  /\ UNCHANGED <<leader, nextL, serving, crashedL, epoch, leo, age, isr, face, acked, hw, elected>>
+  /\ UNCHANGED <<leader, nextL, serving, crashedL, elected, epoch, leo, age, isr, face, acked>>
 
 Ack(o) ==
   /\ o \in 0..nextL-1
@@ -117,7 +117,7 @@ Ack(o) ==
   /\ o < hw
   /\ ~FrozenFace \/ \A f \in face[o] : leo[f] > o \/ age[f] >= LagTicks+1
   /\ acked' = acked \cup {o}
-  /\ UNCHANGED <<leader, nextL, hw, serving, crashedL, elected, epoch, leo, age, isr, face, acked>>
+  /\ UNCHANGED <<leader, nextL, hw, serving, crashedL, elected, epoch, leo, age, isr, face>>
 
 (* ── follower 侧动作 ──────────────────────────────────────────────────── *)
 
@@ -133,7 +133,7 @@ Pull(f) ==
   \* 上报驱动 HW 推进（实现同款：advance_hw 随每次上报调用）——
   \* HW 不是独立可被无限绕过的动作，活性不依赖调度偏好
   /\ hw' = MaxOf2(hw, MinOf2(nextL, MinOf({leo'[g] : g \in isr'})))
-  /\ UNCHANGED <<leader, nextL, serving, crashedL, epoch, face, acked, hw, elected>>
+  /\ UNCHANGED <<leader, nextL, serving, crashedL, elected, epoch, face, acked>>
 
 Tick ==
   /\ \E f \in Followers : age[f] < LagTicks + 1   \* 饱和后禁用：公平性下不让 Tick 独占
@@ -144,7 +144,7 @@ Shrink(f) ==
   /\ f \in isr
   /\ age[f] >= LagTicks            \* 上报过期：显式收缩（非静默消失）
   /\ isr' = isr \ {f}
-  /\ UNCHANGED <<leader, nextL, hw, serving, crashedL, epoch, leo, age, face, acked, elected>>
+  /\ UNCHANGED <<leader, nextL, hw, serving, crashedL, elected, epoch, leo, age, face, acked>>
 
 (* ── failover：崩溃 → 选举 → 就任拉齐 → 服务 ──────────────────────────── *)
 
@@ -153,7 +153,7 @@ CrashL ==
   /\ ~crashedL
   /\ crashedL' = TRUE
   /\ serving' = FALSE              \* 主死即不可服务
-  /\ UNCHANGED <<leader, nextL, hw, epoch, leo, age, isr, face, acked, serving, crashedL, elected>>
+  /\ UNCHANGED <<leader, nextL, hw, elected, epoch, leo, age, isr, face, acked>>
 
 Elect(f) ==
   /\ crashedL
@@ -165,7 +165,7 @@ Elect(f) ==
   /\ hw' = 0                        \* HW 是 per-leader 状态：换主即重算
   /\ elected' = TRUE
   /\ serving' = FALSE
-  /\ UNCHANGED <<crashedL, elected, leo, age, isr, face, acked, leader, nextL, hw, serving, epoch>>
+  /\ UNCHANGED <<crashedL, leo, age, isr, face, acked>>
 
 Reconcile ==
   /\ ~serving
@@ -176,7 +176,7 @@ Reconcile ==
   /\ hw' = nextL'                   \* 服务水位 = 拉齐后的日志末（实现同款：
                                      \* SetRole leader 即 HW=next_offset）
   /\ serving' = TRUE
-  /\ UNCHANGED <<leader, hw, crashedL, epoch, leo, age, isr, face, acked, nextL, serving, elected>>
+  /\ UNCHANGED <<leader, crashedL, elected, epoch, leo, age, isr, face, acked>>
 
 Next ==
   \/ Produce
@@ -203,6 +203,12 @@ InvLeaderServingHasAcked ==
 
 (* HW 不越过主日志末 *)
 InvHWBounded == hw <= nextL
+
+(* 诊断探针：crash 后仍有已 ack 条目（可被落后的当选者丢失的状态存在性） *)
+ProbeAckedAfterCrash == ~ (acked # {} /\ crashedL /\ leader # "L0")
+ProbeAckedNonEmpty == ~(acked # {})
+ProbeHWAdvanced == ~(hw > 0)
+ProbeISRNonEmpty == ~(isr # {})
 
 Spec == Init /\ [][Next]_vars
 

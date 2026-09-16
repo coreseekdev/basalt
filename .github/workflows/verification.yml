@@ -55,6 +55,12 @@ jobs:
         run: make -C spec dp-liveness-stable
       - name: 提交协议名义（㉟ HW/ISR/冻结面/reconciliation 一致性，全空间）
         run: make -C spec replication-commit
+      - name: 阴性对照——无 reconciliation 突变体必须被检出（㉟ 判别力门禁）
+        run: |
+          if make -C spec replication-commit-norecon; then
+            echo "::error::无 reconciliation 突变体未检出反例——InvLeaderServingHasAcked 判别力丢失"
+            exit 1
+          fi
 
 
   verus:

@@ -19,6 +19,12 @@ pub mod key {
     pub const CREATE_TOPICS: i16 = 19;
     pub const DELETE_TOPICS: i16 = 20;
     pub const INIT_PRODUCER_ID: i16 = 22;
+    pub const ADD_PARTITIONS_TO_TXN: i16 = 24;
+    pub const END_TXN: i16 = 26;
+    pub const WRITE_TXN_MARKERS: i16 = 27;
+    pub const TXN_OFFSET_COMMIT: i16 = 28;
+    pub const DESCRIBE_TRANSACTIONS: i16 = 65;
+    pub const LIST_TRANSACTIONS: i16 = 66;
     pub const OFFSET_FOR_LEADER_EPOCH: i16 = 23;
     pub const DESCRIBE_CLUSTER: i16 = 60;
     pub const DESCRIBE_CONFIGS: i16 = 32;
@@ -123,6 +129,13 @@ pub fn supported_versions() -> &'static [(i16, i16, i16)] {
         (key::DELETE_TOPICS, 0, 6),
         (key::DELETE_RECORDS, 0, 2),
         (key::INIT_PRODUCER_ID, 0, 5),
+        // 事务面（ADR-18 §8）：只宣告客户端形态（24 的 v4+ 是 broker 互信
+        // 批量形状，不对客户端宣告；27 WriteTxnMarkers 内部 RPC 不宣告）
+        (key::ADD_PARTITIONS_TO_TXN, 0, 3),
+        (key::END_TXN, 0, 3),
+        (key::TXN_OFFSET_COMMIT, 0, 3),
+        (key::DESCRIBE_TRANSACTIONS, 0, 0),
+        (key::LIST_TRANSACTIONS, 0, 0),
         (key::DESCRIBE_GROUPS, 0, 5),
         (key::LIST_GROUPS, 0, 4),
         (key::OFFSET_FOR_LEADER_EPOCH, 0, 5),

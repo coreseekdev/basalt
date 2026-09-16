@@ -4,6 +4,7 @@
 
 use crate::handlers::{self, Ctx, FetchTarget, ProduceTarget};
 use crate::handlers_groups;
+use crate::handlers_txn;
 use basalt_protocol::api::key;
 use basalt_protocol::codec;
 use basalt_protocol::error::ProtocolError;
@@ -237,6 +238,11 @@ async fn dispatch(frame_bytes: Bytes, ctx: &Ctx) -> Result<Option<Bytes>, Dispat
         key::DELETE_TOPICS => (handlers_groups::delete_topics(&req, ctx).await, false),
         key::DELETE_RECORDS => (handlers_groups::delete_records_handler(&req, ctx).await, false),
         key::INIT_PRODUCER_ID => (handlers_groups::init_producer_id(&req, ctx).await, false),
+        key::ADD_PARTITIONS_TO_TXN => (handlers_txn::add_partitions_to_txn(api_version, &req, ctx).await, false),
+        key::END_TXN => (handlers_txn::end_txn(&req, ctx).await, false),
+        key::TXN_OFFSET_COMMIT => (handlers_txn::txn_offset_commit(api_version, &req, ctx).await, false),
+        key::DESCRIBE_TRANSACTIONS => (handlers_txn::describe_transactions(&req, ctx).await, false),
+        key::LIST_TRANSACTIONS => (handlers_txn::list_transactions(&req, ctx).await, false),
         key::OFFSET_FOR_LEADER_EPOCH => (handlers::offset_for_leader_epoch(&req, ctx).await, false),
         key::DESCRIBE_GROUPS => (handlers_groups::describe_groups(&req, ctx).await, false),
         key::LIST_GROUPS => (handlers_groups::list_groups(&req, ctx).await, false),

@@ -25,6 +25,11 @@ pub const MSG_RAFT: u8 = 7;
 /// 引擎模式 propose 转发：payload = encode_record(rec)；应答 1B 状态（1=ok）
 pub const MSG_CTRL_PROPOSE: u8 = 8;
 
+/// 事务 marker 下发（ADR-18 §5，块 c）：coordinator 路由器 → 远端 leader。
+pub const MSG_WRITE_TXN_MARKER: u8 = 9;
+/// TxnOffsetCommit 代理（ADR-18 §7）：组协调器节点 → controller 事务协调器。
+pub const MSG_TXN_OFFSET_COMMIT: u8 = 10;
+
 /// 分区注入（T-M2.5）：本节点拒绝与之通信的对端集合（双向断边）。
 /// BASALT_BLOCK_PEERS="1,2" —— 心跳/元数据/FetchSlice 全部断开。
 pub fn blocked_peers() -> &'static std::collections::HashSet<i32> {
@@ -87,6 +92,71 @@ impl InternalClient {
 
     pub async fn meta_sync(&self, version: u64) -> std::io::Result<Bytes> {
         self.call(MSG_META_SYNC, &version.to_be_bytes()).await
+    }
+
+    /// 事务 marker 跨节点下发（payload：[topic:S][part:i32][pid:i64]
+    /// [epoch:i16][outcome:u8]；应答 [rc:i8][offset:i64]）。
+    pub async fn write_txn_marker(
+        &self,
+        topic: &str,
+        partition: i32,
+        pid: i64,
+        epoch: i16,
+        outcome: basalt_record::ControlRecordType,
+    ) -> Result<i64, basalt_storage::error::StorageError> {
+        let mut p = Vec::new();
+        p.extend_from_slice(&(topic.len() as i16).to_be_bytes());
+        p.extend_from_slice(topic.as_bytes());
+        p.extend_from_slice(&partition.to_be_bytes());
+        p.extend_from_slice(&pid.to_be_bytes());
+        p.extend_from_slice(&epoch.to_be_bytes());
+        p.push(outcome as u8);
+        let body = self
+            .call(MSG_WRITE_TXN_MARKER, &p)
+            .await
+            .map_err(|e| basalt_storage::error::StorageError::Io(e))?;
+        if body.len() < 9 || body[0] != 0 {
+            return Err(basalt_storage::error::StorageError::Other(format!(
+                "remote marker failed: {:?}",
+                &body[..body.len().min(8)]
+            )));
+        }
+        Ok(i64::from_be_bytes(body[1..9].try_into().unwrap()))
+    }
+
+    /// TxnOffsetCommit 代理到 controller（非 controller 节点的组协调器用）。
+    pub async fn txn_offset_commit_proxy(
+        &self,
+        txn_id: &str,
+        pid: i64,
+        epoch: i16,
+        offsets: &[crate::txn::PendingOffset],
+    ) -> Result<(), basalt_storage::error::StorageError> {
+        let mut p = Vec::new();
+        p.extend_from_slice(&(txn_id.len() as i16).to_be_bytes());
+        p.extend_from_slice(txn_id.as_bytes());
+        p.extend_from_slice(&pid.to_be_bytes());
+        p.extend_from_slice(&epoch.to_be_bytes());
+        p.extend_from_slice(&(offsets.len() as i32).to_be_bytes());
+        for o in offsets {
+            p.extend_from_slice(&(o.group.len() as i16).to_be_bytes());
+            p.extend_from_slice(o.group.as_bytes());
+            p.extend_from_slice(&(o.topic.len() as i16).to_be_bytes());
+            p.extend_from_slice(o.topic.as_bytes());
+            p.extend_from_slice(&o.partition.to_be_bytes());
+            p.extend_from_slice(&o.offset.to_be_bytes());
+            p.extend_from_slice(&(o.metadata.len() as i16).to_be_bytes());
+            p.extend_from_slice(o.metadata.as_bytes());
+        }
+        let body = self
+            .call(MSG_TXN_OFFSET_COMMIT, &p)
+            .await
+            .map_err(|e| basalt_storage::error::StorageError::Io(e))?;
+        if body.first().copied() == Some(0) {
+            Ok(())
+        } else {
+            Err(basalt_storage::error::StorageError::InvalidTxnState)
+        }
     }
 
     pub async fn create_topic(&self, name: &str, partitions: i32, rf: i32) -> std::io::Result<Bytes> {
@@ -671,6 +741,33 @@ fn decode_record(data: &[u8]) -> Option<ClusterRecord> {
 }
 
 
+/// 顶层便捷：write_txn_marker（构造一次性 client）。
+pub async fn write_txn_marker(
+    addr: &str,
+    topic: &str,
+    partition: i32,
+    pid: i64,
+    epoch: i16,
+    outcome: basalt_record::ControlRecordType,
+) -> Result<i64, basalt_storage::error::StorageError> {
+    InternalClient::new(addr.to_string())
+        .write_txn_marker(topic, partition, pid, epoch, outcome)
+        .await
+}
+
+/// 顶层便捷：TxnOffsetCommit 代理。
+pub async fn txn_offset_commit_proxy(
+    addr: &str,
+    txn_id: &str,
+    pid: i64,
+    epoch: i16,
+    offsets: &[crate::txn::PendingOffset],
+) -> Result<(), basalt_storage::error::StorageError> {
+    InternalClient::new(addr.to_string())
+        .txn_offset_commit_proxy(txn_id, pid, epoch, offsets)
+        .await
+}
+
 // ---------- 内部服务端 ----------
 
 #[derive(Clone)]
@@ -685,6 +782,8 @@ pub struct InternalCtx {
     pub is_controller: bool,
     pub controller_tx: Option<mpsc::Sender<ControllerCmd>>,
     pub routes_rx: tokio::sync::watch::Receiver<crate::meta::RoutingTable>,
+    /// 事务协调器句柄（仅 controller 节点；MSG_TXN_OFFSET_COMMIT 落点）。
+    pub txn_tx: Option<mpsc::Sender<crate::txn::TxnCmd>>,
 }
 
 pub async fn serve(listener: tokio::net::TcpListener, ctx: InternalCtx) {
@@ -790,6 +889,139 @@ async fn handle_internal_conn(
                     Err("not controller".into())
                 };
                 Bytes::from(r.map(|_| 0i16).unwrap_or(-1i16).to_be_bytes().to_vec())
+            }
+            MSG_WRITE_TXN_MARKER => {
+                // payload: [topic:S][part:i32][pid:i64][epoch:i16][outcome:u8]
+                // 应答: [rc:i8][offset:i64]
+                let bad = || Bytes::from(vec![1u8, 0, 0, 0, 0, 0, 0, 0, 0]);
+                let mut p = 0usize;
+                let g16 = |p: &mut usize| -> Option<i16> {
+                    if payload.len() < *p + 2 { return None; }
+                    let v = i16::from_be_bytes(payload[*p..*p + 2].try_into().unwrap());
+                    *p += 2;
+                    Some(v)
+                };
+                let g32 = |p: &mut usize| -> Option<i32> {
+                    if payload.len() < *p + 4 { return None; }
+                    let v = i32::from_be_bytes(payload[*p..*p + 4].try_into().unwrap());
+                    *p += 4;
+                    Some(v)
+                };
+                let g64 = |p: &mut usize| -> Option<i64> {
+                    if payload.len() < *p + 8 { return None; }
+                    let v = i64::from_be_bytes(payload[*p..*p + 8].try_into().unwrap());
+                    *p += 8;
+                    Some(v)
+                };
+                let gstr = |p: &mut usize| -> Option<String> {
+                    let n = g16(p)? as usize;
+                    if payload.len() < *p + n { return None; }
+                    let s = String::from_utf8_lossy(&payload[*p..*p + n]).into_owned();
+                    *p += n;
+                    Some(s)
+                };
+                let parsed = (|| {
+                    let topic = gstr(&mut p)?;
+                    let partition = g32(&mut p)?;
+                    let pid = g64(&mut p)?;
+                    let epoch = g16(&mut p)?;
+                    if payload.len() < p + 1 { return None; }
+                    let outcome = basalt_record::ControlRecordType::from_i16(payload[p] as i16)?;
+                    Some((topic, partition, pid, epoch, outcome))
+                })();
+                let Some((topic, partition, pid, epoch, outcome)) = parsed else {
+                    sock.write_all(&bad()).await?;
+                    return Ok(());
+                };
+                let route = {
+                    let g = ctx.routes_rx.borrow();
+                    g.find(&topic, partition).cloned()
+                };
+                let res = if let Some(route) = route {
+                    let (rtx, rrx) = tokio::sync::oneshot::channel();
+                    match route.tx.send(crate::partition::PartitionCmd::WriteTxnMarker {
+                        producer_id: pid,
+                        producer_epoch: epoch,
+                        outcome,
+                        reply: rtx,
+                    }).await {
+                        Ok(()) => rrx.await.unwrap_or_else(|_| Err(basalt_storage::error::StorageError::Other("marker reply dropped".into()))),
+                        Err(_) => Err(basalt_storage::error::StorageError::NotLeader),
+                    }
+                } else {
+                    Err(basalt_storage::error::StorageError::NotLeader)
+                };
+                match res {
+                    Ok(off) => {
+                        let mut out = vec![0u8];
+                        out.extend_from_slice(&off.to_be_bytes());
+                        Bytes::from(out)
+                    }
+                    Err(_) => Bytes::from(vec![1u8, 0, 0, 0, 0, 0, 0, 0, 0]),
+                }
+            }
+            MSG_TXN_OFFSET_COMMIT => {
+                // 代理落点（controller）：payload 与 InternalClient::txn_offset_commit_proxy 对应
+                // 应答: [rc:i8]
+                let mut p = 0usize;
+                let g16 = |p: &mut usize| -> Option<i16> {
+                    if payload.len() < *p + 2 { return None; }
+                    let v = i16::from_be_bytes(payload[*p..*p + 2].try_into().unwrap());
+                    *p += 2;
+                    Some(v)
+                };
+                let g32 = |p: &mut usize| -> Option<i32> {
+                    if payload.len() < *p + 4 { return None; }
+                    let v = i32::from_be_bytes(payload[*p..*p + 4].try_into().unwrap());
+                    *p += 4;
+                    Some(v)
+                };
+                let g64 = |p: &mut usize| -> Option<i64> {
+                    if payload.len() < *p + 8 { return None; }
+                    let v = i64::from_be_bytes(payload[*p..*p + 8].try_into().unwrap());
+                    *p += 8;
+                    Some(v)
+                };
+                let gstr = |p: &mut usize| -> Option<String> {
+                    let n = g16(p)? as usize;
+                    if payload.len() < *p + n { return None; }
+                    let s = String::from_utf8_lossy(&payload[*p..*p + n]).into_owned();
+                    *p += n;
+                    Some(s)
+                };
+                let parsed = (|| {
+                    let txn_id = gstr(&mut p)?;
+                    let pid = g64(&mut p)?;
+                    let epoch = g16(&mut p)?;
+                    let n = g32(&mut p)? as usize;
+                    let mut offs = Vec::with_capacity(n.min(1024));
+                    for _ in 0..n {
+                        let group = gstr(&mut p)?;
+                        let topic = gstr(&mut p)?;
+                        let partition = g32(&mut p)?;
+                        let offset = g64(&mut p)?;
+                        let metadata = gstr(&mut p)?;
+                        offs.push(crate::txn::PendingOffset { group, topic, partition, offset, metadata });
+                    }
+                    Some((txn_id, pid, epoch, offs))
+                })();
+                let Some((txn_id, pid, epoch, offs)) = parsed else {
+                    sock.write_all(&[1u8]).await?;
+                    return Ok(());
+                };
+                let res = if let Some(tx) = &ctx.txn_tx {
+                    let (rtx, rrx) = tokio::sync::oneshot::channel();
+                    let sent = tx.send(crate::txn::TxnCmd::TxnOffsetCommit {
+                        txn_id, pid, epoch, offsets: offs, reply: rtx,
+                    }).await;
+                    match sent {
+                        Ok(()) => rrx.await.unwrap_or(Err(basalt_storage::error::StorageError::Other("reply dropped".into()))),
+                        Err(_) => Err(basalt_storage::error::StorageError::Other("txn coordinator closed".into())),
+                    }
+                } else {
+                    Err(basalt_storage::error::StorageError::Other("not controller".into()))
+                };
+                Bytes::from(vec![if res.is_ok() { 0u8 } else { 1u8 }])
             }
             MSG_RAFT => {
                 // 接收探针：确认 wire 帧到达接收端

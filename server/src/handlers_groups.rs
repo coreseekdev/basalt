@@ -18,20 +18,34 @@ fn coord_err(e: CoordError) -> Value {
 pub async fn find_coordinator(version: i16, req: &basalt_protocol::value::Struct, ctx: &Ctx) -> Value {
     // v0-3：Key（单 string）；v4+：CoordinatorKeys（[]string 批量）。
     // 响应 v4+ Coordinators[].Key 必须逐条回显请求 key（franz-go 按其匹配，
-    // 回显空串 = "coordinator was not returned"）。KeyType 统一 group（0）。
-    let _ = version;
+    // 回显空串 = "coordinator was not returned"）。
     let keys: Vec<String> = match req.get("CoordinatorKeys") {
         Some(Value::Array(ks)) => ks.iter().map(|k| k.as_str().to_string()).collect(),
         _ => vec![req.get("Key").map(|v| v.as_str().to_string()).unwrap_or_default()],
     };
+    let _ = version;
+    // KeyType=1（Transaction）：事务协调器驻 controller（ADR-18 §9）。
+    // 无版本门（review P0-2 实证）：KeyType 字段 v1+ 恒存在，Java 3.x/
+    // franz-go 的事务查找按 broker 宣告版本发 v4+（keys 折入
+    // CoordinatorKeys）——v<=3 之门会让它们 lookupCoordinator 无限自旋
+    let key_type = req.get("KeyType").map(|v| v.as_i32()).unwrap_or(0);
+    let txn_lookup = key_type == 1;
     let mut coordinators = Vec::new();
     for k in &keys {
+        let (nid, host, port, ec) = if txn_lookup {
+            match crate::handlers_txn::controller_endpoint(ctx).await {
+                Ok((id, h, p)) => (id, h, p as i32, ErrorCode::None),
+                Err(code) => (ctx.node_id, ctx.host.clone(), ctx.port as i32, code),
+            }
+        } else {
+            (ctx.node_id, ctx.host.clone(), ctx.port as i32, ErrorCode::None)
+        };
         coordinators.push(s([
             ("Key", Value::str(k.clone())),
-            ("NodeId", Value::I32(ctx.node_id)),
-            ("Host", Value::str(ctx.host.clone())),
-            ("Port", Value::I32(ctx.port as i32)),
-            ("ErrorCode", Value::I16(ErrorCode::None as i16)),
+            ("NodeId", Value::I32(nid)),
+            ("Host", Value::str(host)),
+            ("Port", Value::I32(port)),
+            ("ErrorCode", Value::I16(ec as i16)),
             ("ErrorMessage", Value::Null),
         ]));
     }
@@ -502,7 +516,13 @@ pub async fn list_groups(req: &basalt_protocol::value::Struct, ctx: &Ctx) -> Val
 use std::sync::atomic::{AtomicI64, Ordering};
 static NEXT_PRODUCER_ID: AtomicI64 = AtomicI64::new(1000);
 
-pub async fn init_producer_id(_req: &basalt_protocol::value::Struct, ctx: &Ctx) -> Value {
+pub async fn init_producer_id(req: &basalt_protocol::value::Struct, ctx: &Ctx) -> Value {
+    // 事务分支（ADR-18 §3/§5）：带事务 ID 的 init 走协调器（每事务 bump
+    // epoch；TV2 语义）。非事务路径保持 T-M3.1 原样。
+    let txn_id = req.get("TransactionalId").map(|v| v.as_str().to_string()).unwrap_or_default();
+    if !txn_id.is_empty() {
+        return crate::handlers_txn::init_producer_id_transactional(&txn_id, ctx).await;
+    }
     // 跨 broker 唯一性（T-M3.1）：PID = node_id(高 24 位) | 进程内计数器
     // ——构造性唯一，零协调成本（经控制器分配的方案待 PID 语义扩展时再做）
     let counter = NEXT_PRODUCER_ID.fetch_add(1, Ordering::Relaxed);

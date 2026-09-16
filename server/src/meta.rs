@@ -71,6 +71,11 @@ pub enum MetaCmd {
         name: String,
         reply: oneshot::Sender<bool>,
     },
+    /// 查节点客户端地址（marker 路由器跨节点下发用；内部端口 = +1）。
+    BrokerAddr {
+        node: i32,
+        reply: oneshot::Sender<Option<(String, u16)>>,
+    },
 }
 
 pub struct MetaService {
@@ -161,6 +166,10 @@ impl MetaService {
         while let Some(cmd) = self.rx.recv().await {
             match cmd {
                 MetaCmd::ApplyCluster(state) => self.apply_cluster(state).await,
+                MetaCmd::BrokerAddr { node, reply } => {
+                    let r = self.cluster.brokers.get(&node).map(|b| (b.host.clone(), b.port));
+                    let _ = reply.send(r);
+                }
                 MetaCmd::DeleteTopic { name, reply } => {
                     if let Some(tx) = &self.controller_tx {
                         let (txr, rxr) = tokio::sync::oneshot::channel();

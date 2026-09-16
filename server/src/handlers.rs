@@ -17,6 +17,10 @@ use crate::meta::MetaCmd;
 
 pub struct Ctx {
     pub node_id: i32,
+    /// 控制器推举（cfg.nodes 最小 id；单节点 = 自身）——事务协调器驻留点
+    /// （ADR-18 §9）。运行期地址经 MetaCmd::BrokerAddr 查询（all_brokers
+    /// 生产恒空，review P0-1 实证不可作地址源）。
+    pub controller_id: i32,
     #[allow(dead_code)]
     pub all_brokers: Vec<(i32, String, u16)>,
     pub host: String,
@@ -24,6 +28,8 @@ pub struct Ctx {
     pub meta_tx: mpsc::Sender<MetaCmd>,
     pub group_tx: tokio::sync::mpsc::Sender<GroupCmd>,
     pub routes_rx: tokio::sync::watch::Receiver<crate::meta::RoutingTable>,
+    /// 事务协调器句柄（仅 controller 节点为 Some；§9 拓扑）。
+    pub txn_tx: Option<mpsc::Sender<crate::txn::TxnCmd>>,
     pub brokers_cache: std::sync::Mutex<Option<Vec<basalt_metadata::cluster::BrokerInfo>>>,
     /// 读缓冲池（perf #2：writer 归还 + actor 读复用共享同一池）
     // BufferPool 进程单例共享资源池（内部 Mutex 串行化）：Arc 表达资源共享而非
@@ -37,12 +43,14 @@ impl Ctx {
     pub fn clone_for_request(&self) -> Ctx {
         Ctx {
             node_id: self.node_id,
+            controller_id: self.controller_id,
             host: self.host.clone(),
             port: self.port,
             all_brokers: self.all_brokers.clone(),
             meta_tx: self.meta_tx.clone(),
             group_tx: self.group_tx.clone(),
             routes_rx: self.routes_rx.clone(),
+            txn_tx: self.txn_tx.clone(),
             pool: self.pool.clone(),
             brokers_cache: std::sync::Mutex::new(self.brokers_cache.lock().unwrap().clone()),
         }

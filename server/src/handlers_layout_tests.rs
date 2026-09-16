@@ -81,6 +81,7 @@ pub mod handlers_layout_tests {
         let (_tw, rx2) = tokio::sync::watch::channel(rt);
         Ctx {
             node_id: 0,
+            controller_id: 0,
             all_brokers: vec![],
             host: "localhost".into(),
             port: 9092,
@@ -89,6 +90,7 @@ pub mod handlers_layout_tests {
             routes_rx: rx2,
             brokers_cache: std::sync::Mutex::new(None),
             pool,
+            txn_tx: None,
         }
     }
 
@@ -554,5 +556,286 @@ pub mod handlers_layout_tests {
         let req = req_at(k, v, &st);
         let resp = handlers_groups::init_producer_id(&req, ctx).await;
         resp_decode(k, v, &resp_bytes(k, v, &resp))
+    }
+
+    // ---- 事务 API（ADR-18 块 c）：真实协调器全链 + 字节级布局 ----
+
+    #[tokio::test]
+    async fn probe_txn_api_layouts() {
+        use crate::config::ReplicaConfig;
+        use crate::handlers_txn;
+        use crate::partition::{Isolation, PartitionActor, PartitionCmd};
+        use crate::txn::{MarkerJob, TxnCmd, TxnCoordinator};
+        use basalt_storage::log::{FsyncSchedule, LogOptions};
+        use basalt_storage::pool::BufferPool;
+
+        let dir = tmpdir("txn-api");
+        // 分区 leader（单副本）
+        let pool = Arc::new(BufferPool::new());
+        let ptx = PartitionActor::spawn(
+            "txn".into(), 0, 0, dir.join("part"),
+            LogOptions { segment_max_bytes: 1 << 30, fsync: FsyncSchedule::Os, retention_ms: 0, retention_max_bytes: 0 },
+            ReplicaConfig { min_insync: 1, isr_lag: std::time::Duration::from_millis(500), transaction_timeout: std::time::Duration::from_secs(60) },
+            pool,
+        ).unwrap();
+        ptx.send(PartitionCmd::SetRole { leader: true, epoch: 1, replicas: vec![0] }).await.unwrap();
+        // marker 路由器（内存直连）
+        let (mtx, mut mrx) = tokio::sync::mpsc::channel::<MarkerJob>(64);
+        let fwd = ptx.clone();
+        tokio::spawn(async move {
+            while let Some(job) = mrx.recv().await {
+                let (otx, orx) = tokio::sync::oneshot::channel();
+                fwd.send(PartitionCmd::WriteTxnMarker {
+                    producer_id: job.producer_id,
+                    producer_epoch: job.producer_epoch,
+                    outcome: job.outcome,
+                    reply: otx,
+                }).await.unwrap();
+                let _ = job.reply.send(orx.await.unwrap());
+            }
+        });
+        // 协调器 + Ctx
+        let coord = TxnCoordinator::spawn(&dir.join("txn.log"), 0, mtx, None, std::time::Duration::from_secs(60));
+        let ctx = make_ctx(&[]).await;
+        let ctx = Ctx {
+            txn_tx: Some(coord.clone()),
+            ..ctx
+        };
+
+        // InitProducerId v3（事务分支）：PID/epoch 分配
+        let k_ip = basalt_protocol::api::key::INIT_PRODUCER_ID;
+        let req = req_at(k_ip, 3, &as_struct_owned(s([
+            ("TransactionalId", Value::str("t1")),
+            ("TransactionTimeoutMs", Value::I32(60_000)),
+            ("ProducerId", Value::I64(-1)),
+            ("ProducerEpoch", Value::I16(-1)),
+        ])));
+        let resp = handlers_groups::init_producer_id(&req, &ctx).await;
+        let r = resp_decode(k_ip, 3, &resp_bytes(k_ip, 3, &resp));
+        let pid = fld(&r, "ProducerId").as_i64();
+        assert!(pid >= 0, "协调器分配 PID");
+        assert_eq!(fld(&r, "ProducerEpoch").as_i16(), 0);
+        assert_eq!(fld(&r, "ErrorCode").as_i16(), 0);
+
+        // AddPartitionsToTxn v3：None
+        let k_ap = basalt_protocol::api::key::ADD_PARTITIONS_TO_TXN;
+        let req = req_at(k_ap, 3, &as_struct_owned(s([
+            ("V3AndBelowTransactionalId", Value::str("t1")),
+            ("V3AndBelowProducerId", Value::I64(pid)),
+            ("V3AndBelowProducerEpoch", Value::I16(0)),
+            ("V3AndBelowTopics", Value::Array(vec![s([
+                ("Name", Value::str("txn")),
+                ("Partitions", Value::Array(vec![Value::I32(0)])),
+            ])])),
+        ])));
+        let resp = handlers_txn::add_partitions_to_txn(3, &req, &ctx).await;
+        let r = resp_decode(k_ap, 3, &resp_bytes(k_ap, 3, &resp));
+        let parts = match fld(&r, "ResultsByTopicV3AndBelow") {
+            Value::Array(ts) if !ts.is_empty() => match sfield(&ts[0], "ResultsByPartition") {
+                Value::Array(ps) => ps.len(),
+                _ => 0,
+            },
+            _ => 0,
+        };
+        assert_eq!(parts, 1, "AddPartitionsToTxn 分区结果");
+
+        // EndTxn v3：先产事务数据（直发分区），再提交
+        {
+            use basalt_record::{encode_batch, Rec, ATTR_TRANSACTIONAL};
+            let recs = vec![Rec { timestamp_delta: 0, key: Some(Bytes::from_static(b"k")), value: Some(Bytes::from_static(b"v")), headers: vec![] }];
+            let mut b = BytesMut::new();
+            encode_batch(0, 0, 1000, ATTR_TRANSACTIONAL, pid, 0, 0, &recs, &mut b);
+            let (ptx2, prx2) = tokio::sync::oneshot::channel();
+            ptx.send(PartitionCmd::Produce {
+                batches: b.freeze(),
+                policy: basalt_storage::log::AssignPolicy::Assign,
+                acks: 1,
+                reply: ptx2,
+            }).await.unwrap();
+            prx2.await.unwrap();
+        }
+        let k_et = basalt_protocol::api::key::END_TXN;
+        let req = req_at(k_et, 3, &as_struct_owned(s([
+            ("TransactionalId", Value::str("t1")),
+            ("ProducerId", Value::I64(pid)),
+            ("ProducerEpoch", Value::I16(0)),
+            ("Committed", Value::Bool(true)),
+        ])));
+        let resp = handlers_txn::end_txn(&req, &ctx).await;
+        let r = resp_decode(k_et, 3, &resp_bytes(k_et, 3, &resp));
+        assert_eq!(fld(&r, "ErrorCode").as_i16(), 0, "EndTxn 成功");
+
+        // committed 可见（marker 生效 + 控制批不投递）
+        {
+            let (ftx, frx) = tokio::sync::oneshot::channel();
+            ptx.send(PartitionCmd::Fetch {
+                offset: 0,
+                max_bytes: 1 << 20,
+                deadline: std::time::Instant::now() + std::time::Duration::from_secs(1),
+                isolation: Isolation::ReadCommitted,
+                reply: ftx,
+            }).await.unwrap();
+            let out = frx.await.unwrap();
+            assert!(out.result.map(|r| !r.data.is_empty()).unwrap_or(false), "commit 后可见");
+        }
+
+        // DescribeTransactions v0 → Complete
+        let k_dt = basalt_protocol::api::key::DESCRIBE_TRANSACTIONS;
+        let req = req_at(k_dt, 0, &as_struct_owned(s([
+            ("TransactionalIds", Value::Array(vec![Value::str("t1")])),
+        ])));
+        let resp = handlers_txn::describe_transactions(&req, &ctx).await;
+        let r = resp_decode(k_dt, 0, &resp_bytes(k_dt, 0, &resp));
+        let states = match fld(&r, "TransactionStates") {
+            Value::Array(xs) => xs,
+            _ => panic!("TransactionStates not array"),
+        };
+        assert_eq!(states.len(), 1);
+        assert_eq!(sfield(&states[0], "TransactionState").as_str(), "Complete");
+
+        // ListTransactions v0 → 含 t1
+        let k_lt = basalt_protocol::api::key::LIST_TRANSACTIONS;
+        let req = req_at(k_lt, 0, &as_struct_owned(s([
+            ("StateFilters", Value::Array(vec![])),
+            ("ProducerIdFilters", Value::Array(vec![])),
+        ])));
+        let resp = handlers_txn::list_transactions(&req, &ctx).await;
+        let r = resp_decode(k_lt, 0, &resp_bytes(k_lt, 0, &resp));
+        let states = match fld(&r, "TransactionStates") {
+            Value::Array(xs) => xs,
+            _ => panic!("TransactionStates not array"),
+        };
+        assert_eq!(states.len(), 1, "含 t1");
+        assert_eq!(sfield(&states[0], "TransactionalId").as_str(), "t1");
+
+        // TxnOffsetCommit v3：pending 落协调器（成功路径分区级 None）
+        let k_to = basalt_protocol::api::key::TXN_OFFSET_COMMIT;
+        {
+            // 重新开事务（t1 已 Complete）
+            let (itx2, irx2) = tokio::sync::oneshot::channel();
+            coord.send(TxnCmd::InitProducerId { txn_id: "t2".into(), reply: itx2 }).await.unwrap();
+            let (pid2, epoch2) = irx2.await.unwrap();
+            let (atx2, arx2) = tokio::sync::oneshot::channel();
+            coord.send(TxnCmd::AddPartitionsToTxn {
+                txn_id: "t2".into(), pid: pid2, epoch: epoch2,
+                partitions: vec![("txn".into(), 0)], reply: atx2,
+            }).await.unwrap();
+            arx2.await.unwrap().unwrap();
+            let req = req_at(k_to, 3, &as_struct_owned(s([
+                ("TransactionalId", Value::str("t2")),
+                ("GroupId", Value::str("g1")),
+                ("ProducerId", Value::I64(pid2)),
+                ("ProducerEpoch", Value::I16(epoch2)),
+                ("Topics", Value::Array(vec![s([
+                    ("Name", Value::str("txn")),
+                    ("Partitions", Value::Array(vec![s([
+                        ("PartitionIndex", Value::I32(0)),
+                        ("CommittedOffset", Value::I64(7)),
+                        ("CommittedMetadata", Value::Null),
+                    ])])),
+                ])])),
+            ])));
+            let resp = handlers_txn::txn_offset_commit(3, &req, &ctx).await;
+            let r = resp_decode(k_to, 3, &resp_bytes(k_to, 3, &resp));
+            let code = match fld(&r, "Topics") {
+                Value::Array(ts) => match sfield(&ts[0], "Partitions") {
+                    Value::Array(ps) => sfield(&ps[0], "ErrorCode").as_i16(),
+                    _ => -1,
+                },
+                _ => -1,
+            };
+            assert_eq!(code, 0, "TxnOffsetCommit 成功路径");
+        }
+
+        // FindCoordinator Type=Transaction（v1 KeyType=1 / v4 CoordinatorKeys）：
+        // controller = 自身（单节点推举）→ 回 self
+        let k_fc = basalt_protocol::api::key::FIND_COORDINATOR;
+        // v1：扁平响应（Coordinators[] 是 v4+ 才有）
+        {
+            let req = req_at(k_fc, 1, &as_struct_owned(s([
+                ("Key", Value::str("t1")), ("KeyType", Value::I8(1)),
+            ])));
+            let resp = handlers_groups::find_coordinator(1, &req, &ctx).await;
+            let r = resp_decode(k_fc, 1, &resp_bytes(k_fc, 1, &resp));
+            assert_eq!(fld(&r, "NodeId").as_i32(), 0, "v1 事务查找回 controller（自身）");
+            assert_eq!(fld(&r, "ErrorCode").as_i16(), 0);
+        }
+        // v4：CoordinatorKeys 形状 + Coordinators[] 响应
+        {
+            let req = req_at(k_fc, 4, &as_struct_owned(s([
+                ("CoordinatorKeys", Value::Array(vec![Value::str("t1")])),
+                ("KeyType", Value::I8(1)),
+            ])));
+            let resp = handlers_groups::find_coordinator(4, &req, &ctx).await;
+            let r = resp_decode(k_fc, 4, &resp_bytes(k_fc, 4, &resp));
+            let co = match fld(&r, "Coordinators") {
+                Value::Array(xs) => &xs[0],
+                _ => panic!("Coordinators missing"),
+            };
+            assert_eq!(sfield(co, "NodeId").as_i32(), 0, "v4 事务查找回 controller");
+        }
+        // 组路径零回归：KeyType=0 回 self（v1 扁平）
+        {
+            let req = req_at(k_fc, 1, &as_struct_owned(s([
+                ("Key", Value::str("g1")), ("KeyType", Value::I8(0)),
+            ])));
+            let resp = handlers_groups::find_coordinator(1, &req, &ctx).await;
+            let r = resp_decode(k_fc, 1, &resp_bytes(k_fc, 1, &resp));
+            assert_eq!(fld(&r, "NodeId").as_i32(), 0);
+        }
+
+        // 非 controller 面（txn_tx = None）：InitProducerId/AddPartitions 回 16
+        let ctx_nc = make_ctx(&[]).await;
+        let req = req_at(k_ip, 3, &as_struct_owned(s([
+            ("TransactionalId", Value::str("t9")),
+            ("TransactionTimeoutMs", Value::I32(60_000)),
+            ("ProducerId", Value::I64(-1)),
+            ("ProducerEpoch", Value::I16(-1)),
+        ])));
+        let resp = handlers_groups::init_producer_id(&req, &ctx_nc).await;
+        let r = resp_decode(k_ip, 3, &resp_bytes(k_ip, 3, &resp));
+        assert_eq!(fld(&r, "ErrorCode").as_i16(), 16, "NotCoordinator");
+        let req = req_at(k_ap, 3, &as_struct_owned(s([
+            ("V3AndBelowTransactionalId", Value::str("t9")),
+            ("V3AndBelowProducerId", Value::I64(1)),
+            ("V3AndBelowProducerEpoch", Value::I16(0)),
+            ("V3AndBelowTopics", Value::Array(vec![])),
+        ])));
+        let resp = handlers_txn::add_partitions_to_txn(3, &req, &ctx_nc).await;
+        let r = resp_decode(k_ap, 3, &resp_bytes(k_ap, 3, &resp));
+        // v3 响应无顶层 ErrorCode（v4+ 才有）——错误码在分区级（客户端真实读取面）
+        assert!(matches!(fld(&r, "ResultsByTopicV3AndBelow"), Value::Array(v) if v.is_empty()),
+            "无分区 → 空 topic 结果");
+        // 带分区的 NotCoordinator 路径：分区级 16
+        let req = req_at(k_ap, 3, &as_struct_owned(s([
+            ("V3AndBelowTransactionalId", Value::str("t9")),
+            ("V3AndBelowProducerId", Value::I64(1)),
+            ("V3AndBelowProducerEpoch", Value::I16(0)),
+            ("V3AndBelowTopics", Value::Array(vec![s([
+                ("Name", Value::str("txn")),
+                ("Partitions", Value::Array(vec![Value::I32(0)])),
+            ])])),
+        ])));
+        let resp = handlers_txn::add_partitions_to_txn(3, &req, &ctx_nc).await;
+        let r = resp_decode(k_ap, 3, &resp_bytes(k_ap, 3, &resp));
+        let parts = match fld(&r, "ResultsByTopicV3AndBelow") {
+            Value::Array(ts) if !ts.is_empty() => match sfield(&ts[0], "ResultsByPartition") {
+                Value::Array(ps) => ps.len(),
+                _ => 0,
+            },
+            _ => 0,
+        };
+        assert_eq!(parts, 1);
+        let code = match fld(&r, "ResultsByTopicV3AndBelow") {
+            Value::Array(ts) => match sfield(&ts[0], "ResultsByPartition") {
+                Value::Array(ps) => sfield(&ps[0], "PartitionErrorCode").as_i16(),
+                _ => -1,
+            },
+            _ => -1,
+        };
+        assert_eq!(code, 16, "非 controller 分区级 NotCoordinator");
+
+        drop(coord);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

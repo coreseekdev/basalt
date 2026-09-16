@@ -13,6 +13,7 @@ mod ctrl_raft;
 mod internal;
 mod meta;
 mod partition;
+mod handlers_txn;
 mod txn;
 
 use basalt_storage::pool::BufferPool;
@@ -47,6 +48,7 @@ async fn async_main(cfg: Config) {
     let _peers = cluster_peers(&cfg);
     let ctrl = controller_peer(&cfg);
     let is_controller = ctrl.as_ref().map(|(id, _, _)| *id == cfg.node_id).unwrap_or(true);
+    let controller_id = ctrl.as_ref().map(|(id, _, _)| *id).unwrap_or(cfg.node_id);
     tracing::info!(
         node_id = cfg.node_id, port = cfg.port, data = %cfg.data_dir,
         controller = ?ctrl.as_ref().map(|(id, _, _)| *id), is_controller, "basalt starting"
@@ -129,6 +131,32 @@ async fn async_main(cfg: Config) {
     let group_tx = basalt_coordinator::GroupManager::spawn(std::path::Path::new(&cfg.data_dir));
     let routes_rx_internal = routes_rx.clone();
 
+    // 事务协调器（ADR-18 §9：单实例驻 controller 节点）+ marker 路由器。
+    // 非 controller 节点 txn_tx = None——事务 API 回 NotCoordinator(16)，
+    // 客户端经 FindCoordinator(Type=Transaction) 重路由（协议自愈）。
+    let txn_tx = if is_controller {
+        let (marker_tx, marker_rx) = tokio::sync::mpsc::channel::<txn::MarkerJob>(256);
+        let router_routes = routes_rx.clone();
+        let router_meta = meta_tx.clone();
+        let router_node = cfg.node_id;
+        tokio::spawn(handlers_txn::marker_router(marker_rx, router_routes, router_meta, router_node));
+        let log_path = std::path::Path::new(&cfg.data_dir).join("txn").join("txn.log");
+        if let Some(parent) = log_path.parent() {
+            let _ = std::fs::create_dir_all(parent);
+        }
+        let coord = txn::TxnCoordinator::spawn(
+            &log_path,
+            cfg.node_id,
+            marker_tx,
+            None, // pending 提升钩子：块 d 接 group OffsetLog（§7）
+            std::time::Duration::from_millis(cfg.txn_timeout_ms),
+        );
+        Some(coord)
+    } else {
+        None
+    };
+    let txn_tx_internal = txn_tx.clone();
+
     // 内部服务
     let internal_listener = tokio::net::TcpListener::bind(format!("0.0.0.0:{internal_port}"))
         .await
@@ -158,6 +186,7 @@ async fn async_main(cfg: Config) {
                 is_controller,
                 controller_tx: controller_tx_internal,
                 routes_rx: routes_rx_internal,
+                txn_tx: txn_tx_internal,
             };
             internal::serve(internal_listener, ctx).await;
         });
@@ -346,6 +375,7 @@ async fn async_main(cfg: Config) {
 
     let ctx = handlers::Ctx {
         node_id: cfg.node_id,
+        controller_id,
         host: cfg.host.clone(),
         port: cfg.port,
         all_brokers: Vec::new(),
@@ -354,6 +384,7 @@ async fn async_main(cfg: Config) {
         routes_rx: routes_rx.clone(),
         brokers_cache: std::sync::Mutex::new(None),
         pool: pool.clone(),
+        txn_tx: txn_tx.clone(),
     };
     CTX.set(ctx).ok();
 
@@ -364,12 +395,14 @@ async fn async_main(cfg: Config) {
                 Ok((sock, peer)) => {
                     let ctx = handlers::Ctx {
                         node_id: ctx_ref.node_id,
+                        controller_id: ctx_ref.controller_id,
                         host: ctx_ref.host.clone(),
                         port: ctx_ref.port,
                         all_brokers: Vec::new(),
                         meta_tx: ctx_ref.meta_tx.clone(),
                         group_tx: ctx_ref.group_tx.clone(),
                         routes_rx: ctx_ref.routes_rx.clone(),
+                        txn_tx: ctx_ref.txn_tx.clone(),
                         brokers_cache: std::sync::Mutex::new(ctx_ref.brokers_cache.lock().unwrap().clone()),
                         pool: pool.clone(),
                     };

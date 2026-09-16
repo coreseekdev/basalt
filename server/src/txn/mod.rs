@@ -127,6 +127,8 @@ pub enum TxnCmd {
     },
     /// 诊断/DescribeTransactions 底座（块 c 接线 API）。
     Describe { txn_id: String, reply: oneshot::Sender<Option<(String, i64, i16, Vec<(String, i32)>)>> },
+    /// ListTransactions 底座：(txn_id, pid, epoch, 相位串)。
+    ListTransactions { reply: oneshot::Sender<Vec<(String, i64, i16, String)>> },
 }
 
 // ---------- 协调器 ----------
@@ -377,6 +379,15 @@ impl TxnCoordinator {
                     (t.phase.as_str().to_string(), t.pid, t.epoch, t.parts.clone())
                 });
                 let _ = reply.send(r);
+            }
+            TxnCmd::ListTransactions { reply } => {
+                let mut rows: Vec<(String, i64, i16, String)> = self
+                    .txns
+                    .values()
+                    .map(|t| (t.txn_id.clone(), t.pid, t.epoch, t.phase.as_str().to_string()))
+                    .collect();
+                rows.sort_by(|a, b| a.0.cmp(&b.0));
+                let _ = reply.send(rows);
             }
         }
     }

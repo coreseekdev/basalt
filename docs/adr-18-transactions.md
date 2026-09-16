@@ -295,8 +295,21 @@ UnknownServer 会让 java 客户端无限重试，fence 形同虚设）。
   超时 sweep abort + 接管恢复驱动（ReplayCommit/Orphaned）+ TxnOffsetCommit
   pending 落盘/提升钩子 + epoch fence；coordinator_tests ×8 全绿（两段
   闭环/重放/孤儿/超时/并发/concurrent fence/pending 提升）。
-- **c. 协议面**：五个 API handler + 宣告 + FindCoordinator 分支 +
-  TxnOffsetCommit pending 落盘；handlers_layout_tests 字节级布局回归（⑰ 先例）。
+- **c. 协议面 ✅（2026-09-16）**：五个 API handler（24 v0-3 客户端形状 /
+  26 / 28 / 65 / 66）+ api.rs 宣告 + FindCoordinator Type=Transaction 回
+  controller（v1-3 KeyType）+ InitProducerId 事务分支（非事务路径原样）；
+  TxnCoordinator 单实例驻 controller（txn_tx 双路：直发 / NotCoordinator
+  16 协议自愈重路由）；TxnOffsetCommit 非 controller 节点内部 RPC 代理
+  （MSG_TXN_OFFSET_COMMIT）；marker 路由器（本地直发 / 远端
+  MSG_WRITE_TXN_MARKER + MetaCmd::BrokerAddr 查址）；
+  probe_txn_api_layouts 全链字节级回归（⑰ 先例；review 实证后扩充 28/
+  FindCoordinator v1+v4/NotCoordinator 面）。review 两个 P0 修复入档：
+  ① Ctx.all_brokers 生产恒空（仅 metadata 响应缓存）——controller 路由/
+  TxnOffsetCommit 代理改经 MetaCmd::BrokerAddr 查运行期地址 + Ctx 增加
+  controller_id 推举值；② Java 3.x/franz-go 的事务 FindCoordinator 按
+  broker 宣告版本发 v4+（KeyType 字段 v1+ 恒在）——查找无版本门。
+  P1：storage_err_to_code 兜底改 15（83 常量实为 EligibleLeadersNot
+  Available，事务面误用会给出错误重试语义）。
 - **d. 验收面**：java kafka-clients 事务 e2e（initTransactions/commit/abort/
   sendOffsets + read_committed 消费对比专项——TASK.md T-M3.2 验收行）；
   franz-go 事务档；T-M3.6 Jepsen 三场景进仿真 harness（≥500 seeds）；

@@ -18,6 +18,8 @@ pub enum StorageError {
     OutOfOrderSequence(i32, i32),
     #[error("invalid producer epoch (zombie fenced, ADR-18)")]
     InvalidProducerEpoch,
+    #[error("producer id mapping mismatch (ADR-18)")]
+    InvalidProducerIdMapping,
     #[error("invalid txn state (terminal marker conflict / stale epoch marker)")]
     InvalidTxnState,
     #[error("{0}")]

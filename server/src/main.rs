@@ -13,6 +13,7 @@ mod ctrl_raft;
 mod internal;
 mod meta;
 mod partition;
+mod txn;
 
 use basalt_storage::pool::BufferPool;
 use config::Config;

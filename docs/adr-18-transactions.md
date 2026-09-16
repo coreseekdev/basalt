@@ -162,11 +162,14 @@ Empty ──AddPartitionsToTxn──▶ Ongoing ──EndTxn──▶ Prepare{Co
   └─────────────── 完结 ◀─────────────────────────┘── 崩溃恢复 ──▶ §6 接管判定 ◀──────────────┘
 ```
 
-- **AddPartitionsToTxn**（key 24，接受 v0-4；v4 TV2 批量形状）：校验
-  txn_id↔pid↔epoch → Empty 则先落 TxnLog 开事务记录（epoch+1，TV2 每事务
-  bump 落盘点）→ Ongoing，登记分区清单（marker fan-out 范围）。
-  前事务未完（Complete 未落）→ CONCURRENT_TRANSACTIONS（TV2 语义，服务端
-  内部重试数次后仍返回）。
+- **InitProducerId（事务路径）每调用 bump epoch**（TV2 每事务 bump 落点，
+  §3）；AddPartitionsToTxn 携带该 epoch，协调器校验 txn_id↔pid↔epoch →
+  Empty/Complete 则落 TxnLog Begin 记录（携带已 bump 的 epoch——client 用
+  init 应答的 epoch 产数据，Begin 再 bump 会被 broker 幂等面 fence 掉合法
+  流）→ Ongoing，登记分区清单（marker fan-out 范围）；同 epoch 重复 add =
+  幂等扩分区。前事务 Prepare 残留 → CONCURRENT_TRANSACTIONS（可重试）。
+  re-init 遇 Ongoing 先强制 abort（init 即 fence）；遇 Prepare 残留 bump
+  照常（旧事务由分区侧自 abort 收敛 + §6 接管重驱收口）。
 - **EndTxn**（key 26）两段：
   1. Ongoing→Prepare：**TxnLog 先写 Prepare 记录（含分区清单、outcome）并
      fsync**——arroyo §11 的所有权语义：「占有即授权外部提交/放弃」，
@@ -287,8 +290,11 @@ UnknownServer 会让 java 客户端无限重试，fence 形同虚设）。
   自 abort 单测（partition.rs 测试模式照 idempotence_tests）；内部 marker
   命令先于 coordinator 可注入；挂起 fetch 三接触点的隔离级回归
   （含 on_deadline 超时回包泄露探针）。
-- **b. 协调面**：TxnLog + 状态机 + EndTxn 两段 + §6 纯函数表驱动单测 +
-  超时 abort；InitProducerId 事务路径 + 47 错误码映射。
+- **b. 协调面 ✅（2026-09-16）**：TxnLog（5 类记录 + fsync Prepare 落盘
+  点）+ 状态机 + EndTxn 两段 + §6 纯函数（takeover_tests ×4 表驱动）+
+  超时 sweep abort + 接管恢复驱动（ReplayCommit/Orphaned）+ TxnOffsetCommit
+  pending 落盘/提升钩子 + epoch fence；coordinator_tests ×8 全绿（两段
+  闭环/重放/孤儿/超时/并发/concurrent fence/pending 提升）。
 - **c. 协议面**：五个 API handler + 宣告 + FindCoordinator 分支 +
   TxnOffsetCommit pending 落盘；handlers_layout_tests 字节级布局回归（⑰ 先例）。
 - **d. 验收面**：java kafka-clients 事务 e2e（initTransactions/commit/abort/

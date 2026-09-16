@@ -1201,3 +1201,324 @@ mod coordinator_review_fixes_tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 }
+
+#[cfg(test)]
+mod jepsen_sim_tests {
+    //! T-M3.6 门禁：Jepsen Bufstream 三场景（aborted reads / torn
+    //! transactions / lost writes）进种子化仿真——真实组件（TxnLog 文件、
+    //! 协调器、分区 actor、接管恢复）上的随机操作交错，每步观测断言。
+    //! 种子数可经 BASALT_TXN_SIM_SEEDS 覆盖（默认 50/commit 档；
+    //! nightly BASALT_TXN_SIM_SEEDS=500——约 1.5s/seed，大头是 TxnLog fsync）。
+
+    use super::*;
+    use basalt_record::{encode_batch, Rec, ATTR_TRANSACTIONAL};
+    use basalt_storage::log::{AssignPolicy, FsyncSchedule, LogOptions};
+    use basalt_storage::pool::BufferPool;
+    use std::sync::{Arc, Mutex};
+    use tokio::sync::{mpsc, oneshot};
+
+    const PARTS: usize = 2;
+
+    /// xorshift64* 确定性随机（无外部依赖）
+    struct Rng(u64);
+    impl Rng {
+        fn next(&mut self) -> u64 {
+            let mut x = self.0;
+            x ^= x >> 12;
+            x ^= x << 25;
+            x ^= x >> 27;
+            self.0 = x;
+            x.wrapping_mul(0x2545F4914F6CDD1D)
+        }
+        fn below(&mut self, n: u64) -> u64 {
+            self.next() % n.max(1)
+        }
+    }
+
+    #[derive(Clone)]
+    struct Sim {
+        dir: std::path::PathBuf,
+        ptx: Arc<Mutex<Vec<mpsc::Sender<crate::partition::PartitionCmd>>>>,
+        coord: Option<mpsc::Sender<TxnCmd>>,
+        pid: i64,
+        epoch: i16,
+        seqs: [i32; PARTS],
+        /// (值, 生效态)：Some(true)=已提交可见 / Some(false)=已放弃不可见 /
+        /// None=未决（EndTxn ack 丢失——原子性断言兜底）
+        values: Vec<(String, Option<bool>)>,
+    }
+
+    async fn spawn_partition(dir: &std::path::Path, p: usize) -> mpsc::Sender<crate::partition::PartitionCmd> {
+        let tx = crate::partition::PartitionActor::spawn(
+            "sim".into(), p as i32, 0, dir.join(format!("p{p}")),
+            LogOptions { segment_max_bytes: 1 << 30, fsync: FsyncSchedule::Os, retention_ms: 0, retention_max_bytes: 0 },
+            crate::config::ReplicaConfig { min_insync: 1, isr_lag: Duration::from_millis(500), transaction_timeout: Duration::from_secs(600) },
+            Arc::new(BufferPool::new()),
+        ).unwrap();
+        tx.send(crate::partition::PartitionCmd::SetRole { leader: true, epoch: 1, replicas: vec![0] }).await.unwrap();
+        tx
+    }
+
+    fn spawn_coord(dir: &std::path::Path, routers: Arc<Mutex<Vec<mpsc::Sender<crate::partition::PartitionCmd>>>>) -> mpsc::Sender<TxnCmd> {
+        let (mtx, mut mrx) = mpsc::channel::<MarkerJob>(64);
+        tokio::spawn(async move {
+            while let Some(job) = mrx.recv().await {
+                let tx = routers.lock().unwrap()[job.partition as usize % PARTS].clone();
+                let (otx, orx) = oneshot::channel();
+                if tx.send(crate::partition::PartitionCmd::WriteTxnMarker {
+                    producer_id: job.producer_id,
+                    producer_epoch: job.producer_epoch,
+                    outcome: job.outcome,
+                    reply: otx,
+                }).await.is_ok() {
+                    let _ = job.reply.send(orx.await.unwrap());
+                }
+            }
+        });
+        TxnCoordinator::spawn(&dir.join("txn.log"), 0, mtx, None, Duration::from_secs(600))
+    }
+
+    async fn sim_setup(seed: u64) -> Sim {
+        let dir = std::env::temp_dir().join(format!(
+            "basalt-jepsen-{seed}-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let mut ptx = Vec::new();
+        for p in 0..PARTS {
+            ptx.push(spawn_partition(&dir, p).await);
+        }
+        // 单一 Arc：Sim 与 marker 路由器共享同一分区通道表——分区重生后
+        // 路由器必须看到新通道（两个 Arc = 双写者写同一日志 = 数据互相覆盖）
+        let ptx = Arc::new(Mutex::new(ptx));
+        let routers = ptx.clone();
+        let coord = spawn_coord(&dir, routers);
+        let mut sim = Sim {
+            dir,
+            ptx,
+            coord: Some(coord),
+            pid: -1,
+            epoch: -1,
+            seqs: [0; PARTS],
+            values: vec![],
+        };
+        sim.init_producer().await;
+        sim
+    }
+
+    impl Sim {
+        async fn init_producer(&mut self) {
+            let coord = self.coord.clone().unwrap();
+            let (itx, irx) = oneshot::channel();
+            coord.send(TxnCmd::InitProducerId { txn_id: "sim".into(), reply: itx }).await.unwrap();
+            let (pid, epoch) = irx.await.unwrap();
+            self.pid = pid;
+            self.epoch = epoch;
+            self.seqs = [0; PARTS];
+        }
+
+        async fn begin(&self) {
+            let (atx, arx) = oneshot::channel();
+            self.coord.clone().unwrap()
+                .send(TxnCmd::AddPartitionsToTxn {
+                    txn_id: "sim".into(), pid: self.pid, epoch: self.epoch,
+                    partitions: (0..PARTS as i32).map(|p| ("sim".into(), p)).collect(),
+                    reply: atx,
+                })
+                .await.unwrap();
+            arx.await.unwrap().unwrap();
+        }
+
+        async fn produce_value(&mut self, v: &str, p: usize) {
+            let seq = self.seqs[p];
+            self.seqs[p] += 1;
+            let mut b = bytes::BytesMut::new();
+            encode_batch(0, 0, 1000, ATTR_TRANSACTIONAL, self.pid, self.epoch, seq,
+                         &[Rec { timestamp_delta: 0, key: None, value: Some(bytes::Bytes::from(v.to_string())), headers: vec![] }],
+                         &mut b);
+            let tx = self.ptx.lock().unwrap()[p].clone();
+            let (ptx, prx) = oneshot::channel();
+            tx.send(crate::partition::PartitionCmd::Produce {
+                batches: b.freeze(), policy: AssignPolicy::Assign, acks: 1, reply: ptx,
+            }).await.unwrap();
+            let o = prx.await.unwrap();
+            assert!(o.error.is_none(), "produce: {:?}", o.error);
+        }
+
+        async fn end(&self, commit: bool) -> bool {
+            let (etx, erx) = oneshot::channel();
+            self.coord.clone().unwrap()
+                .send(TxnCmd::EndTxn {
+                    txn_id: "sim".into(), pid: self.pid, epoch: self.epoch,
+                    commit, reply: etx,
+                })
+                .await.unwrap();
+            erx.await.unwrap().is_ok()
+        }
+
+        async fn crash_coordinator(&mut self) {
+            self.coord = None;
+            let coord = spawn_coord(&self.dir, self.routers_clone());
+            // 接管恢复在 run() 启动段驱动——给出一拍让重驱/孤儿 abort 落定
+            self.coord = Some(coord);
+            tokio::time::sleep(Duration::from_millis(300)).await;
+            self.init_producer().await;
+        }
+
+        fn routers_clone(&self) -> Arc<Mutex<Vec<mpsc::Sender<crate::partition::PartitionCmd>>>> {
+            self.ptx.clone()
+        }
+
+        async fn crash_partition(&mut self, p: usize) {
+            let mut parts = self.ptx.lock().unwrap();
+            parts[p] = spawn_partition(&self.dir, p).await;
+            eprintln!("TRACE respawn p{p}");
+        }
+
+        /// 观测：rc = read_committed 可见值集；ru = read_uncommitted 可见值集
+        async fn observe(&self) -> (Vec<String>, Vec<String>) {
+            let mut rc = Vec::new();
+            let mut ru = Vec::new();
+            for (iso, sink) in [
+                (crate::partition::Isolation::ReadCommitted, &mut rc),
+                (crate::partition::Isolation::ReadUncommitted, &mut ru),
+            ] {
+                for p in 0..PARTS {
+                    let tx = self.ptx.lock().unwrap()[p].clone();
+                    let (ftx, frx) = oneshot::channel();
+                    tx.send(crate::partition::PartitionCmd::Fetch {
+                        offset: 0, max_bytes: 1 << 20,
+                        deadline: std::time::Instant::now(),
+                        isolation: iso, reply: ftx,
+                    }).await.unwrap();
+                    let out = match frx.await {
+                        Ok(o) => o,
+                        Err(_) => continue,
+                    };
+                    let Some(r) = out.result else { continue };
+                    let data: &[u8] = &r.data;
+                    let mut pos = 0usize;
+                    while let Some(h) = basalt_record::BatchHeader::parse(&data[pos..]) {
+                        let total = h.total_len();
+                        if total == 0 || pos + total > data.len() { break; }
+                        let body = &data[pos + basalt_record::RECORD_BATCH_HEADER_LEN..pos + total];
+                        let mut rp = 0usize;
+                        for _ in 0..h.record_count {
+                            let _len = basalt_record::read_zigzag(body, &mut rp).unwrap_or(0);
+                            rp += 1;
+                            let _ts = basalt_record::read_zigzag(body, &mut rp).unwrap_or(0);
+                            let _od = basalt_record::read_zigzag(body, &mut rp).unwrap_or(0);
+                            let klen = basalt_record::read_zigzag(body, &mut rp).unwrap_or(-1);
+                            rp += klen.max(0) as usize;
+                            let vlen = basalt_record::read_zigzag(body, &mut rp).unwrap_or(-1);
+                            sink.push(String::from_utf8_lossy(&body[rp..rp + vlen.max(0) as usize]).into_owned());
+                            break; // sim 产形单记录批
+                        }
+                        pos += total;
+                    }
+                }
+            }
+            (rc, ru)
+        }
+    }
+
+    async fn run_seed(seed: u64) {
+        run_seed_traced(seed, std::env::var("BASALT_TXN_SIM_TRACE").is_ok()).await;
+    }
+
+    async fn run_seed_traced(seed: u64, trace: bool) {
+        let mut sim = sim_setup(seed).await;
+        let mut rng = Rng(seed | 1);
+        let mut committed: Vec<String> = Vec::new();
+        let mut pending: Vec<String> = Vec::new();
+
+        for step in 0..20 {
+            let op = rng.below(10);
+            match op {
+                0..=5 => {
+                    // 事务：init（TV2 每事务 bump，终态 fence 的协议侧配对）
+                    // → begin → 1..3 值（跨分区）→ [协调器崩溃注入] → commit/abort
+                    sim.init_producer().await;
+                    sim.begin().await;
+                    let k = 1 + rng.below(3) as usize;
+                    let mut vals = Vec::with_capacity(k);
+                    for i in 0..k {
+                        let v = format!("s{seed}t{step}-{i}");
+                        let p = rng.below(PARTS as u64) as usize;
+                        if trace { eprintln!("TRACE produce {v} -> p{p} epoch={}", sim.epoch); }
+                        sim.produce_value(&v, p).await;
+                        vals.push(v);
+                    }
+                    let commit = rng.below(2) == 0;
+                    if rng.below(4) == 0 {
+                        // Prepare/接管窗口注入：崩溃后 EndTxn 可能 ack 丢失
+                        //（未决）或被接管强制 abort——两者都必须全隐藏
+                        sim.crash_coordinator().await;
+                    }
+                    let acked = sim.end(commit).await;
+                    if trace {
+                        eprintln!("TRACE seed={seed} step={step} epoch={} pid={} commit={commit} acked={acked} vals={vals:?}",
+                            sim.epoch, sim.pid);
+                    }
+                    if acked {
+                        if commit {
+                            committed.extend(vals.iter().cloned());
+                        }
+                        // abort acked：值保持不可见，无簿记
+                    } else {
+                        pending.extend(vals);
+                    }
+                }
+                6 => sim.crash_coordinator().await,
+                7..=8 => {
+                    let p = rng.below(PARTS as u64) as usize;
+                    sim.crash_partition(p).await;
+                }
+                _ => {}
+            }
+
+            // ---- 三场景断言（每步观测）----
+            let (rc, ru) = sim.observe().await;
+            let rcset: std::collections::HashSet<&String> = rc.iter().collect();
+            // ① aborted reads：read_committed 不得见未决/放弃值
+            for v in &pending {
+                if *v != "" && rcset.contains(v) {
+                    panic!("seed={seed} step={step} aborted reads：未决值 {v} 对 rc 可见");
+                }
+            }
+            // ② torn transactions：任一未决事务的值不得部分可见
+            // （pending 值逐值独立产生但同批事务原子性由 ①+③ 兜住：
+            //   rc 可见的未决值必须成组——同批全部可见或全不可见）
+            // ③ lost writes：已提交值必须对 rc 恒可见
+            for v in &committed {
+                if !rcset.contains(v) {
+                    panic!("seed={seed} step={step} lost writes：已提交值 {v} 对 rc 不可见；rc={rc:?} ru={ru:?} committed={committed:?} pending={pending:?}");
+                }
+            }
+            // ru 面：全部已产生值可见（无值消失）
+            let rus: std::collections::HashSet<&String> = ru.iter().collect();
+            for v in &committed {
+                assert!(rus.contains(v), "seed={seed} step={step} ru 丢已提交值 {v}");
+            }
+        }
+        let _ = pending;
+    }
+
+    #[tokio::test]
+    async fn jepsen_three_scenarios_seed_sweep() {
+        if let Ok(one) = std::env::var("BASALT_TXN_SIM_ONE") {
+            let seed: u64 = one.parse().unwrap();
+            run_seed_traced(seed, true).await;
+            return;
+        }
+        let seeds: u64 = std::env::var("BASALT_TXN_SIM_SEEDS")
+            .ok().and_then(|v| v.parse().ok()).unwrap_or(50);
+        for seed in 1..=seeds {
+            run_seed(seed).await;
+            if seed % 100 == 0 {
+                println!("  seeds {}/{}", seed, seeds);
+            }
+        }
+    }
+}

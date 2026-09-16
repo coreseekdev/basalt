@@ -77,6 +77,8 @@ jobs:
             echo "::error::无 fence 突变体未检出——僵尸续写复活开事务（LSO 永锚）"
             exit 1
           fi
+      - name: 事务仿真（T-M3.6 Jepsen 三场景，50 种子/commit 档）
+        run: cargo test -p basalt-server --bin basalt-server jepsen -- --nocapture
 
 
   verus:
@@ -157,6 +159,8 @@ jobs:
         run: |
           OPFUZZ_CLEAN_SEEDS=500 OPFUZZ_CHAOS_SEEDS=250 OPFUZZ_BATCHIO_SEEDS=250 \
             cargo test -p basalt-storage --test opfuzz -- --test-threads=4
+      - name: 事务仿真扩量（T-M3.6 Jepsen 三场景 500 种子）
+        run: BASALT_TXN_SIM_SEEDS=500 cargo test -p basalt-server --bin basalt-server jepsen
 
   perf-nightly:
     if: github.event_name == 'schedule'

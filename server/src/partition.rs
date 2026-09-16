@@ -70,6 +70,9 @@ pub enum PartitionCmd {
         timestamp: i64,
         reply: oneshot::Sender<Result<(i64, i64), StorageError>>,
     },
+    /// topic 删除：actor 退出（路由已移除，句柄/内存随任务结束回收；
+    /// 数据目录留给 retention 清理）。
+    Shutdown { reply: oneshot::Sender<()> },
     /// 本地日志 LEO（follower 重启/追平校准用，区别于 HW）。
     LocalLeo {
         reply: oneshot::Sender<i64>,
@@ -512,6 +515,12 @@ impl PartitionActor {
                         self.serve_replica_pends(); // 拉齐落盘也是"新数据到达"
                     }
                     let _ = reply.send(r);
+                }
+                PartitionCmd::Shutdown { reply } => {
+                    // topic 删除：actor 退出（路由已移除，句柄/内存随任务
+                    // 结束回收；数据目录留给 retention 清理）
+                    let _ = reply.send(());
+                    return;
                 }
                 PartitionCmd::ListOffsets { timestamp, reply } => {
                     let _ = reply.send(self.log.list_offset(timestamp));

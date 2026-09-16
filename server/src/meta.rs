@@ -468,6 +468,25 @@ impl MetaService {
             .map(|a| (topic_id_from(&a.topic), a.partition))
             .collect();
         self.routes.by_id.retain(|k, _| live_ids.contains(k));
+        // 删除 topic 的孤儿 actor 关停（DeleteTopic 落地的最后一口气）：
+        // 路由已移除，actor 不可达但句柄/内存仍在——Shutdown 使其退出
+        let dead_topics: Vec<String> = self
+            .local
+            .keys()
+            .filter(|t| !self.cluster.assignments.iter().any(|a| &a.topic == *t))
+            .cloned()
+            .collect();
+        for t in dead_topics {
+            if let Some((_, parts)) = self.local.remove(&t) {
+                for p in parts {
+                    if let Some(route) = self.routes.by_name.remove(&(t.clone(), p)) {
+                        let (done_tx, done_rx) = tokio::sync::oneshot::channel();
+                        let _ = route.tx.send(PartitionCmd::Shutdown { reply: done_tx }).await;
+                        let _ = done_rx.await;
+                    }
+                }
+            }
+        }
         let _ = self.tx_watch.send(self.routes.clone());
     }
 }

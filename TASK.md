@@ -36,7 +36,7 @@ Basalt：Rust 版 Kafka 兼容消息流平台
 | M0 | rdkafka/franz-go 冒烟通过（Produce/Fetch/acks=1）；turmoil 单机崩溃持久性种子扫描绿 |
 | M1 | librdkafka + franz-go + kafka-clients report card ≥ 90%；仿真种子扫描无丢重 |
 | M2 | 仿真切主/分区/追赶场景不丢不重；ducktape 式 bounce 测试通过；failover L1：崩溃 <2s、计划内交接毫秒级（ADR-10） |
-|   | **验收进度（2026-09-14）**：切主/分区/追赶 ✅（multinode 五场景不丢不重）；bounce ✅（v1 六轮零丢失）；failover L1 ✅（崩溃实测 1063ms <2s）、计划内交接 ✅（153-279ms）。**多引擎控制器（T-M2.1）大幅推进（2026-09-14）**：openraft 骨架 + raft-rs（TiKV）双引擎 + MSG_RAFT wire + 运行时挂接 + 快照持久化，七/八多节点场景 raftrs 模式全 PASS。剩余=控制器 kill 端到端闭环 + openraft 控制器 actor 完整改造 |
+|   | **验收进度（2026-09-16）**：M2 数据面九场景 + 引擎模式九场景 e2e 全绿（双模式）；T-M2.1 ✅（双引擎控制器 + WAL + ISR/reconciliation + 规格化五门禁）；T-M2.3 ✅ 核心闭合（ISR 状态机 + 冻结提交面 + 长轮询调优 249K msg/s/延迟 p50 1.0ms）；T-M2.2 🟨（全量广播/任意节点 bootstrap ✅，增量 delta 待做）；C11 ✅ 四档客户端全闭合（kafka-python/librdkafka/franz-go/kafka-clients，各档均有战果）。ReplicationCommit.tla 规格化五门禁入 CI（安全名义 + 判别力阴性对照 + 名义活性 + 恢复活性）；账本 ㉒-㊺ 二十四缺陷全闭环 |
 | M3 | RisingWave/Vector/Bento 式真实负载 e2e 通过；事务 marker 语义专项通过 |
 | M4 | 基准对标报表产出；混沌长跑 24h 无不变式违反 |
 

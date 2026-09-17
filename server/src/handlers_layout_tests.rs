@@ -595,6 +595,22 @@ pub mod handlers_layout_tests {
         ])
     }
 
+    // v1 请求：+ SubscribedTopicRegex 字段（宣告 0-1）
+    fn hb_req_v1(group: &str, member: &str, epoch: i32, subs: Value, regex: Value) -> Value {
+        s([
+            ("GroupId", Value::str(group)),
+            ("MemberId", Value::str(member)),
+            ("MemberEpoch", Value::I32(epoch)),
+            ("InstanceId", Value::Null),
+            ("RackId", Value::Null),
+            ("RebalanceTimeoutMs", Value::I32(10_000)),
+            ("SubscribedTopicNames", subs),
+            ("SubscribedTopicRegex", regex),
+            ("ServerAssignor", Value::str("range")),
+            ("TopicPartitions", Value::Null),
+        ])
+    }
+
     fn assignment_parts(r: &Struct) -> Vec<Value> {
         match fld(r, "Assignment") {
             Value::Null => vec![],
@@ -674,6 +690,25 @@ pub mod handlers_layout_tests {
         // 该成员离开——describe 断言面收敛为单成员组
         let r = cgh(&ctx, 0, hb_req("cg1", &ghost_member, -1, Value::Array(vec![]), Value::Null)).await;
         assert_eq!(fld(&r, "ErrorCode").as_i16(), 0);
+
+        // ---- v1（KIP-848 完全体）：客户端自生成 member id（KIP-1082）+
+        // keepalive null 订阅 + regex 拒收（franz-go should848 硬性要求
+        // broker 宣告 v1——v0 宣告 = 客户端静默回退 classic）----
+        let kv = 1;
+        // v1 join：非空 MemberId 按原样注册（服务端不再分配）
+        let r = cgh(&ctx, kv, hb_req_v1("cg2", "client-uuid-1", 0, Value::Array(vec![Value::str("t1")]), Value::Null)).await;
+        assert_eq!(fld(&r, "ErrorCode").as_i16(), 0);
+        assert_eq!(fld(&r, "MemberId").as_str(), "client-uuid-1", "v1 member id 原样返回");
+        assert_eq!(fld(&r, "MemberEpoch").as_i32(), 1);
+        assert_eq!(assignment_parts(&r).len(), 1, "v1 单成员独占");
+        // keepalive：订阅/Topics 置 null（"没变化"）→ 订阅保持、分配保留、不 bump
+        let r = cgh(&ctx, kv, hb_req_v1("cg2", "client-uuid-1", 1, Value::Null, Value::Null)).await;
+        assert_eq!(fld(&r, "ErrorCode").as_i16(), 0);
+        assert_eq!(fld(&r, "MemberEpoch").as_i32(), 1, "keepalive 不 bump");
+        assert_eq!(assignment_parts(&r).len(), 1, "null 订阅 = 未变，分配保留");
+        // regex 订阅（v1 字段）：POC 非目标 → INVALID_REQUEST(42)，非静默吞
+        let r = cgh(&ctx, kv, hb_req_v1("cg2", "client-uuid-2", 0, Value::Null, Value::str("(?:t.*)"))).await;
+        assert_eq!(fld(&r, "ErrorCode").as_i16(), 42, "regex 订阅显式拒收");
 
         // ---- ConsumerGroupDescribe (69) ----
         let kd = basalt_protocol::api::key::CONSUMER_GROUP_DESCRIBE;

@@ -150,9 +150,13 @@ pub fn supported_versions() -> &'static [(i16, i16, i16)] {
         (key::DESCRIBE_GROUPS, 0, 5),
         (key::LIST_GROUPS, 0, 4),
         (key::OFFSET_FOR_LEADER_EPOCH, 0, 5),
-        // KIP-848 新消费组协议（ADR-19 块 b）：v0 单档（v1 需 SubscribedTopicRegex/
-        // KIP-1082，后置）
-        (key::CONSUMER_GROUP_HEARTBEAT, 0, 0),
+        // KIP-848 新消费组协议（ADR-19 块 b/c）：heartbeat 宣告 0-1——
+        // franz-go v1.21 的 should848 硬性 supportsKIP848v1()（只认 broker
+        // 宣告 max≥1，v0 宣告 = 客户端静默回退 classic 路径）。v1 差异：
+        // SubscribedTopicRegex（服务端不支持正则订阅 → 拒收 INVALID_REQUEST）
+        // + KIP-1082 客户端自生成 member id（服务端按原样注册，已支持）。
+        // describe 保持 v0（消费路径不依赖）。
+        (key::CONSUMER_GROUP_HEARTBEAT, 0, 1),
         (key::CONSUMER_GROUP_DESCRIBE, 0, 0),
     ]
 }

@@ -145,8 +145,20 @@ fn decode_value(
                 }
             }
         }
-        Ty::Struct => decode_struct_fields(&node.children, version, flexible, r, src)
-            .map(Value::Struct)?,
+        Ty::Struct => {
+            // nullable struct：Kafka 线上原语 = int8 presence 标记（-1 =
+            // null，1 = 存在后跟结构体；kmsg/Java codegen 同构，与 flexible
+            // 无关）。KIP-848 Assignment 首个真实用户——codec 此前缺这个
+            // 原语，null 写空结构体、存在无标记，真客户端解码越界
+            // （kbin ErrNotEnoughData）。
+            if node.nullable {
+                let present = r.i8()?;
+                if present < 0 {
+                    return Ok(Value::Null);
+                }
+            }
+            decode_struct_fields(&node.children, version, flexible, r, src).map(Value::Struct)?
+        }
     })
 }
 
@@ -306,17 +318,29 @@ fn encode_value(node: &Node, version: i16, flexible: bool, v: &Value, out: &mut 
             }
         }
         Ty::Struct => match v {
-            Value::Struct(st) => encode_struct_fields(&node.children, version, flexible, st, out)?,
+            Value::Struct(st) => {
+                // nullable struct 存在 = int8 标记 1 后跟结构体（见 decode 侧注）
+                if node.nullable {
+                    out.put_i8(1);
+                }
+                encode_struct_fields(&node.children, version, flexible, st, out)?
+            }
             Value::Null => {
-                // nullable struct（如 CurrentLeader/DivergingEpoch 不发）：
-                // flexible 时写一个空 struct + 空 tag section；legacy 写默认字段。
-                encode_struct_fields(
-                    &node.children,
-                    version,
-                    flexible,
-                    &Struct::default(),
-                    out,
-                )?;
+                if node.nullable {
+                    // nullable struct null = int8 -1（Kafka 线上原语）
+                    out.put_i8(-1);
+                } else {
+                    // 非 nullable 的缺省结构体（如 CurrentLeader/DivergingEpoch
+                    // 不发）：flexible 写空 struct + 空 tag section；legacy 写
+                    // 默认字段。
+                    encode_struct_fields(
+                        &node.children,
+                        version,
+                        flexible,
+                        &Struct::default(),
+                        out,
+                    )?;
+                }
             }
             _ => return Err(bad_val(node, v)),
         },

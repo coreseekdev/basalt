@@ -38,17 +38,38 @@ fn heartbeat_unavailable() -> Value {
 
 pub async fn consumer_group_heartbeat(req: &basalt_protocol::value::Struct, ctx: &Ctx) -> Value {
     let group = req.get("GroupId").map(|v| v.as_str().to_string()).unwrap_or_default();
-    // 空串 = 新成员注册（服务端分配 MemberId）；-1 = 离开
+    // 空串 = 新成员（v0：服务端分配 MemberId；v1 KIP-1082：客户端已自带
+    // 生成的 id，状态机按原样注册）；-1 = 离开
     let member_id = req.get("MemberId").map(|v| v.as_str().to_string()).unwrap_or_default();
     let member_epoch = req.get("MemberEpoch").map(|v| v.as_i32()).unwrap_or(-1);
-    let subscribed: Vec<String> = match req.get("SubscribedTopicNames") {
-        Some(Value::Array(a)) => a
-            .iter()
-            .map(|x| x.as_str().to_string())
-            .filter(|n| !n.is_empty())
-            .collect(),
-        _ => vec![],
+    // KIP-848 keepalive 语义：未变字段置 null = "没变化"——null 订阅不得当
+    // 退订（franz-go topicsMatch 路径每拍都发 null，误判 = 成员每拍丢分配）
+    let subscribed: Option<Vec<String>> = match req.get("SubscribedTopicNames") {
+        Some(Value::Array(a)) => Some(
+            a.iter()
+                .map(|x| x.as_str().to_string())
+                .filter(|n| !n.is_empty())
+                .collect(),
+        ),
+        _ => None,
     };
+    // SubscribedTopicRegex（v1）：正则订阅是 ADR-19 §1 非目标——显式拒收
+    // （INVALID_REQUEST=42，848 支持错误集内），不静默吞掉（吞掉 = 客户端
+    // 零订阅零消费，假绿）
+    if let Some(v) = req.get("SubscribedTopicRegex") {
+        let regex = v.as_str();
+        if !regex.is_empty() {
+            return s([
+                throttle_field(),
+                ("ErrorCode", Value::I16(ErrorCode::InvalidRequest as i16)),
+                ("ErrorMessage", Value::Str("SubscribedTopicRegex is not supported (POC boundary)".into())),
+                ("MemberId", Value::str(member_id)),
+                ("MemberEpoch", Value::I32(member_epoch)),
+                ("HeartbeatIntervalMs", Value::I32(HEARTBEAT_INTERVAL_MS)),
+                ("Assignment", Value::Null),
+            ]);
+        }
+    }
     // 请求 owned 的 TopicId → 名反查（接线要点①）：组状态机以名字为键。
     // 未知 TopicId 的 owned 条目丢弃——owned 是增量确认面，状态机不据此分配。
     let owned: BTreeMap<String, Vec<i32>> = {
@@ -72,17 +93,11 @@ pub async fn consumer_group_heartbeat(req: &basalt_protocol::value::Struct, ctx:
     // 订阅 topic 的分区数快照 + 名→TopicId 映射（接线要点②：经 Lookup 携带；
     // TopicMeta 有 name/topic_id/partitions）。Some(vec![]) 恒定——None 是
     // 全量语义，会把全集群 topic 灌进组（退订成员误扩 partition_counts）。
-    let (mtx, mrx) = oneshot::channel();
-    let _ = ctx
-        .meta_tx
-        .send(MetaCmd::Lookup { names: Some(subscribed.clone()), allow_create: false, reply: mtx })
-        .await;
-    let (metas, _brokers) = mrx.await.unwrap_or_default();
-    let counts: Vec<(String, i32)> = metas
-        .iter()
-        .map(|t| (t.name.clone(), t.partitions.len() as i32))
-        .collect();
-    let tids: HashMap<String, u128> = metas.iter().map(|t| (t.name.clone(), t.topic_id)).collect();
+    // keepalive（订阅 null）跳过快照刷新——分区数只在订阅变化时才可能生效。
+    let (counts, mut tids): (Vec<(String, i32)>, HashMap<String, u128>) = match &subscribed {
+        Some(names) => lookup_meta(ctx, names.clone()).await,
+        None => (vec![], HashMap::new()),
+    };
 
     let (tx, rx) = oneshot::channel();
     let cmd = CGCmd::Heartbeat(CGHeartbeat {
@@ -101,6 +116,20 @@ pub async fn consumer_group_heartbeat(req: &basalt_protocol::value::Struct, ctx:
         return heartbeat_unavailable();
     };
 
+    // assignment 的 TopicId 回填：keepalive 路径订阅未随请求携带（null），
+    // 分配 topic 可能不在首查结果里——对分配键补查（分配 ⊆ 已订阅集，
+    // 通常零补查或一轮）。
+    let missing: Vec<String> = res
+        .assignment
+        .keys()
+        .filter(|t| !tids.contains_key(*t))
+        .cloned()
+        .collect();
+    if !missing.is_empty() {
+        let (_counts2, tids2) = lookup_meta(ctx, missing).await;
+        tids.extend(tids2);
+    }
+
     // fenced 三态 → 错误码（接线要点③）：fenced 心跳不带 assignment、零状态
     let (err, assignment_val) = if res.fenced {
         let code = if res.unknown_member { ErrorCode::UnknownMemberId } else { ErrorCode::FencedMemberEpoch };
@@ -118,6 +147,23 @@ pub async fn consumer_group_heartbeat(req: &basalt_protocol::value::Struct, ctx:
         ("HeartbeatIntervalMs", Value::I32(HEARTBEAT_INTERVAL_MS)),
         ("Assignment", assignment_val),
     ])
+}
+
+/// 订阅/分配 topic 集 → (分区数快照, 名→TopicId)。恒 allow_create=false
+/// ——组协议面不建题（未知 topic = 无分配，Kafka 同义）。
+async fn lookup_meta(ctx: &Ctx, names: Vec<String>) -> (Vec<(String, i32)>, HashMap<String, u128>) {
+    let (mtx, mrx) = oneshot::channel();
+    let _ = ctx
+        .meta_tx
+        .send(MetaCmd::Lookup { names: Some(names), allow_create: false, reply: mtx })
+        .await;
+    let (metas, _brokers) = mrx.await.unwrap_or_default();
+    let counts = metas
+        .iter()
+        .map(|t| (t.name.clone(), t.partitions.len() as i32))
+        .collect();
+    let tids = metas.iter().map(|t| (t.name.clone(), t.topic_id)).collect();
+    (counts, tids)
 }
 
 /// 名字键的 assignment → 线上 TopicPartitions（名→TopicId 经 Lookup 快照）。

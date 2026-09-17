@@ -59,11 +59,14 @@ pub struct HeartbeatResult {
 }
 
 impl ConsumerGroup {
+    /// `subscribed: None` = 订阅未变（KIP-848 心跳 keepalive：客户端对未变
+    /// 字段置 null；franz-go consumer_group_848 的 topicsMatch 路径实证）。
+    /// 新成员带 None 视为空订阅（无分配，等下个显式订阅）。
     pub fn heartbeat(
         &mut self,
         member_id: &str,
         member_epoch: i32,
-        subscribed: Vec<String>,
+        subscribed: Option<Vec<String>>,
         _owned: BTreeMap<String, Vec<i32>>,
     ) -> HeartbeatResult {
         // 离开：epoch = -1 → 注销 + 重算（剩余成员接管）
@@ -87,7 +90,8 @@ impl ConsumerGroup {
             return HeartbeatResult { fenced: true, unknown_member: true, ..Default::default() };
         }
 
-        // 注册（空 MemberId）/ 续租
+        // 注册（空 MemberId = 服务端分配 / 非空 = 客户端生成，KIP-1082 v1
+        // 语义）/ 续租。None 订阅 = keepalive 不动现有订阅。
         let id = if member_id.is_empty() {
             self.next_ordinal += 1;
             format!("consumer-{}", self.next_ordinal)
@@ -95,10 +99,14 @@ impl ConsumerGroup {
             member_id.to_string()
         };
         match self.members.get_mut(&id) {
-            Some(m) => m.subscribed = subscribed.clone(),
+            Some(m) => {
+                if let Some(subs) = subscribed.clone() {
+                    m.subscribed = subs;
+                }
+            }
             None => {
                 self.members.insert(id.clone(), MemberState {
-                    member_id: id.clone(), epoch: 0, subscribed: subscribed.clone(), assignment: BTreeMap::new(),
+                    member_id: id.clone(), epoch: 0, subscribed: subscribed.unwrap_or_default(), assignment: BTreeMap::new(),
                 });
             }
         }
@@ -202,7 +210,7 @@ mod consumer_group_tests {
         cg.heartbeat(
             id,
             epoch,
-            sub.into_iter().map(String::from).collect(),
+            Some(sub.into_iter().map(String::from).collect()),
             owned.into_iter().map(|(t, ps)| (t.to_string(), ps)).collect(),
         )
     }
@@ -304,6 +312,29 @@ mod consumer_group_tests {
         let u = hb(&mut cg, &a.member_id, a.member_epoch, vec![], vec![]);
         assert!(!u.assignment.contains_key("t"), "退订后收回分配");
     }
+
+    /// keepalive（KIP-848：未变字段置 null）：订阅保持、分配保留、epoch
+    /// 不 bump——不得把 null 订阅当退订（franz-go topicsMatch 路径每拍都
+    /// 发 null，误判会让成员每拍丢分配）。
+    #[test]
+    fn keepalive_null_subscription_is_noop() {
+        let mut cg = ConsumerGroup::default();
+        cg.partition_counts.insert("t".into(), 2);
+        let a = hb(&mut cg, "", 0, vec!["t"], vec![]);
+        let ka = cg.heartbeat(
+            &a.member_id,
+            a.member_epoch,
+            None,
+            BTreeMap::new(),
+        );
+        assert!(!ka.fenced);
+        assert_eq!(ka.member_epoch, a.member_epoch, "keepalive 不 bump");
+        assert_eq!(ka.assignment[&"t".to_string()], vec![0, 1], "分配保留");
+        // 新成员带 None 订阅 = 空订阅（无分配但不挂）
+        let b = cg.heartbeat("", 0, None, BTreeMap::new());
+        assert!(!b.fenced);
+        assert!(b.assignment.is_empty());
+    }
 }
 
 // ---------- 多组管理 actor（块 b 协议面接线用） ----------
@@ -312,7 +343,8 @@ pub struct CGHeartbeat {
     pub group: String,
     pub member_id: String,
     pub member_epoch: i32,
-    pub subscribed: Vec<String>,
+    /// None = 订阅未变（KIP-848 keepalive：未变字段置 null）
+    pub subscribed: Option<Vec<String>>,
     pub owned: BTreeMap<String, Vec<i32>>,
     /// 订阅 topic 的分区数快照（handler 经 meta 查询后携带）
     pub counts: Vec<(String, i32)>,

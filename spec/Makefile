@@ -38,11 +38,21 @@ transaction-commit-noprepare: ; $(TLC) -config transaction-commit-noprepare.cfg 
 transaction-commit-nofence:   ; $(TLC) -config transaction-commit-nofence.cfg TransactionCommit.tla
 .PHONY: transaction-commit transaction-commit-noprepare transaction-commit-nofence
 
+# KIP-848 新消费组协议（ADR-19 §6d，T-M3.3 块 d）：名义全空间绿；
+# 两只判别力阴性对照必须红——①无心跳 member-epoch fence（突变常数
+# HeartbeatFence=FALSE，InvHeartbeatFencedMon 抓）②无提交成员级双令牌
+# （CommitFence=FALSE，InvCommitFencedMon 抓）。㊼ 纪律：突变常数与
+# ADR-19 §6d / 账本三方一致
+consumer-group-848:               ; $(TLC) -config consumer-group-848.cfg ConsumerGroup848.tla
+consumer-group-848-nohbfence:     ; $(TLC) -config consumer-group-848-nohbfence.cfg ConsumerGroup848.tla
+consumer-group-848-nocommitfence: ; $(TLC) -config consumer-group-848-nocommitfence.cfg ConsumerGroup848.tla
+
 # 数据面活性（P2-2 闭合）：稳定变体期望绿；churn 变体期望红（负结果已入账）
 dp-liveness-stable: ; $(TLC) -deadlock -config dp-liveness-stable.cfg BasaltDataPlaneLiveness.tla
 dp-liveness:         ; $(TLC) -deadlock -config dp-liveness.cfg BasaltDataPlaneLiveness.tla
 
 .PHONY: dp-liveness-stable dp-liveness
+.PHONY: consumer-group-848 consumer-group-848-nohbfence consumer-group-848-nocommitfence
 .PHONY: replication-commit replication-commit-norecon replication-commit-liveness replication-commit-recovery
 
 .PHONY: consumer-group consumer-group-demo consumer-group-liveness

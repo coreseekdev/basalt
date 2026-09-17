@@ -3,6 +3,7 @@
 //! 每连接独占读/写缓冲（BytesMut 复用 = 连接级内存池）。
 
 use crate::handlers::{self, Ctx, FetchTarget, ProduceTarget};
+use crate::handlers_consumer;
 use crate::handlers_groups;
 use crate::handlers_txn;
 use basalt_protocol::api::key;
@@ -245,6 +246,8 @@ async fn dispatch(frame_bytes: Bytes, ctx: &Ctx) -> Result<Option<Bytes>, Dispat
         key::DESCRIBE_TRANSACTIONS => (handlers_txn::describe_transactions(&req, ctx).await, false),
         key::LIST_TRANSACTIONS => (handlers_txn::list_transactions(&req, ctx).await, false),
         key::OFFSET_FOR_LEADER_EPOCH => (handlers::offset_for_leader_epoch(&req, ctx).await, false),
+        key::CONSUMER_GROUP_HEARTBEAT => (handlers_consumer::consumer_group_heartbeat(&req, ctx).await, false),
+        key::CONSUMER_GROUP_DESCRIBE => (handlers_consumer::consumer_group_describe(&req, ctx).await, false),
         key::DESCRIBE_GROUPS => (handlers_groups::describe_groups(&req, ctx).await, false),
         key::LIST_GROUPS => (handlers_groups::list_groups(&req, ctx).await, false),
         _ => {

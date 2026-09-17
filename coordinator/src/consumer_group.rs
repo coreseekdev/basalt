@@ -21,17 +21,41 @@ pub struct ConsumerGroup {
     /// 成员集+订阅集签名：变化才重算 target 并全员 epoch+1（幂等续租不 bump）
     subsig: u64,
     next_ordinal: u64,
+    /// 重算次数（Describe 的 Group/AssignmentEpoch 同源——membership 变化
+    /// 即重算，无栅栏相位）
+    rebalances: u64,
+}
+
+/// ConsumerGroupDescribe 的组快照（块 b）。
+#[derive(Debug, Clone)]
+pub struct GroupDescribe {
+    pub state: String,
+    pub group_epoch: i32,
+    pub assignment_epoch: i32,
+    pub assignor: String,
+    pub members: Vec<MemberDescribe>,
+}
+
+#[derive(Debug, Clone)]
+pub struct MemberDescribe {
+    pub member_id: String,
+    pub member_epoch: i32,
+    pub subscribed: Vec<String>,
+    pub assignment: BTreeMap<String, Vec<i32>>,
 }
 
 /// 心跳结果：成员态 + 当前 target assignment。
 /// fenced = member-epoch 与服务端不符（C9 令牌面下沉），fenced 心跳不带
-/// assignment 且不产生任何状态变化。
+/// assignment 且不产生任何状态变化。fenced 二分（协议面错误码映射，
+/// ADR-19 §6③）：unknown_member = 未知成员/僵尸（UNKNOWN_MEMBER_ID），
+/// 否则已知成员 epoch 陈旧（FENCED_MEMBER_EPOCH）。
 #[derive(Debug, Default)]
 pub struct HeartbeatResult {
     pub member_id: String,
     pub member_epoch: i32,
     pub assignment: BTreeMap<String, Vec<i32>>,
     pub fenced: bool,
+    pub unknown_member: bool,
 }
 
 impl ConsumerGroup {
@@ -60,7 +84,7 @@ impl ConsumerGroup {
                 };
             }
         } else if !member_id.is_empty() && member_epoch != 0 {
-            return HeartbeatResult { fenced: true, ..Default::default() };
+            return HeartbeatResult { fenced: true, unknown_member: true, ..Default::default() };
         }
 
         // 注册（空 MemberId）/ 续租
@@ -94,6 +118,28 @@ impl ConsumerGroup {
             member_epoch: m.epoch,
             assignment: m.assignment.clone(),
             fenced: false,
+            unknown_member: false,
+        }
+    }
+
+    /// DescribeConsumerGroup 快照（ConsumerGroupDescribe v0）。空组成员集
+    /// = Empty（组存在但无成员）；Assignor 固定 range（§3 POC 边界）。
+    pub fn describe(&self) -> GroupDescribe {
+        GroupDescribe {
+            state: if self.members.is_empty() { "Empty" } else { "Stable" }.to_string(),
+            group_epoch: self.rebalances as i32,
+            assignment_epoch: self.rebalances as i32,
+            assignor: "range".to_string(),
+            members: self
+                .members
+                .values()
+                .map(|m| MemberDescribe {
+                    member_id: m.member_id.clone(),
+                    member_epoch: m.epoch,
+                    subscribed: m.subscribed.clone(),
+                    assignment: m.assignment.clone(),
+                })
+                .collect(),
         }
     }
 
@@ -112,6 +158,7 @@ impl ConsumerGroup {
     /// 服务端 Range 分配（java RangeAssignor 对齐）：订阅并集内每个 topic，
     /// 分区按成员序连续切块（余数给前面的成员）；未订阅的 topic 不分配。
     fn rebalance(&mut self) {
+        self.rebalances += 1;
         let ids: Vec<String> = self.members.keys().cloned().collect();
         for (id, m) in self.members.iter_mut() {
             let mut target = BTreeMap::new();
@@ -221,8 +268,31 @@ mod consumer_group_tests {
         assert_eq!(stale.assignment.len(), 0, "fenced 心跳不带 assignment");
         let zero = hb(&mut cg, &a.member_id, 0, vec!["t"], vec![]);
         assert!(zero.fenced, "已知成员归零 epoch = 陈旧心跳，不得落注册路径");
+        assert!(!zero.unknown_member, "已知成员 fence = 82 面（非未知成员）");
         let zombie = hb(&mut cg, "consumer-99", 7, vec!["t"], vec![]);
         assert!(zombie.fenced, "未知成员带非零 epoch = 僵尸");
+        assert!(zombie.unknown_member, "僵尸必须标记 unknown_member（协议面映射 25）");
+    }
+
+    /// Describe 快照（块 b ConsumerGroupDescribe 数据面）：成员明细/订阅/
+    /// 分配与 epoch 同源；空组 = Empty；不存在组由 actor 层回 None。
+    #[test]
+    fn describe_reflects_membership() {
+        let mut cg = ConsumerGroup::default();
+        cg.partition_counts.insert("t".into(), 2);
+        let d0 = cg.describe();
+        assert_eq!(d0.state, "Empty");
+        let a = hb(&mut cg, "", 0, vec!["t"], vec![]);
+        hb(&mut cg, &a.member_id, a.member_epoch, vec!["t"], vec![("t", vec![0, 1])]);
+        let d = cg.describe();
+        assert_eq!(d.state, "Stable");
+        assert_eq!(d.assignor, "range");
+        assert!(d.group_epoch >= 1 && d.assignment_epoch == d.group_epoch, "epoch 同源");
+        assert_eq!(d.members.len(), 1);
+        let m = &d.members[0];
+        assert_eq!(m.member_id, a.member_id);
+        assert_eq!(m.subscribed, vec!["t".to_string()]);
+        assert_eq!(m.assignment[&"t".to_string()], vec![0, 1]);
     }
 
     /// 退订：订阅集变化 → 重算后该 topic 不在 target。
@@ -251,6 +321,11 @@ pub struct CGHeartbeat {
 
 pub enum CGCmd {
     Heartbeat(CGHeartbeat),
+    /// ConsumerGroupDescribe：组不存在回 None（协议面映射 GROUP_ID_NOT_FOUND）。
+    Describe {
+        group: String,
+        reply: tokio::sync::oneshot::Sender<Option<GroupDescribe>>,
+    },
 }
 
 /// 每节点一个（组协调器 POC 全节点，FindCoordinator Type=0 回自身——与
@@ -278,6 +353,9 @@ impl ConsumerGroups {
                             hb.owned,
                         );
                         let _ = hb.reply.send(res);
+                    }
+                    CGCmd::Describe { group, reply } => {
+                        let _ = reply.send(groups.get(&group).map(|cg| cg.describe()));
                     }
                 }
             }

@@ -12,6 +12,9 @@ use std::time::{Duration, Instant};
 pub mod consumer_group;
 pub mod log;
 
+// KIP-848 新消费组协议面（T-M3.3 块 b）——server 侧 handler 直接引用
+pub use consumer_group::{CGCmd, CGHeartbeat, ConsumerGroups, GroupDescribe, MemberDescribe};
+
 use log::OffsetLog;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

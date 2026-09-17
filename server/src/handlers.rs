@@ -27,6 +27,9 @@ pub struct Ctx {
     pub port: u16,
     pub meta_tx: mpsc::Sender<MetaCmd>,
     pub group_tx: tokio::sync::mpsc::Sender<GroupCmd>,
+    /// KIP-848 consumer 组 actor 句柄（每节点一个，组协调器全节点拓扑——
+    /// 与 classic 同构，ADR-19 §4）
+    pub cg_tx: tokio::sync::mpsc::Sender<basalt_coordinator::CGCmd>,
     pub routes_rx: tokio::sync::watch::Receiver<crate::meta::RoutingTable>,
     /// 事务协调器句柄（仅 controller 节点为 Some；§9 拓扑）。
     pub txn_tx: Option<mpsc::Sender<crate::txn::TxnCmd>>,
@@ -49,6 +52,7 @@ impl Ctx {
             all_brokers: self.all_brokers.clone(),
             meta_tx: self.meta_tx.clone(),
             group_tx: self.group_tx.clone(),
+            cg_tx: self.cg_tx.clone(),
             routes_rx: self.routes_rx.clone(),
             txn_tx: self.txn_tx.clone(),
             pool: self.pool.clone(),
@@ -744,6 +748,7 @@ mod error_semantics_tests {
         (ErrorCode::InvalidProducerId, "INVALID_PRODUCER_ID", 50, false),
         (ErrorCode::EligibleLeadersNotAvailable, "ELIGIBLE_LEADERS_NOT_AVAILABLE", 83, true),
         (ErrorCode::FencedMemberEpoch, "FENCED_MEMBER_EPOCH", 82, false),
+        (ErrorCode::GroupIdNotFound, "GROUP_ID_NOT_FOUND", 69, false),
     ];
 
     /// 官方数值权威表（Errors.java 转录，独立于我们枚举的第二真相源——
@@ -767,6 +772,7 @@ mod error_semantics_tests {
         ("INVALID_PRODUCER_ID", 50),
         ("ELIGIBLE_LEADERS_NOT_AVAILABLE", 83),
         ("FENCED_MEMBER_EPOCH", 82),
+        ("GROUP_ID_NOT_FOUND", 69),
     ];
 
     #[test]
@@ -801,6 +807,7 @@ mod error_semantics_tests {
             ("INVALID_PRODUCER_ID", false),
             ("ELIGIBLE_LEADERS_NOT_AVAILABLE", true),
             ("FENCED_MEMBER_EPOCH", false),
+            ("GROUP_ID_NOT_FOUND", false),
         ];
         for (code, name, _, retriable) in TABLE {
             let official = official_retriable.iter().find(|(n, _)| n == name).unwrap();

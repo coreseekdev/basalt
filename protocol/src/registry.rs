@@ -117,6 +117,8 @@ impl Registry {
                     key::DESCRIBE_CONFIGS => "DescribeConfigs",
                     key::ALTER_CONFIGS => "AlterConfigs",
                     key::DESCRIBE_CLUSTER => "DescribeCluster",
+                    key::CONSUMER_GROUP_HEARTBEAT => "ConsumerGroupHeartbeat",
+                    key::CONSUMER_GROUP_DESCRIBE => "ConsumerGroupDescribe",
                     _ => "Unknown",
                 };
                 let hi = hi.min(e.stable_max);

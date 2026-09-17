@@ -106,6 +106,9 @@ pub enum ErrorCode {
     // 82 = FENCED_MEMBER_EPOCH（KIP-848：member-epoch 落后的心跳，客户端
     // 重新加入语义；ADR-19 块 b 消费组协议用）
     FencedMemberEpoch = 82,
+    // 69 = GROUP_ID_NOT_FOUND（KIP-848 ConsumerGroupDescribe：组不存在；
+    // Errors.java 核对，不可重试——ADR-19 块 b describe 面）
+    GroupIdNotFound = 69,
 }
 
 impl From<ErrorCode> for i16 {
@@ -147,5 +150,9 @@ pub fn supported_versions() -> &'static [(i16, i16, i16)] {
         (key::DESCRIBE_GROUPS, 0, 5),
         (key::LIST_GROUPS, 0, 4),
         (key::OFFSET_FOR_LEADER_EPOCH, 0, 5),
+        // KIP-848 新消费组协议（ADR-19 块 b）：v0 单档（v1 需 SubscribedTopicRegex/
+        // KIP-1082，后置）
+        (key::CONSUMER_GROUP_HEARTBEAT, 0, 0),
+        (key::CONSUMER_GROUP_DESCRIBE, 0, 0),
     ]
 }

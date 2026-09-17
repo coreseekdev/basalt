@@ -8,6 +8,7 @@
 mod config;
 mod conn;
 mod handlers;
+mod handlers_consumer;
 mod handlers_groups;
 mod ctrl_raft;
 mod internal;
@@ -129,6 +130,9 @@ async fn async_main(cfg: Config) {
 
     let (meta_tx, routes_rx) = meta::MetaService::spawn(cfg.clone(), controller_addr, controller_tx.clone(), pool.clone());
     let group_tx = basalt_coordinator::GroupManager::spawn(std::path::Path::new(&cfg.data_dir));
+    // KIP-848 consumer 组 actor（每节点一个；FindCoordinator 组路径回自身——
+    // 与 classic 同拓扑，ADR-19 §4）
+    let cg_tx = basalt_coordinator::ConsumerGroups::spawn();
     let routes_rx_internal = routes_rx.clone();
 
     // 事务协调器（ADR-18 §9：单实例驻 controller 节点）+ marker 路由器。
@@ -413,6 +417,7 @@ async fn async_main(cfg: Config) {
         all_brokers: Vec::new(),
         meta_tx,
         group_tx: group_tx.clone(),
+        cg_tx: cg_tx.clone(),
         routes_rx: routes_rx.clone(),
         brokers_cache: std::sync::Mutex::new(None),
         pool: pool.clone(),
@@ -433,6 +438,7 @@ async fn async_main(cfg: Config) {
                         all_brokers: Vec::new(),
                         meta_tx: ctx_ref.meta_tx.clone(),
                         group_tx: ctx_ref.group_tx.clone(),
+                        cg_tx: ctx_ref.cg_tx.clone(),
                         routes_rx: ctx_ref.routes_rx.clone(),
                         txn_tx: ctx_ref.txn_tx.clone(),
                         brokers_cache: std::sync::Mutex::new(ctx_ref.brokers_cache.lock().unwrap().clone()),

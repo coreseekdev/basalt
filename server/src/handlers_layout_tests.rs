@@ -8,8 +8,9 @@
 #[cfg(test)]
 pub mod handlers_layout_tests {
 
-    use crate::meta::{MetaCmd, Route, RoutingTable};
+    use crate::meta::{MetaCmd, Route, RoutingTable, topic_id_from};
     use crate::handlers::Ctx;
+    use crate::handlers_consumer;
     use crate::handlers_groups;
     use basalt_coordinator::{CommittedOffset, GroupCmd, JoinSpec, SyncSpec};
     use basalt_protocol::codec;
@@ -33,6 +34,7 @@ pub mod handlers_layout_tests {
     async fn make_ctx(topics: &[(&str, i32)]) -> Ctx {
         let dir = tmpdir("groups");
         let group_tx = basalt_coordinator::GroupManager::spawn(&dir);
+        let cg_tx = basalt_coordinator::ConsumerGroups::spawn();
         let cfg = crate::config::Config {
             node_id: 0,
             host: "localhost".into(),
@@ -49,17 +51,20 @@ pub mod handlers_layout_tests {
         };
         let pool: Arc<basalt_storage::pool::BufferPool> = Arc::new(basalt_storage::pool::BufferPool::new());
         let (meta_tx, routes_rx) = crate::meta::MetaService::spawn(cfg, None, None, pool.clone());
-        // 填充集群态：t0..tN 各 1 分区，leader=0 —— Lookup 由此应答 found
+        // 填充集群态：t0..tN 各 parts 分区，leader=0 —— Lookup 由此应答
+        // found 且分区数真实（KIP-848 心跳的分区数快照源）
         let mut state = basalt_metadata::cluster::ClusterState::default();
         state.brokers.insert(0, basalt_metadata::cluster::BrokerInfo { node_id: 0, host: "localhost".into(), port: 9092 });
-        for (name, _) in topics {
-            state.assignments.push(basalt_metadata::cluster::ReplicaAssignment {
-                topic: name.to_string(),
-                partition: 0,
-                replicas: vec![0],
-                leader: 0,
-                epoch: 1,
-            });
+        for (name, parts) in topics {
+            for p in 0..*parts {
+                state.assignments.push(basalt_metadata::cluster::ReplicaAssignment {
+                    topic: name.to_string(),
+                    partition: p,
+                    replicas: vec![0],
+                    leader: 0,
+                    epoch: 1,
+                });
+            }
         }
         // 集群态进 MetaService（原探针漏发此条 → Lookup 恒空，delete_topics 误报红）
         let _ = meta_tx.send(MetaCmd::ApplyCluster(Box::new(state))).await;
@@ -87,6 +92,7 @@ pub mod handlers_layout_tests {
             port: 9092,
             meta_tx,
             group_tx,
+            cg_tx,
             routes_rx: rx2,
             brokers_cache: std::sync::Mutex::new(None),
             pool,
@@ -556,6 +562,156 @@ pub mod handlers_layout_tests {
         let req = req_at(k, v, &st);
         let resp = handlers_groups::init_producer_id(&req, ctx).await;
         resp_decode(k, v, &resp_bytes(k, v, &resp))
+    }
+
+    // ---- KIP-848 消费组协议（ADR-19 块 b）：真实组 actor 全链 + 字节级布局 ----
+
+    async fn cgh(ctx: &Ctx, v: i16, st: Value) -> Struct {
+        let k = basalt_protocol::api::key::CONSUMER_GROUP_HEARTBEAT;
+        let st = as_struct_owned(st);
+        let req = req_at(k, v, &st);
+        let resp = handlers_consumer::consumer_group_heartbeat(&req, ctx).await;
+        resp_decode(k, v, &resp_bytes(k, v, &resp))
+    }
+    async fn cgd(ctx: &Ctx, v: i16, st: Value) -> Struct {
+        let k = basalt_protocol::api::key::CONSUMER_GROUP_DESCRIBE;
+        let st = as_struct_owned(st);
+        let req = req_at(k, v, &st);
+        let resp = handlers_consumer::consumer_group_describe(&req, ctx).await;
+        resp_decode(k, v, &resp_bytes(k, v, &resp))
+    }
+
+    fn hb_req(group: &str, member: &str, epoch: i32, subs: Value, owned: Value) -> Value {
+        s([
+            ("GroupId", Value::str(group)),
+            ("MemberId", Value::str(member)),
+            ("MemberEpoch", Value::I32(epoch)),
+            ("InstanceId", Value::Null),
+            ("RackId", Value::Null),
+            ("RebalanceTimeoutMs", Value::I32(10_000)),
+            ("SubscribedTopicNames", subs),
+            ("ServerAssignor", Value::str("range")),
+            ("TopicPartitions", owned),
+        ])
+    }
+
+    fn assignment_parts(r: &Struct) -> Vec<Value> {
+        match fld(r, "Assignment") {
+            Value::Null => vec![],
+            v => arr(as_struct(v), "TopicPartitions"),
+        }
+    }
+
+    #[tokio::test]
+    async fn probe_consumer_group_layouts() {
+        let ctx = make_ctx(&[("t1", 2)]).await;
+        let tid1 = topic_id_from("t1");
+
+        // 注册：空 MemberId → 服务端分配 consumer-1；epoch 0→1（注册即首算）；
+        // 单成员 Range 独占 t1 两分区；assignment 携带 TopicId（uuid）
+        let r = cgh(&ctx, 0, hb_req("cg1", "", 0, Value::Array(vec![Value::str("t1")]), Value::Null)).await;
+        assert_eq!(fld(&r, "ErrorCode").as_i16(), 0);
+        assert_eq!(fld(&r, "MemberId").as_str(), "consumer-1");
+        assert_eq!(fld(&r, "MemberEpoch").as_i32(), 1);
+        assert_eq!(fld(&r, "HeartbeatIntervalMs").as_i32(), 5000, "POC 固定 5s");
+        let tps = assignment_parts(&r);
+        assert_eq!(tps.len(), 1, "单 topic 分配");
+        assert_eq!(sfield(&tps[0], "TopicId").as_uuid(), tid1, "assignment 反查 TopicId");
+        let parts: Vec<i32> = arr(as_struct(&tps[0]), "Partitions").iter().map(|p| p.as_i32()).collect();
+        assert_eq!(parts, vec![0, 1], "单成员 Range 独占全部");
+
+        // 幂等续租：同 epoch → 不 bump，分配原样重发；owned 带未知 TopicId
+        // 条目静默丢弃（反查 miss 不致命——owned 只是确认面）
+        let r = cgh(&ctx, 0, hb_req(
+            "cg1", "consumer-1", 1,
+            Value::Array(vec![Value::str("t1")]),
+            Value::Array(vec![s([("TopicId", Value::Uuid(tid1)), ("Partitions", Value::Array(vec![Value::I32(0), Value::I32(1)]))]),
+                              s([("TopicId", Value::Uuid(999)), ("Partitions", Value::Array(vec![]))])]),
+        )).await;
+        assert_eq!(fld(&r, "ErrorCode").as_i16(), 0);
+        assert_eq!(fld(&r, "MemberEpoch").as_i32(), 1, "续租不 bump");
+        assert_eq!(assignment_parts(&r).len(), 1);
+
+        // 陈旧 epoch → FENCED_MEMBER_EPOCH(82)，Assignment null，应答带服务端 epoch
+        let r = cgh(&ctx, 0, hb_req("cg1", "consumer-1", 0, Value::Array(vec![Value::str("t1")]), Value::Null)).await;
+        assert_eq!(fld(&r, "ErrorCode").as_i16(), 82, "stale epoch = FENCED_MEMBER_EPOCH");
+        assert_eq!(assignment_parts(&r).len(), 0, "fenced 心跳不带 assignment");
+        assert_eq!(fld(&r, "MemberEpoch").as_i32(), 1, "应答携带服务端当前 epoch");
+
+        // 未知成员带非零 epoch（僵尸）→ UNKNOWN_MEMBER_ID(25)
+        let r = cgh(&ctx, 0, hb_req("cg1", "consumer-99", 7, Value::Array(vec![Value::str("t1")]), Value::Null)).await;
+        assert_eq!(fld(&r, "ErrorCode").as_i16(), 25, "未知成员 = UNKNOWN_MEMBER_ID");
+
+        // 第二成员加入 → Range 均分：b 得 [1]；a 旧 epoch 被 fence → 重同步得 [0]
+        let b = cgh(&ctx, 0, hb_req("cg1", "", 0, Value::Array(vec![Value::str("t1")]), Value::Null)).await;
+        assert_eq!(fld(&b, "MemberId").as_str(), "consumer-2");
+        let b_parts: Vec<i32> = arr(as_struct(&assignment_parts(&b)[0]), "Partitions").iter().map(|p| p.as_i32()).collect();
+        assert_eq!(b_parts, vec![1], "2 成员 Range：后位成员得尾段");
+        let r = cgh(&ctx, 0, hb_req("cg1", "consumer-1", 1, Value::Array(vec![Value::str("t1")]), Value::Null)).await;
+        assert_eq!(fld(&r, "ErrorCode").as_i16(), 82, "成员集变化后 a 旧 epoch 被 fence");
+        let a_epoch = fld(&r, "MemberEpoch").as_i32();
+        let r = cgh(&ctx, 0, hb_req("cg1", "consumer-1", a_epoch, Value::Array(vec![Value::str("t1")]), Value::Null)).await;
+        let a_parts: Vec<i32> = arr(as_struct(&assignment_parts(&r)[0]), "Partitions").iter().map(|p| p.as_i32()).collect();
+        assert_eq!(a_parts, vec![0], "重同步后 a 得首段");
+
+        // 离开（epoch=-1）：err 0 + epoch 回 -1；b 旧 epoch 被 fence → 重同步接管全部
+        let r = cgh(&ctx, 0, hb_req("cg1", "consumer-1", -1, Value::Array(vec![]), Value::Null)).await;
+        assert_eq!(fld(&r, "ErrorCode").as_i16(), 0);
+        assert_eq!(fld(&r, "MemberEpoch").as_i32(), -1);
+        assert_eq!(assignment_parts(&r).len(), 0);
+        let r = cgh(&ctx, 0, hb_req("cg1", "consumer-2", 1, Value::Array(vec![Value::str("t1")]), Value::Null)).await;
+        assert_eq!(fld(&r, "ErrorCode").as_i16(), 82, "a 离开触发重算 → b 旧 epoch fence");
+        let b_epoch = fld(&r, "MemberEpoch").as_i32();
+        let r = cgh(&ctx, 0, hb_req("cg1", "consumer-2", b_epoch, Value::Array(vec![Value::str("t1")]), Value::Null)).await;
+        let b_parts: Vec<i32> = arr(as_struct(&assignment_parts(&r)[0]), "Partitions").iter().map(|p| p.as_i32()).collect();
+        assert_eq!(b_parts, vec![0, 1], "离开后接管全部");
+
+        // 订阅未知 topic（allow_create=false 不建题）→ 新成员 epoch 推进但无分配
+        let r = cgh(&ctx, 0, hb_req("cg1", "", 0, Value::Array(vec![Value::str("ghost")]), Value::Null)).await;
+        assert_eq!(fld(&r, "ErrorCode").as_i16(), 0);
+        assert_eq!(assignment_parts(&r).len(), 0, "未知 topic 无分配");
+        let ghost_member = fld(&r, "MemberId").as_str().to_string();
+        // 该成员离开——describe 断言面收敛为单成员组
+        let r = cgh(&ctx, 0, hb_req("cg1", &ghost_member, -1, Value::Array(vec![]), Value::Null)).await;
+        assert_eq!(fld(&r, "ErrorCode").as_i16(), 0);
+
+        // ---- ConsumerGroupDescribe (69) ----
+        let kd = basalt_protocol::api::key::CONSUMER_GROUP_DESCRIBE;
+        let r = cgd(&ctx, 0, s([
+            ("GroupIds", Value::Array(vec![Value::str("cg1")])),
+            ("IncludeAuthorizedOperations", Value::Bool(false)),
+        ])).await;
+        let gs = arr(&r, "Groups");
+        assert_eq!(gs.len(), 1);
+        let g = as_struct(&gs[0]);
+        assert_eq!(fld(g, "GroupId").as_str(), "cg1");
+        assert_eq!(fld(g, "ErrorCode").as_i16(), 0);
+        assert_eq!(fld(g, "GroupState").as_str(), "Stable");
+        assert_eq!(fld(g, "AssignorName").as_str(), "range");
+        assert!(fld(g, "GroupEpoch").as_i32() >= 1, "epoch 推进可见");
+        assert_eq!(fld(g, "AssignmentEpoch").as_i32(), fld(g, "GroupEpoch").as_i32(), "同源");
+        let ms = arr(g, "Members");
+        assert_eq!(ms.len(), 1, "仅 consumer-2 在组");
+        assert_eq!(sfield(&ms[0], "MemberId").as_str(), "consumer-2");
+        let subs = arr(as_struct(&ms[0]), "SubscribedTopicNames");
+        assert_eq!(subs.len(), 1);
+        // Assignment/TargetAssignment 同构：TopicPartitions 带 TopicId + TopicName
+        for key in ["Assignment", "TargetAssignment"] {
+            let tp = arr(as_struct(sfield(&ms[0], key)), "TopicPartitions");
+            assert_eq!(tp.len(), 1, "{key} 结构");
+            assert_eq!(sfield(&tp[0], "TopicId").as_uuid(), tid1);
+            assert_eq!(sfield(&tp[0], "TopicName").as_str(), "t1", "describe 版多 TopicName 字段");
+        }
+
+        // 未知组 → GROUP_ID_NOT_FOUND(69)，GroupId 逐条回显
+        let r = cgd(&ctx, 0, s([
+            ("GroupIds", Value::Array(vec![Value::str("ghost")])),
+            ("IncludeAuthorizedOperations", Value::Bool(false)),
+        ])).await;
+        let gs = arr(&r, "Groups");
+        assert_eq!(sfield(&gs[0], "GroupId").as_str(), "ghost");
+        assert_eq!(sfield(&gs[0], "ErrorCode").as_i16(), 69, "GROUP_ID_NOT_FOUND");
+        assert!(arr(as_struct(&gs[0]), "Members").is_empty());
     }
 
     // ---- 事务 API（ADR-18 块 c）：真实协调器全链 + 字节级布局 ----

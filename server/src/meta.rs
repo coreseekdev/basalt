@@ -38,6 +38,17 @@ impl RoutingTable {
         self.by_id.get(&(id, partition))
     }
 
+    /// TopicId → topic 名反查（KIP-848 块 b：心跳请求的 TopicPartitions 只带
+    /// TopicId，组状态机以名字为键）。topic id 是名字哈希（topic_id_from），
+    /// 故由 by_name 键派生反查——零新增状态面，免三表同步失联（㊽ 族教训）；
+    /// 心跳频率低（5s 档）+ POC topic 量级小，线性扫描可接受。
+    pub fn name_for(&self, id: u128) -> Option<String> {
+        self.by_name
+            .keys()
+            .find(|(n, _)| topic_id_from(n) == id)
+            .map(|(n, _)| n.to_string())
+    }
+
     pub fn iter_all_topics(&self) -> Vec<String> {
         self.by_name
             .keys()

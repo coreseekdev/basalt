@@ -1686,7 +1686,7 @@ mod idempotence_tests {
     use basalt_storage::log::{FsyncSchedule, LogOptions};
     use bytes::{Bytes, BytesMut};
 
-    fn batch_bytes_idem(pid: i64, epoch: i16, seq: i32, tag: &str) -> Bytes {
+    pub(super) fn batch_bytes_idem(pid: i64, epoch: i16, seq: i32, tag: &str) -> Bytes {
         let recs: Vec<Rec> = (0..1)
             .map(|i| Rec {
                 timestamp_delta: i as i64,
@@ -1700,7 +1700,7 @@ mod idempotence_tests {
         b.freeze()
     }
 
-    async fn spawn_leader(tag: &str) -> (mpsc::Sender<PartitionCmd>, std::path::PathBuf) {
+    pub(super) async fn spawn_leader(tag: &str) -> (mpsc::Sender<PartitionCmd>, std::path::PathBuf) {
         let dir = std::env::temp_dir().join(format!(
             "basalt-idem-{tag}-{}-{}",
             std::process::id(),
@@ -1718,7 +1718,7 @@ mod idempotence_tests {
         (tx, dir)
     }
 
-    async fn produce(tx: &mpsc::Sender<PartitionCmd>, pid: i64, epoch: i16, seq: i32, tag: &str) -> ProduceOutcome {
+    pub(super) async fn produce(tx: &mpsc::Sender<PartitionCmd>, pid: i64, epoch: i16, seq: i32, tag: &str) -> ProduceOutcome {
         let (ptx, prx) = oneshot::channel();
         tx.send(PartitionCmd::Produce {
             batches: batch_bytes_idem(pid, epoch, seq, tag),
@@ -1729,7 +1729,7 @@ mod idempotence_tests {
         prx.await.unwrap()
     }
 
-    async fn leo(tx: &mpsc::Sender<PartitionCmd>) -> i64 {
+    pub(super) async fn leo(tx: &mpsc::Sender<PartitionCmd>) -> i64 {
         let (ltx, lrx) = oneshot::channel();
         tx.send(PartitionCmd::LocalLeo { reply: ltx }).await.unwrap();
         lrx.await.unwrap()
@@ -2084,6 +2084,57 @@ mod txn_tests {
 
         let f2 = fetch(&tx, 1, Isolation::ReadCommitted, Duration::from_secs(1)).await;
         assert_eq!(f2.last_stable_offset, 2, "LSO 释放 = HW");
+
+        drop(tx);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+}
+
+#[cfg(test)]
+mod retry_storm_tests {
+    //! T-M3.1 收口：重试风暴下的去重稳定性（确定性，无随机）。
+    //! 场景：客户端把"ack 丢失"的生产原样重试 N 轮（交错两 PID、两会话）——
+    //! 每逻辑批 offset 恒定（缓存回放）、LEO 不漂移；epoch 升级后旧会话
+    //! 重投被拒（duplicate sequence too old），新会话全新追加。
+
+    use super::*;
+    use basalt_record::{encode_batch, Rec};
+    use basalt_storage::log::{FsyncSchedule, LogOptions};
+    use std::collections::HashMap;
+
+    use idempotence_tests::{batch_bytes_idem, spawn_leader, leo, produce};
+
+    #[tokio::test]
+    async fn retry_storm_dedup_stability() {
+        let (tx, dir) = spawn_leader("storm").await;
+
+        // 风暴：2 PID × 3 逻辑批 × 5 轮重试（PID 交替、轮内 seq 升序）
+        let mut offset_of: HashMap<String, i64> = HashMap::new();
+        for round in 0..5u32 {
+            for pid in [100i64, 200i64] {
+                for seq in 0..3i32 {
+                    let v = format!("m{pid}-{seq}");
+                    let o = produce(&tx, pid, 0, seq, &v).await;
+                    assert!(o.error.is_none(), "round{round} {v}: {:?}", o.error);
+                    match offset_of.get(&v) {
+                        Some(prev) => assert_eq!(*prev, o.base_offset,
+                            "round{round} {v}: 重试偏移漂移 {} -> {}", prev, o.base_offset),
+                        None => { offset_of.insert(v, o.base_offset); }
+                    }
+                }
+            }
+            assert_eq!(leo(&tx).await, 6, "round{round}: LEO 漂移（重复批不得推进）");
+        }
+
+        // epoch 升级（新会话）：重置后同 seq 全新追加，offset 前进
+        let o = produce(&tx, 100, 1, 0, "m100-0-e1").await;
+        assert!(o.error.is_none(), "{:?}", o.error);
+        assert_eq!(o.base_offset, 6, "新会话必须全新追加");
+
+        // 旧会话（epoch 0）重投：缓存已随升级清空 → duplicate sequence too old
+        let o = produce(&tx, 100, 0, 0, "m100-0-stale").await;
+        assert!(o.error.is_some(), "旧会话重投必须被拒");
+        assert_eq!(leo(&tx).await, 7, "被拒批不得推进 LEO");
 
         drop(tx);
         let _ = std::fs::remove_dir_all(&dir);

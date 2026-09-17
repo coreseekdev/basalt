@@ -1,6 +1,7 @@
 # ADR-19：KIP-848 新消费组协议（T-M3.3）
 
-- 状态：落地中（设计 2026-09-17 草案；块 a ✅ 2026-09-17；块 b ✅ 2026-09-18）
+- 状态：落地中（设计 2026-09-17 草案；块 a ✅ 2026-09-17；块 b ✅ 2026-09-18；
+  块 c ✅ 2026-09-18；剩块 d 规格化）
 - 依据：TASK.md T-M3.3/T-M3.4；Kafka §5（01-apache-kafka.md）；spec/ConsumerGroup.tla
   （C9 经典协议规格化：generation 令牌 + InvStableWellFormed）与
   CONSUMERGROUP-LIVENESS.md（四级公平性均不可满足的负结果）；KIP-848 官方语义。
@@ -96,17 +97,30 @@ epoch 落后的心跳（fence 面，C9 的 InvCommitFencedMon 同构下沉为
   （HeartbeatResult.unknown_member 显式判别位）/describe 未知组 →
   GROUP_ID_NOT_FOUND(69，新增枚举+语义表双锁行)。actor 失联（send/oneshot
   断）→ 15 可重试兜底。
-- **c. 验收面**：e2e（python/franz-go 任一支持 KIP-848 的客户端）——
-  混布收敛 + 增量 rebalance 无停等 + 双隔离级消费；
+- **c. 验收面 ✅（2026-09-18）**：e2e = franz-go v1.21.6（testing/franzgo/
+  kip848/main.go，run_franzgo_848.sh）三验收面全过：①混布收敛——同 topic
+  两组建（classic 无 opt-in / consumer 带 opt-in）各读 20/20 不重不漏；
+  ②增量 rebalance 无停等——新成员中流加入，存量成员接收间隙最大 201ms
+  （classic 栅栏相位会停整个 rebalance），B 分得增量、全组 60/60 无丢失；
+  ③双隔离级——read_committed 组消费者 abort 流不可见 / read_uncommitted
+  双流全见。**前置定案（§7 开放问题）**：客户端 = franz-go 先行（v1.21.6
+  的 should848 三道门实证：ctx opt-in + eager balancer 首位 + broker 宣告
+  68 max≥1——只宣告 v0 客户端静默回退 classic，故 heartbeat 宣告升 0-1，
+  v1 差异 = SubscribedTopicRegex 拒收 INVALID_REQUEST + KIP-1082 客户端
+  自生成 member id 按原样注册）。**过程中抓到 codec 缺 nullable-struct
+  原语**（账本 51：自 round-trip 自洽但真客户端解码越界——探针不可替代
+  跨实现对拍）。java 4.x 升级保持单列。
 - **d. 规格化**：ConsumerGroup.tla 扩展 consumer 型状态机（无栅栏相位后
   C9 的 Stable 良构与 generation fencing 需按 member-epoch 重述）+
   阴性对照（stale-epoch 心跳被拒必须可检出）。
 
 ## 7. 已知边界与开放问题
 
-- **客户端版本门槛（开放问题，块 c 前定案）**：KIP-848 客户端 GA =
-  kafka-clients 4.0+（`group.protocol=consumer`）；仓库现有 java 档为
-  3.7——需升级 maven 依赖或改用 franz-go（v1.21+ 已有早期支持）作验收
-  客户端。倾向：franz-go 先行（工具链已就位），java 4.x 升级单列；
+- **客户端版本门槛（✅ 已定案 2026-09-18，见 §6c）**：franz-go v1.21.6
+  先行（should848 硬性要求 broker 宣告 68 max≥1——v0-only 宣告客户端
+  静默回退 classic 路径，验收会假绿）；heartbeat 宣告 0-1（v1 的
+  SubscribedTopicRegex 拒收 INVALID_REQUEST，KIP-1082 member id 已天然
+  支持）；kafka-clients 4.x 升级单列（java 3.7 档不受 68/69 宣告影响，
+  已实证零回归）；
 - SubscribedTopicRegex/Share groups 后置；成员关系驻内存（classic 同边界）；
 - 服务端分配器只有 Range（Uniform/Sticky 随 T-M3.4）。

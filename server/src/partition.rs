@@ -240,8 +240,10 @@ pub struct PartitionActor {
     txn_open: std::collections::HashMap<i64, OpenTxn>,
     /// 终态 marker（终态 fence + marker 幂等）。
     last_marker: std::collections::HashMap<i64, (i16, basalt_record::ControlRecordType)>,
-    /// 已 abort 区间 (pid, epoch, first, last)：read_committed 过滤。
-    aborted: Vec<(i64, i16, i64, i64)>,
+    /// 已 abort 区间索引（review P2-2）：(pid, epoch) → 区间表（first, last
+    /// 升序；同键多区间防御性保留——TV2 每 epoch 一事务，正常恰一条）。
+    /// 过滤 = 键直查 + 键内短表扫描，O(批 × 键内区间)。
+    aborted: std::collections::HashMap<(i64, i16), Vec<(i64, i64)>>,
     /// 最后稳定 offset = min(HW, 各开事务 first_offset)；无开事务 = HW。
     lso: i64,
     /// 过冻结提交面的 marker 应答。
@@ -298,7 +300,7 @@ impl PartitionActor {
             pending_replica: Vec::new(),
             txn_open: std::collections::HashMap::new(),
             last_marker: std::collections::HashMap::new(),
-            aborted: Vec::new(),
+            aborted: std::collections::HashMap::new(),
             lso: 0,
             parked_markers: Vec::new(),
             deferred_markers: Vec::new(),
@@ -1068,7 +1070,7 @@ impl PartitionActor {
             Some((e, first, old_last)) => {
                 // 会话更替：旧开事务被 fence 且不再会有其 marker——安全方向
                 // 直接入 aborted（与恢复收割同语义）
-                self.aborted.push((pid, e, first, old_last));
+                self.aborted.entry((pid, e)).or_default().push((first, old_last));
                 self.txn_open.insert(pid, OpenTxn {
                     epoch, first_offset: base, last_offset: last,
                     deadline: Instant::now() + self.repl.transaction_timeout,
@@ -1178,11 +1180,11 @@ impl PartitionActor {
         self.last_marker.insert(b.pid, (b.epoch, b.outcome));
         if let Some(t) = self.txn_open.remove(&b.pid) {
             if b.outcome == basalt_record::ControlRecordType::Abort && t.epoch == b.epoch {
-                self.aborted.push((b.pid, b.epoch, t.first_offset, t.last_offset));
+                self.aborted.entry((b.pid, b.epoch)).or_default().push((t.first_offset, t.last_offset));
             }
         }
         if b.outcome == basalt_record::ControlRecordType::Commit {
-            self.aborted.retain(|&(p, e, _, _)| !(p == b.pid && e == b.epoch));
+            self.aborted.remove(&(b.pid, b.epoch));
         }
         self.recompute_lso();
         self.serve_pending();
@@ -1326,12 +1328,10 @@ impl PartitionActor {
             let mut skip = h.is_control();
             if !skip && committed && h.is_transactional() && h.producer_id >= 0 {
                 let last = h.base_offset + h.last_offset_delta as i64;
-                if self
-                    .aborted
-                    .iter()
-                    .any(|&(p, e, f, l)| p == h.producer_id && e == h.producer_epoch && f <= last && h.base_offset <= l)
-                {
-                    skip = true;
+                if let Some(ranges) = self.aborted.get(&(h.producer_id, h.producer_epoch)) {
+                    if ranges.iter().any(|&(f, l)| f <= last && h.base_offset <= l) {
+                        skip = true;
+                    }
                 }
             }
             if !skip {
@@ -1354,7 +1354,9 @@ impl PartitionActor {
             });
         }
         self.last_marker = h.last_marker;
-        self.aborted = h.aborted;
+        for (pid, epoch, first, last) in h.aborted {
+            self.aborted.entry((pid, epoch)).or_default().push((first, last));
+        }
         for (pid, epoch) in h.pid_epoch {
             self.idem.entry(pid).or_default().epoch = epoch;
         }

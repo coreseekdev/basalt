@@ -24,6 +24,7 @@ cg-liveness-l3: ; $(TLC) -config consumer-group-l3.cfg ConsumerGroupLiveness.tla
 # 提交协议（账本 ㉟，T-M2.2）：名义全空间绿；无 reconciliation 突变体必须红
 replication-commit:         ; $(TLC) -config replication-commit.cfg ReplicationCommit.tla
 replication-commit-liveness:      ; $(TLC) -deadlock -config replication-commit-liveness.cfg ReplicationCommit.tla
+replication-commit-liveness-2f:   ; $(TLC) -deadlock -config replication-commit-liveness-2f.cfg ReplicationCommit.tla
 replication-commit-recovery:      ; $(TLC) -deadlock -config replication-commit-recovery.cfg ReplicationCommit.tla
 # 阴性对照（判别力已恢复 2026-09-16：全 UNCHANGED 集修复后故障路径可达）：
 # 无 reconciliation 突变体必须被 InvLeaderServingHasAcked 检出

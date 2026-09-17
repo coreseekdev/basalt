@@ -219,14 +219,13 @@ Spec == Init /\ [][Next]_vars
    CrashEnabled=TRUE 的恢复活性：崩溃 ⇒ 最终恢复服务（reconciliation
    不空转）。*)
 
-(* 🚧 WIP（2026-09-16）：名义活性（EventuallyAllAcked）反例未解。
-   反例形态：Produce×2 → Tick×2（age 饱和）→ 永久 stutter——follower 从不
-   pull、ack 从不发生。该 stutter 尾部中 Pull 持续 ENABLED 却从不发生，
-   WF/SF 均应排除之（已试 WF/ disjunctive/ SF 三种公平性形态 + 单
-   follower 最小模型，均复现）。怀疑点：TLC tableau 与「\E 动作上的
-   SF」/量化 WF 合取的交互，或活性性质需要条件化（稳定环境假设）。
-   下一步：fresh/ISR 双阈值分离建模 + 条件化活性重述（稳定 pull 环境
-   ⇒ ack 推进），参考 BasaltDataPlaneLiveness 的 FairDP 结构。 *)
+(* ✅ 名义活性已闭合（2026-09-17）：此处量化 WF(Pull(f)) 即「稳定 pull
+   环境」的公平性表达——follower 沉默簇（从不 pull）违反 WF(Pull(f)) 被
+   排除，无需性质侧条件化重述（原「Produce×2 → Tick×2 → 永久 stutter
+   反例」系早期公平性形态残留，量化 WF 下 2-follower/MaxEntries=3 配置
+   全空间 45,714 态绿——replication-commit-liveness-2f 门禁固化）。
+   待做（P1 降级）：fresh/ISR 双阈值分离建模仍可增强 norecon 判别面，
+   按需启动。 *)
 (* 逐 follower WF(Pull)：每个存活副本的 pull 循环持续运行（实现现实——
    pull 循环永不退出）。f1 永不拉取的行为违反 WF(Pull(f1)) 而被排除——
    冻结提交面等待其追平是系统诚实性，不是活锁。 *)

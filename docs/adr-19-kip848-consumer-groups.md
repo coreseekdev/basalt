@@ -1,7 +1,7 @@
 # ADR-19：KIP-848 新消费组协议（T-M3.3）
 
-- 状态：落地中（设计 2026-09-17 草案；块 a ✅ 2026-09-17；块 b ✅ 2026-09-18；
-  块 c ✅ 2026-09-18；剩块 d 规格化）
+- 状态：✅ 全部落地（设计 2026-09-17 草案；块 a ✅ 2026-09-17；块 b ✅
+  2026-09-18；块 c ✅ 2026-09-18；块 d ✅ 2026-09-18——T-M3.3 闭合）
 - 依据：TASK.md T-M3.3/T-M3.4；Kafka §5（01-apache-kafka.md）；spec/ConsumerGroup.tla
   （C9 经典协议规格化：generation 令牌 + InvStableWellFormed）与
   CONSUMERGROUP-LIVENESS.md（四级公平性均不可满足的负结果）；KIP-848 官方语义。
@@ -110,9 +110,20 @@ epoch 落后的心跳（fence 面，C9 的 InvCommitFencedMon 同构下沉为
   自生成 member id 按原样注册）。**过程中抓到 codec 缺 nullable-struct
   原语**（账本 51：自 round-trip 自洽但真客户端解码越界——探针不可替代
   跨实现对拍）。java 4.x 升级保持单列。
-- **d. 规格化**：ConsumerGroup.tla 扩展 consumer 型状态机（无栅栏相位后
-  C9 的 Stable 良构与 generation fencing 需按 member-epoch 重述）+
-  阴性对照（stale-epoch 心跳被拒必须可检出）。
+- **d. 规格化 ✅（2026-09-18，`13344d7`）**：spec/ConsumerGroup848.tla
+  （独立模块，镜像 consumer_group.rs：无栅栏 Join/订阅变化/Leave 单步
+  原子重算 + 确定性 Range + member-epoch fencing + 成员级提交双令牌——
+  分区级不校验，归属迁移期合法窗口是协议语义）。**C9 重述**：Stable 良构
+  → InvOwnerIsMember / InvOwnerSubscribed / InvCoverage /
+  InvRegisteredEpochBounded（注册即首算，成员不驻留 epoch 0——848 设计面
+  直述性质）；generation fencing → 心跳/提交两只审计位监控（C9 v0.3
+  同款）。**三门禁**（make consumer-group-848 三步）：名义绿 82,945 态；
+  两突变体必须红——①HeartbeatFence=FALSE → InvHeartbeatFencedMon；
+  ②CommitFence=FALSE → InvCommitFencedMon（正交捕获：各自的门只抓各自
+  的洞；突变常数与 Makefile 注释/账本三方一致，㊼ 纪律）。已知取舍入
+  模块头：Leave 不校验请求方身份/epoch（与实现及 classic LeaveGroup 同
+  信任边界——POC 成员 id 可冒充，§7）、epoch 上界 escape hatch、commit
+  只前进（经典 spec 同款）。
 
 ## 7. 已知边界与开放问题
 

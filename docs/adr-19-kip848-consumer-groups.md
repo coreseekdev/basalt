@@ -1,6 +1,6 @@
 # ADR-19：KIP-848 新消费组协议（T-M3.3）
 
-- 状态：设计草案（2026-09-17，待评审）
+- 状态：落地中（设计 2026-09-17 草案；块 a ✅ 2026-09-17；块 b ✅ 2026-09-18）
 - 依据：TASK.md T-M3.3/T-M3.4；Kafka §5（01-apache-kafka.md）；spec/ConsumerGroup.tla
   （C9 经典协议规格化：generation 令牌 + InvStableWellFormed）与
   CONSUMERGROUP-LIVENESS.md（四级公平性均不可满足的负结果）；KIP-848 官方语义。
@@ -81,7 +81,21 @@ epoch 落后的心跳（fence 面，C9 的 InvCommitFencedMon 同构下沉为
   ErrorCode+语义表行)、未知成员 UNKNOWN_MEMBER_ID(25)。ConsumerGroup actor（心跳循环/成员注册/
   Range 分配/member-epoch fence/差分下发）+ 确定性单测（分配对拍 java
   RangeAssignor 金样）；
-- **b. 协议面**：68/69 handler + 宣告 + handlers_layout_tests 字节级回归；
+- **b. 协议面 ✅（2026-09-18）**：68/69 v0 handler（server/src/handlers_consumer.rs）
+  + 宣告（supported_versions 两行，v0 单档——v1 需 SubscribedTopicRegex/KIP-1082
+  后置）+ conn.rs dispatch + Ctx.cg_tx（main.rs 每节点 spawn ConsumerGroups，
+  与 classic 同拓扑）+ probe_consumer_group_layouts 字节级回归（注册/续租/
+  fence 重同步/僵尸/离开接管/describe 全链，resp_decode 尾字节证明）。
+  **三条接线要点的落地方式**：①`RoutingTable::name_for(tid)` 由名字哈希
+  派生反查（topic_id_from 同函数，零新增状态面免三表同步失联；心跳 5s 档
+  线性扫描可接受）；②分区数快照经 `MetaCmd::Lookup` 携带（TopicMeta 的
+  name/topic_id/partitions 一次拿全——counts 进组状态机、topic_id 供
+  assignment 回填；⚠ Lookup 传 `Some(vec![])` 恒定，None 是全量语义会把
+  全集群 topic 灌进退订成员的组）；③fenced 三态映射：已知成员 epoch 不符
+  → FENCED_MEMBER_EPOCH(82)/未知成员僵尸 → UNKNOWN_MEMBER_ID(25)
+  （HeartbeatResult.unknown_member 显式判别位）/describe 未知组 →
+  GROUP_ID_NOT_FOUND(69，新增枚举+语义表双锁行)。actor 失联（send/oneshot
+  断）→ 15 可重试兜底。
 - **c. 验收面**：e2e（python/franz-go 任一支持 KIP-848 的客户端）——
   混布收敛 + 增量 rebalance 无停等 + 双隔离级消费；
 - **d. 规格化**：ConsumerGroup.tla 扩展 consumer 型状态机（无栅栏相位后

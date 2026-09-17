@@ -235,3 +235,53 @@ mod consumer_group_tests {
         assert!(!u.assignment.contains_key("t"), "退订后收回分配");
     }
 }
+
+// ---------- 多组管理 actor（块 b 协议面接线用） ----------
+
+pub struct CGHeartbeat {
+    pub group: String,
+    pub member_id: String,
+    pub member_epoch: i32,
+    pub subscribed: Vec<String>,
+    pub owned: BTreeMap<String, Vec<i32>>,
+    /// 订阅 topic 的分区数快照（handler 经 meta 查询后携带）
+    pub counts: Vec<(String, i32)>,
+    pub reply: tokio::sync::oneshot::Sender<HeartbeatResult>,
+}
+
+pub enum CGCmd {
+    Heartbeat(CGHeartbeat),
+}
+
+/// 每节点一个（组协调器 POC 全节点，FindCoordinator Type=0 回自身——与
+/// classic 同拓扑）。
+pub struct ConsumerGroups {
+    groups: HashMap<String, ConsumerGroup>,
+}
+
+impl ConsumerGroups {
+    pub fn spawn() -> tokio::sync::mpsc::Sender<CGCmd> {
+        let (tx, mut rx) = tokio::sync::mpsc::channel(256);
+        tokio::spawn(async move {
+            let mut groups: HashMap<String, ConsumerGroup> = HashMap::new();
+            while let Some(cmd) = rx.recv().await {
+                match cmd {
+                    CGCmd::Heartbeat(hb) => {
+                        let cg = groups.entry(hb.group.clone()).or_default();
+                        for (t, c) in hb.counts {
+                            cg.partition_counts.insert(t, c);
+                        }
+                        let res = cg.heartbeat(
+                            &hb.member_id,
+                            hb.member_epoch,
+                            hb.subscribed,
+                            hb.owned,
+                        );
+                        let _ = hb.reply.send(res);
+                    }
+                }
+            }
+        });
+        tx
+    }
+}

@@ -71,7 +71,14 @@ epoch 落后的心跳（fence 面，C9 的 InvCommitFencedMon 同构下沉为
 
 ## 6. 测试与交付切分
 
-- **a. 状态机+分配器**：ConsumerGroup actor（心跳循环/成员注册/
+- **a. 状态机+分配器 ✅（2026-09-17）**：consumer_group.rs（纯同步）+
+  多组管理 actor（CGCmd::Heartbeat，分区数快照随命令携带）；consumer_group
+  tests ×4 全绿（java 对拍/幂等续租/fence 三态/退订收回）。**块 b 已知
+  接线要点**：①Assignment 响应的 TopicPartitions 需要 TopicId（uuid）——
+  请求侧只带 TopicId，需路由表 by_id 反查 topic 名（RoutingTable 需补
+  name_for(tid)）；②分区数快照经 MetaCmd::Lookup 携带（TopicMeta 有
+  name/topic_id/partitions）；③fenced 映射 FencedMemberEpoch(82，需加
+  ErrorCode+语义表行)、未知成员 UNKNOWN_MEMBER_ID(25)。ConsumerGroup actor（心跳循环/成员注册/
   Range 分配/member-epoch fence/差分下发）+ 确定性单测（分配对拍 java
   RangeAssignor 金样）；
 - **b. 协议面**：68/69 handler + 宣告 + handlers_layout_tests 字节级回归；

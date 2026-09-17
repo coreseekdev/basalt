@@ -9,6 +9,7 @@
 use std::collections::HashMap;
 use std::time::{Duration, Instant};
 
+pub mod consumer_group;
 pub mod log;
 
 use log::OffsetLog;

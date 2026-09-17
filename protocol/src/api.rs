@@ -99,7 +99,10 @@ pub enum ErrorCode {
     IneligibleReplica = 71,
     NewLeaderElected = 72,
     OffsetMovedToTieredStorage = 73,
-    UnknownServer = 83,
+    // 83 官方语义 = ELIGIBLE_LEADERS_NOT_AVAILABLE（可重试；Errors.java
+    // 核对）——此前误名 UnknownServer（官方 UNKNOWN_SERVER = -1），事务面
+    // 曾误用作兜底给客户端错误的重试语义（review P1 实证后改兜底为 15）
+    EligibleLeadersNotAvailable = 83,
 }
 
 impl From<ErrorCode> for i16 {

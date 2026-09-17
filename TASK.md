@@ -100,7 +100,7 @@ Basalt：Rust 版 Kafka 兼容消息流平台
 | T-M3.3 | ⬜ | KIP-848 新消费组协议 | ConsumerGroupHeartbeat、服务端分配、增量 rebalance；Range/RoundRobin/Sticky 分配器 | 新旧协议混布 rebalance 收敛；客户端（kafka-clients 4.x）跑通 | T-M1.1 | [Kafka §5](../docs/01-apache-kafka.md) |
 | T-M3.4 | ⬜ | cooperative-sticky rebalance | 增量 partition 交接协议 | franz-go/rdkafka cooperative 模式跑通且无停顿式双全量 rebalance | T-M3.3 | [生态 §C](../docs/08-ecosystem.md) |
 | T-M3.5 🔬 | ⬜ | 生态真实负载 e2e | 三模板：rdkafka 手动 assign 消费（RW 式）；Vector 式 drain-then-commit；Bento 式 checkpoint_limit 背压 | 模板各自跑通含事务场景；docker-compose 一键拉起 | T-M3.2 | [生态 §A/B/C](../docs/08-ecosystem.md) |
-| T-M3.6 🔬 | 🟨 | 事务仿真与兼容专项 | 事务场景进仿真 harness（**Jepsen 三场景 ✅ jepsen_sim_tests 500 seeds 全绿 + 50/commit 档入 CI**；错误码分流语义表测试 ⬜ | 事务场景 ≥500 seeds；语义表 100% 覆盖 | T-M3.2, T-M2.5 | [测试 §3.2/§5](../docs/11-testing-strategy.md) |
+| T-M3.6 🔬 | 🟨 | 事务仿真与兼容专项 | 事务场景进仿真 harness（**Jepsen 三场景 ✅ jepsen_sim_tests 500 seeds 全绿 + 50/commit 档入 CI**；错误码分流语义表 ✅ error_semantics_tests（官方数值+retriable 分类双重锁定，统一映射函数三处收口） | 事务场景 ≥500 seeds；语义表 100% 覆盖 | T-M3.2, T-M2.5 | [测试 §3.2/§5](../docs/11-testing-strategy.md) |
 
 ## M4 生产化
 

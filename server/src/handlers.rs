@@ -237,6 +237,25 @@ struct Resolved {
     leader: i32,
 }
 
+/// StorageError → 线上错误码的**唯一**映射（T-M3.6 语义表面锁定；三处
+/// 调用点：produce / fetch / txn——兜底 15 可重试，勿用 83，见 api.rs 注）。
+pub(crate) fn storage_error_code(e: &StorageError) -> ErrorCode {
+    match e {
+        StorageError::CorruptBatch { .. } => ErrorCode::CorruptMessage,
+        StorageError::NotEnoughReplicas => ErrorCode::NotEnoughReplicas,
+        StorageError::OutOfOrderSequence(..) => ErrorCode::OutOfOrderSequence,
+        StorageError::InvalidProducerEpoch => ErrorCode::InvalidProducerEpoch,
+        StorageError::InvalidTxnState => ErrorCode::InvalidTxnState,
+        StorageError::InvalidProducerIdMapping => ErrorCode::InvalidProducerIdMapping,
+        StorageError::NotLeader => ErrorCode::NotLeaderOrFollower,
+        StorageError::OffsetOutOfRange(_) => ErrorCode::OffsetOutOfRange,
+        // 前事务 Prepare 残留（CONCURRENT_TRANSACTIONS 的 basalt 映射：
+        // 14 可重试，客户端退避重试；官方 51 的 20ms 快退避不做）
+        StorageError::Other(m) if m.contains("concurrent") => ErrorCode::CoordinatorLoadInProgress,
+        _ => ErrorCode::CoordinatorNotAvailable,
+    }
+}
+
 pub async fn produce(version: i16, acks: i16, targets: Vec<ProduceTarget>, ctx: &Ctx) -> Value {
     // 快照路由（clone Sender），borrow 不跨 await
     let resolved: Vec<Resolved> = {
@@ -309,15 +328,8 @@ pub async fn produce(version: i16, acks: i16, targets: Vec<ProduceTarget>, ctx: 
                         Err(_) => ProduceOutcome { base_offset: -1, last_offset: -1, log_append_time: now_ms(), error: None },
                     };
                     let err = match &out.error {
-                        Some(basalt_storage::StorageError::CorruptBatch { .. }) => ErrorCode::CorruptMessage,
-                        Some(StorageError::NotEnoughReplicas) => ErrorCode::NotEnoughReplicas,
-                        Some(StorageError::OutOfOrderSequence(..)) => ErrorCode::OutOfOrderSequence,
-                        Some(StorageError::InvalidProducerEpoch) => ErrorCode::InvalidProducerEpoch,
-                        Some(StorageError::InvalidTxnState) => ErrorCode::InvalidTxnState,
-                        Some(StorageError::NotLeader) => ErrorCode::NotLeaderOrFollower,
-                        Some(StorageError::OffsetOutOfRange(_)) => ErrorCode::OffsetOutOfRange,
-                        Some(_) => ErrorCode::UnknownServer,
                         None => ErrorCode::None,
+                        Some(e) => storage_error_code(e),
                     };
                     (Value::I16(err as i16), out.base_offset, out.last_offset, out.log_append_time)
                 }
@@ -440,11 +452,7 @@ pub async fn fetch(targets: Vec<FetchTarget>, ctx: &Ctx) -> Value {
             Some(rx) => match rx.await {
                 Ok(out) => {
                     if let Some(e) = &out.error {
-                        let code = match e {
-                            StorageError::NotLeader => ErrorCode::NotLeaderOrFollower,
-                            StorageError::OffsetOutOfRange(_) => ErrorCode::OffsetOutOfRange,
-                            _ => ErrorCode::UnknownServer,
-                        };
+                        let code = storage_error_code(e);
                         (code, Bytes::new(), -1, -1, -1)
                     } else {
                         match out.result {
@@ -705,4 +713,124 @@ pub async fn delete_records(req: &basalt_protocol::value::Struct, ctx: &Ctx) -> 
         responses.push(s([("Name", Value::str(name)), ("Partitions", Value::Array(pvals))]));
     }
     s([("ThrottleTimeMs", Value::I32(0)), ("Topics", Value::Array(responses))])
+}
+
+#[cfg(test)]
+mod error_semantics_tests {
+    //! T-M3.6 尾项：错误码分流语义表——官方数值 + retriable 分类**双重**
+    //! 锁定。权威面 = apache/kafka `Errors.java`（客户端重试决策依据）：
+    //! basalt 返回的每个码，客户端将按官方 retriable 标志决定重试或终止
+    //! ——数值对而分类错 = 客户端行为错（㊻/㊿ 同族教训）。
+
+    use basalt_protocol::api::ErrorCode;
+
+    /// (我们的变体, 官方名, 官方数值, Errors.java isRetriable)
+    const TABLE: &[(ErrorCode, &'static str, i16, bool)] = &[
+        (ErrorCode::None, "NONE", 0, false),
+        (ErrorCode::OffsetOutOfRange, "OFFSET_OUT_OF_RANGE", 1, true),
+        (ErrorCode::CorruptMessage, "CORRUPT_MESSAGE", 2, true),
+        (ErrorCode::NotLeaderOrFollower, "NOT_LEADER_OR_FOLLOWER", 6, true),
+        (ErrorCode::CoordinatorLoadInProgress, "COORDINATOR_LOAD_IN_PROGRESS", 14, true),
+        (ErrorCode::CoordinatorNotAvailable, "COORDINATOR_NOT_AVAILABLE", 15, true),
+        (ErrorCode::NotCoordinator, "NOT_COORDINATOR", 16, true),
+        (ErrorCode::MessageTooLarge, "MESSAGE_TOO_LARGE", 10, false),
+        (ErrorCode::RecordListTooLarge, "RECORD_LIST_TOO_LARGE", 18, false),
+        (ErrorCode::NotEnoughReplicas, "NOT_ENOUGH_REPLICAS", 19, true),
+        (ErrorCode::OutOfOrderSequence, "OUT_OF_ORDER_SEQUENCE", 45, true),
+        (ErrorCode::DuplicateSequenceNumber, "DUPLICATE_SEQUENCE_NUMBER", 46, false),
+        (ErrorCode::InvalidProducerEpoch, "INVALID_PRODUCER_EPOCH", 47, false),
+        (ErrorCode::InvalidProducerIdMapping, "INVALID_PRODUCER_ID_MAPPING", 48, false),
+        (ErrorCode::InvalidTxnState, "INVALID_TXN_STATE", 49, false),
+        (ErrorCode::InvalidProducerId, "INVALID_PRODUCER_ID", 50, false),
+        (ErrorCode::EligibleLeadersNotAvailable, "ELIGIBLE_LEADERS_NOT_AVAILABLE", 83, true),
+    ];
+
+    /// 官方数值权威表（Errors.java 转录，独立于我们枚举的第二真相源——
+    /// 两表逐项对撞即双向锁定）。
+    const OFFICIAL: &[(&str, i16)] = &[
+        ("NONE", 0),
+        ("OFFSET_OUT_OF_RANGE", 1),
+        ("CORRUPT_MESSAGE", 2),
+        ("NOT_LEADER_OR_FOLLOWER", 6),
+        ("COORDINATOR_LOAD_IN_PROGRESS", 14),
+        ("COORDINATOR_NOT_AVAILABLE", 15),
+        ("NOT_COORDINATOR", 16),
+        ("MESSAGE_TOO_LARGE", 10),
+        ("RECORD_LIST_TOO_LARGE", 18),
+        ("NOT_ENOUGH_REPLICAS", 19),
+        ("OUT_OF_ORDER_SEQUENCE", 45),
+        ("DUPLICATE_SEQUENCE_NUMBER", 46),
+        ("INVALID_PRODUCER_EPOCH", 47),
+        ("INVALID_PRODUCER_ID_MAPPING", 48),
+        ("INVALID_TXN_STATE", 49),
+        ("INVALID_PRODUCER_ID", 50),
+        ("ELIGIBLE_LEADERS_NOT_AVAILABLE", 83),
+    ];
+
+    #[test]
+    fn official_numbers_locked() {
+        for (code, name, want, _) in TABLE {
+            let official = OFFICIAL.iter().find(|(n, _)| n == name).unwrap();
+            assert_eq!(*code as i16, *want, "{name} 枚举判别值漂移");
+            assert_eq!(*want, official.1, "{name} 与官方转录表不一致");
+        }
+    }
+
+    #[test]
+    fn retriable_classification_matches_official() {
+        // 分类面独立转录（Errors.java isRetriable）：数值对而分类错 =
+        // 客户端行为错（83 误用作兜底即此类，㊿ 族）
+        let official_retriable: &[(&str, bool)] = &[
+            ("NONE", false),
+            ("OFFSET_OUT_OF_RANGE", true),
+            ("CORRUPT_MESSAGE", true),
+            ("NOT_LEADER_OR_FOLLOWER", true),
+            ("COORDINATOR_LOAD_IN_PROGRESS", true),
+            ("COORDINATOR_NOT_AVAILABLE", true),
+            ("NOT_COORDINATOR", true),
+            ("MESSAGE_TOO_LARGE", false),
+            ("RECORD_LIST_TOO_LARGE", false),
+            ("NOT_ENOUGH_REPLICAS", true),
+            ("OUT_OF_ORDER_SEQUENCE", true),
+            ("DUPLICATE_SEQUENCE_NUMBER", false),
+            ("INVALID_PRODUCER_EPOCH", false),
+            ("INVALID_PRODUCER_ID_MAPPING", false),
+            ("INVALID_TXN_STATE", false),
+            ("INVALID_PRODUCER_ID", false),
+            ("ELIGIBLE_LEADERS_NOT_AVAILABLE", true),
+        ];
+        for (code, name, _, retriable) in TABLE {
+            let official = official_retriable.iter().find(|(n, _)| n == name).unwrap();
+            assert_eq!(retriable, &official.1, "{name} retriable 分类漂移（{}）", *code as i16);
+        }
+    }
+
+    /// 统一映射函数的输出必须全部落在语义表内（无表外码逃逸到客户端）。
+    #[test]
+    fn storage_error_mapping_lands_in_table() {
+        use basalt_storage::error::StorageError;
+        let samples: Vec<StorageError> = vec![
+            StorageError::CorruptBatch { path: "p".into(), pos: 0, reason: "r".into() },
+            StorageError::NotEnoughReplicas,
+            StorageError::OutOfOrderSequence(3, 2),
+            StorageError::InvalidProducerEpoch,
+            StorageError::InvalidTxnState,
+            StorageError::InvalidProducerIdMapping,
+            StorageError::NotLeader,
+            StorageError::OffsetOutOfRange(7),
+            StorageError::Other("concurrent transaction".into()),
+            StorageError::Other("anything else".into()),
+        ];
+        for e in &samples {
+            let code = crate::handlers::storage_error_code(e);
+            let hit = TABLE.iter().find(|(c, _, _, _)| c == &code);
+            assert!(hit.is_some(), "{e:?} 映射到表外错误码 {}", code as i16);
+            // 终态 vs 可重试显式断言（分流面）
+            let (_, name, _, retriable) = hit.unwrap();
+            if e.to_string().contains("concurrent") {
+                assert!(retriable, "并发冲突必须可重试");
+            }
+            let _ = name;
+        }
+    }
 }

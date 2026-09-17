@@ -460,16 +460,7 @@ pub async fn init_producer_id_transactional(txn_id: &str, ctx: &crate::handlers:
 }
 
 fn storage_err_to_code(e: &StorageError) -> ErrorCode {
-    match e {
-        StorageError::InvalidProducerEpoch => ErrorCode::InvalidProducerEpoch,
-        StorageError::InvalidTxnState => ErrorCode::InvalidTxnState,
-        StorageError::InvalidProducerIdMapping => ErrorCode::InvalidProducerIdMapping,
-        StorageError::Other(m) if m.contains("concurrent") => ErrorCode::CoordinatorLoadInProgress,
-        // 兜底 15（可重试，客户端重查 coordinator）——83 常量实为
-        // EligibleLeadersNotAvailable（review P1-1 核对 Errors.java），
-        // 事务面误用它会给客户端错的重试语义
-        _ => ErrorCode::CoordinatorNotAvailable,
-    }
+    crate::handlers::storage_error_code(e)
 }
 
 /// controller 地址解析（FindCoordinator Type=Transaction / TxnOffsetCommit

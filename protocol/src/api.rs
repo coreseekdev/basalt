@@ -103,6 +103,9 @@ pub enum ErrorCode {
     // 核对）——此前误名 UnknownServer（官方 UNKNOWN_SERVER = -1），事务面
     // 曾误用作兜底给客户端错误的重试语义（review P1 实证后改兜底为 15）
     EligibleLeadersNotAvailable = 83,
+    // 82 = FENCED_MEMBER_EPOCH（KIP-848：member-epoch 落后的心跳，客户端
+    // 重新加入语义；ADR-19 块 b 消费组协议用）
+    FencedMemberEpoch = 82,
 }
 
 impl From<ErrorCode> for i16 {

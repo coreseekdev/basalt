@@ -1,0 +1,23 @@
+# T-M3.5 一键拉起：docker compose up -d --build 起 broker，
+# testing/e2e/run_e2e_docker.sh 跑 4 个 rdkafka 模板后收尾 down。
+# BASALT_HOST=localhost：客户端在宿主机连 localhost:9092（直映射端口），
+# broker advertised 地址回指 localhost 即可闭环。
+services:
+  basalt:
+    build:
+      context: .
+      dockerfile: deploy/docker/Dockerfile.e2e
+    image: basalt-e2e:latest
+    container_name: basalt-e2e
+    environment:
+      BASALT_HOST: localhost
+      BASALT_PORT: "9092"
+      BASALT_DATA_DIR: /var/lib/basalt
+      BASALT_NUM_PARTITIONS: "2"
+      BASALT_METRICS_PORT: "9094"
+      BASALT_LOG_LEVEL: info
+    ports:
+      - "9092:9092"
+      - "9093:9093"   # 预留（多节点内部面；单节点未监听，暴露与根 Dockerfile 对齐）
+      - "9094:9094"   # metrics
+    restart: "no"

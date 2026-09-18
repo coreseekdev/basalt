@@ -1,0 +1,8 @@
+# 离线本地验证 override（自动被 docker compose 装载）：宿主 glibc(2.43)
+# 高于本地镜像内 glibc，经宿主 loader + 库目录直启二进制。有 registry
+# 访问时删除本文件，用 Dockerfile.e2e 的自举构建变体即可。
+services:
+  basalt:
+    volumes:
+      - /usr/lib/x86_64-linux-gnu:/host-libs:ro
+    entrypoint: ["/host-libs/ld-linux-x86-64.so.2", "--library-path", "/host-libs", "/usr/local/bin/basalt-server"]

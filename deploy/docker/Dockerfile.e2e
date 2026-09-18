@@ -1,0 +1,19 @@
+# e2e 一键镜像（T-M3.5）：装载主机构建的 release 二进制（同根 Dockerfile
+# 模式——离线环境无法拉取 rust 基础镜像做容器内自举，且宿主/容器同架构
+# glibc 对齐用 ubuntu:24.04）。容器内自举构建的历史版本见 git（当时依赖
+# docker hub 可达）。
+# 与仓库根 Dockerfile 的分工：本镜像供 docker-compose.yml 一键拉起，
+# BASALT_* 档位与本地 run_e2e.sh 一致（NUM_PARTITIONS=2 为模板前提）。
+FROM ubuntu:24.04
+# 离线构建：不跑 apt（basalt-server 走明文 Kafka wire，无需 CA 包）
+COPY target/release/basalt-server /usr/local/bin/basalt-server
+# BASALT_* 环境变量与本地 run_e2e.sh 档位一致
+ENV BASALT_HOST=localhost \
+    BASALT_PORT=9092 \
+    BASALT_DATA_DIR=/var/lib/basalt \
+    BASALT_NUM_PARTITIONS=2 \
+    BASALT_METRICS_PORT=9094 \
+    BASALT_LOG_LEVEL=info
+EXPOSE 9092 9093 9094
+VOLUME ["/var/lib/basalt"]
+ENTRYPOINT ["/usr/local/bin/basalt-server"]

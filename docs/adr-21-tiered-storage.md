@@ -66,8 +66,13 @@ tokio::spawn 改 OS 线程——阻塞 IO 专用线程纪律同 Log::open）；�
 ## 3. 已知边界（v1）
 
 - cloud-direct（S3）适配器未接：契约面已按 Arroyo 四原语收窄，换入即用；
-- per-topic 存储模式未做（broker 级开关）；分层的 retention 联动（对象
-  侧过期删除）未做——对象保留全量，本地侧 retention 照旧；
+- per-topic 存储模式 **✅ v2 已落地（2026-09-18）**：CreateTopics configs
+  `basalt.storage.mode=tiered` → EnsureTopic → ClusterRecord/ReplicaAssignment
+  （serde default + WAL 长度守卫 + 快照尾字节）→ actor spawn 参数化
+  （env 仍为 broker 级缺省，v1 行为保留）。e2e：run_tiered_pertopic.sh
+  （同机双题分叉：configs 题 5 对象/本地回收至 active，普通题 0 对象/多段
+  照旧，双题全量消费正确）；分层的 retention 联动（对象侧过期删除）未做
+  ——对象保留全量，本地侧 retention 照旧；
 - fetch 对已回收段的读穿透为整段对象读（段有界）；无跨段合并优化；
 - 控制器/多节点：tiered 对象存储为节点本地配置（各副本各自上传各自的
   段对象，key 含 base offset 天然幂等——同 base 同内容，create CAS 去重）。

@@ -75,6 +75,7 @@ pub enum MetaCmd {
         name: String,
         partitions: i32,
         rf: i32,
+        tiered: bool,
         reply: oneshot::Sender<bool>,
     },
     /// CreateTopics 语义：缺则按请求的 partitions/rf 建，存则查回。
@@ -82,6 +83,8 @@ pub enum MetaCmd {
         name: String,
         partitions: i32,
         rf: i32,
+        /// per-topic 分层存储（CreateTopics configs: basalt.storage.mode）
+        tiered: bool,
         reply: oneshot::Sender<(Vec<TopicMeta>, Vec<BrokerInfo>)>,
     },
     /// 删题（转发控制器，raft 复制后本地 assignment 消失）。
@@ -249,7 +252,7 @@ impl MetaService {
                                 if let Some(m) = topic_meta_from_cluster(&self.cluster, n) {
                                     out.push(m);
                                 } else if allow_create {
-                                    if self.create_via_controller(n, self.cfg.num_partitions, self.cfg.default_rf).await {
+                                    if self.create_via_controller(n, self.cfg.num_partitions, self.cfg.default_rf, false).await {
                                         if let Some(m) = topic_meta_from_cluster(&self.cluster, n) {
                                             out.push(m);
                                         }
@@ -261,18 +264,18 @@ impl MetaService {
                     let brokers: Vec<BrokerInfo> = self.cluster.brokers.values().cloned().collect();
                     let _ = reply.send((out, brokers));
                 }
-                MetaCmd::CreateTopic { name, partitions, rf, reply } => {
-                    let ok = self.create_via_controller(&name, partitions, rf).await;
+                MetaCmd::CreateTopic { name, partitions, rf, tiered, reply } => {
+                    let ok = self.create_via_controller(&name, partitions, rf, tiered).await;
                     let _ = reply.send(ok);
                 }
-                MetaCmd::EnsureTopic { name, partitions, rf, reply } => {
+                MetaCmd::EnsureTopic { name, partitions, rf, tiered, reply } => {
                     // CreateTopics 语义：请求的 NumPartitions/RF 是**建题参数**
                     // 而非查询——缺失时按请求值建（≠ Lookup allow_create 的
                     // broker 默认值；账本 59：请求值被默认值覆盖）。
                     let mut out = Vec::new();
                     if let Some(m) = topic_meta_from_cluster(&self.cluster, &name) {
                         out.push(m);
-                    } else if self.create_via_controller(&name, partitions, rf).await {
+                    } else if self.create_via_controller(&name, partitions, rf, tiered).await {
                         if let Some(m) = topic_meta_from_cluster(&self.cluster, &name) {
                             out.push(m);
                         }
@@ -358,7 +361,7 @@ impl MetaService {
         }
     }
 
-    async fn create_via_controller(&mut self, name: &str, partitions: i32, rf: i32) -> bool {
+    async fn create_via_controller(&mut self, name: &str, partitions: i32, rf: i32, tiered: bool) -> bool {
         // 创建：本机持有控制器 actor → 直调；否则 RPC 到控制器内部端口
         if let Some(tx) = &self.controller_tx {
             let (txr, rxr) = oneshot::channel();
@@ -367,6 +370,7 @@ impl MetaService {
                     name: name.to_string(),
                     partitions,
                     rf,
+                    tiered,
                     reply: txr,
                 })
                 .await;
@@ -376,7 +380,7 @@ impl MetaService {
         } else {
             let Some(addr) = self.controller_addr.clone() else { return false };
             let client = crate::internal::InternalClient::new(addr);
-            if client.create_topic(name, partitions, rf).await.is_err() {
+            if client.create_topic(name, partitions, rf, tiered).await.is_err() {
                 return false;
             }
         }
@@ -429,7 +433,7 @@ impl MetaService {
                     retention_ms: 7 * 24 * 3600 * 1000,
                     retention_max_bytes: 0,
                 };
-                match PartitionActor::spawn(a.topic.clone(), a.partition, self.cfg.node_id, dir, opts, self.cfg.replica_config(), self.pool.clone()) {
+                match PartitionActor::spawn(a.topic.clone(), a.partition, self.cfg.node_id, dir, opts, self.cfg.replica_config(), self.pool.clone(), a.tiered) {
                     Ok(tx) => {
                         entry.1.insert(a.partition);
                         let route = Route { tx: tx.clone(), leader: a.leader, epoch: a.epoch, replicas: a.replicas.clone() };

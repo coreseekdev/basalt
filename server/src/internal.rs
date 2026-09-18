@@ -159,12 +159,13 @@ impl InternalClient {
         }
     }
 
-    pub async fn create_topic(&self, name: &str, partitions: i32, rf: i32) -> std::io::Result<Bytes> {
+    pub async fn create_topic(&self, name: &str, partitions: i32, rf: i32, tiered: bool) -> std::io::Result<Bytes> {
         let mut p = Vec::new();
         p.extend_from_slice(&(name.len() as i16).to_be_bytes());
         p.extend_from_slice(name.as_bytes());
         p.extend_from_slice(&partitions.to_be_bytes());
         p.extend_from_slice(&rf.to_be_bytes());
+        p.push(tiered as u8);
         self.call(MSG_CREATE_TOPIC, &p).await
     }
 
@@ -202,7 +203,13 @@ pub enum ControllerCmd {
     Register { info: BrokerInfo, reply: oneshot::Sender<()> },
     Heartbeat { node_id: i32 },
     Sync { version: u64, reply: oneshot::Sender<Option<Vec<u8>>> },
-    CreateTopic { name: String, partitions: i32, rf: i32, reply: oneshot::Sender<()> },
+    CreateTopic {
+        name: String,
+        partitions: i32,
+        rf: i32,
+        tiered: bool,
+        reply: oneshot::Sender<()>,
+    },
     DeleteTopic { name: String, reply: oneshot::Sender<bool> },
     ApplySnapshot { state: ClusterState },
     /// 引擎模式跨节点 propose 转发（MSG_CTRL_PROPOSE 落地）：本节点为 raft
@@ -433,7 +440,7 @@ impl Controller {
                     None
                 });
             }
-            ControllerCmd::CreateTopic { name, partitions, rf, reply } => {
+            ControllerCmd::CreateTopic { name, partitions, rf, tiered, reply } => {
                 eprintln!("CTRL-CREATE node={} name={}", self.node_id, name);
                 let exists = self.state.assignments.iter().any(|a| a.topic == name);
                 // rf 守卫：多副本建题时 broker 未注册齐会按不完整集群算
@@ -446,12 +453,12 @@ impl Controller {
                     return;
                 }
                 if self.engine.is_some() {
-                    if let Err(m) = self.apply_via_engine(&ClusterRecord::CreateTopic { name: name.clone(), partitions, rf }) {
+                    if let Err(m) = self.apply_via_engine(&ClusterRecord::CreateTopic { name: name.clone(), partitions, rf, tiered }) {
                         tracing::error!(topic=%name, error=%m, "CreateTopic raft propose failed");
                     }
                 } else {
                     if !exists {
-                        self.apply_and_persist(&ClusterRecord::CreateTopic { name, partitions, rf });
+                        self.apply_and_persist(&ClusterRecord::CreateTopic { name, partitions, rf, tiered });
                     }
                 }
                 let _ = reply.send(());
@@ -669,12 +676,13 @@ fn encode_record(rec: &ClusterRecord) -> Vec<u8> {
             b.extend_from_slice(br.host.as_bytes());
             b.extend_from_slice(&(br.port as i32).to_be_bytes());
         }
-        ClusterRecord::CreateTopic { name, partitions, rf } => {
+        ClusterRecord::CreateTopic { name, partitions, rf, tiered } => {
             b.push(2);
             b.extend_from_slice(&(name.len() as i16).to_be_bytes());
             b.extend_from_slice(name.as_bytes());
             b.extend_from_slice(&partitions.to_be_bytes());
             b.extend_from_slice(&rf.to_be_bytes());
+            b.push(*tiered as u8);
         }
         ClusterRecord::DeleteTopic { name } => {
             b.push(4);
@@ -723,7 +731,9 @@ fn decode_record(data: &[u8]) -> Option<ClusterRecord> {
             let name = gstr(&mut p);
             let partitions = g32(&mut p);
             let rf = g32(&mut p);
-            ClusterRecord::CreateTopic { name, partitions, rf }
+            // tiered 尾字节：旧 WAL 记录缺失 → false（持久化面兼容）
+            let tiered = p < data.len() && data[p] != 0;
+            ClusterRecord::CreateTopic { name, partitions, rf, tiered }
         }
         3 => {
             let topic = gstr(&mut p);
@@ -1051,13 +1061,13 @@ async fn handle_internal_conn(
                 Bytes::from(vec![if ok { 1 } else { 0 }])
             }
             MSG_CREATE_TOPIC => {
-                let Ok((name, partitions, rf)) = parse_create(payload) else {
+                let Ok((name, partitions, rf, tiered)) = parse_create(payload) else {
                     sock.write_all(&short_frame()).await?;
                     return Ok(());
                 };
                 if let Some(tx) = &ctx.controller_tx {
                     let (txr, rxr) = tokio::sync::oneshot::channel();
-                    let _ = tx.send(ControllerCmd::CreateTopic { name, partitions, rf, reply: txr }).await;
+                    let _ = tx.send(ControllerCmd::CreateTopic { name, partitions, rf, tiered, reply: txr }).await;
                     let _ = rxr.await;
                 }
                 Bytes::from(0i16.to_be_bytes().to_vec())
@@ -1161,7 +1171,7 @@ fn parse_register(p: &[u8]) -> std::io::Result<(i32, String, u16)> {
     Ok((node_id, host, port))
 }
 
-fn parse_create(p: &[u8]) -> std::io::Result<(String, i32, i32)> {
+fn parse_create(p: &[u8]) -> std::io::Result<(String, i32, i32, bool)> {
     if p.len() < 2 {
         return Err(std::io::Error::other("short create"));
     }
@@ -1172,7 +1182,9 @@ fn parse_create(p: &[u8]) -> std::io::Result<(String, i32, i32)> {
     let name = String::from_utf8_lossy(&p[2..2 + n]).into_owned();
     let partitions = i32::from_be_bytes(p[2 + n..6 + n].try_into().unwrap());
     let rf = i32::from_be_bytes(p[6 + n..10 + n].try_into().unwrap());
-    Ok((name, partitions, rf))
+    // tiered 尾字节（T-M4.3 v2）；旧客户端缺字节 → false
+    let tiered = p.len() > 10 + n && p[10 + n] != 0;
+    Ok((name, partitions, rf, tiered))
 }
 
 fn parse_fetch_slice(p: &[u8]) -> std::io::Result<(String, i32, i32, i64, usize)> {
@@ -1212,7 +1224,7 @@ mod failover_tests {
                 node_id: i, host: "h".into(), port: 9000 + i as u16,
             }));
         }
-        ctrl.apply_and_persist(&ClusterRecord::CreateTopic { name: "t".into(), partitions: 1, rf: 3 });
+        ctrl.apply_and_persist(&ClusterRecord::CreateTopic { name: "t".into(), partitions: 1, rf: 3, tiered: false });
         // p0 的 leader 迁到 node1，随后 node1 死亡（无心跳）
         ctrl.apply_and_persist(&ClusterRecord::LeaderChange { topic: "t".into(), partition: 0, leader: 1, epoch: 1 });
         let now = Instant::now();

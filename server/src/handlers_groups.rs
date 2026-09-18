@@ -354,6 +354,15 @@ pub async fn create_topics(req: &basalt_protocol::value::Struct, ctx: &Ctx) -> V
             let name = ts.get("Name").map(|v| v.as_str().to_string()).unwrap_or_default();
             let num_partitions = ts.get("NumPartitions").map(|v| v.as_i32()).unwrap_or(1);
             let rf = ts.get("ReplicationFactor").map(|v| v.as_i32()).unwrap_or(1);
+            // per-topic 分层存储（T-M4.3 v2）：configs 键 basalt.storage.mode=tiered
+            let tiered = match ts.get("Configs") {
+                Some(Value::Array(cfgs)) => cfgs.iter().any(|c| {
+                    let Value::Struct(cs) = c else { return false };
+                    cs.get("Name").map(|v| v.as_str()) == Some("basalt.storage.mode")
+                        && cs.get("Value").map(|v| v.as_str()) == Some("tiered")
+                }),
+                _ => false,
+            };
             let (reply_tx, reply_rx) = oneshot::channel();
             // EnsureTopic：请求的 NumPartitions/RF 是建题参数（≠ Lookup
             // allow_create 的 broker 默认——那会把请求值静默覆盖，账本 59）
@@ -361,6 +370,7 @@ pub async fn create_topics(req: &basalt_protocol::value::Struct, ctx: &Ctx) -> V
                 name: name.clone(),
                 partitions: num_partitions,
                 rf,
+                tiered,
                 reply: reply_tx,
             }).await;
             let (found, _brokers) = reply_rx.await.unwrap_or_default();

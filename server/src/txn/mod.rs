@@ -676,6 +676,7 @@ mod coordinator_tests {
             LogOptions { segment_max_bytes: 1 << 30, fsync: FsyncSchedule::Os, retention_ms: 0, retention_max_bytes: 0 },
             ReplicaConfig { min_insync: 1, isr_lag: Duration::from_millis(500), transaction_timeout: Duration::from_secs(60) },
             pool,
+            false,
         )
         .unwrap();
         ptx.send(PartitionCmd::SetRole { leader: true, epoch: 1, replicas: vec![0] }).await.unwrap();
@@ -1011,6 +1012,7 @@ mod coordinator_review_fixes_tests {
             LogOptions { segment_max_bytes: 1 << 30, fsync: FsyncSchedule::Os, retention_ms: 0, retention_max_bytes: 0 },
             ReplicaConfig { min_insync: 1, isr_lag: Duration::from_millis(500), transaction_timeout: Duration::from_secs(60) },
             pool,
+            false,
         )
         .unwrap();
         ptx.send(PartitionCmd::SetRole { leader: true, epoch: 1, replicas: vec![0] }).await.unwrap();
@@ -1256,6 +1258,7 @@ mod jepsen_sim_tests {
             LogOptions { segment_max_bytes: 1 << 30, fsync: FsyncSchedule::Os, retention_ms: 0, retention_max_bytes: 0 },
             crate::config::ReplicaConfig { min_insync: 1, isr_lag: Duration::from_millis(500), transaction_timeout: Duration::from_secs(600) },
             Arc::new(BufferPool::new()),
+            false,
         ).unwrap();
         tx.send(crate::partition::PartitionCmd::SetRole { leader: true, epoch: 1, replicas: vec![0] }).await.unwrap();
         tx

@@ -322,11 +322,15 @@ impl PartitionActor {
         opts: LogOptions,
         repl: ReplicaConfig,
         pool: std::sync::Arc<BufferPool>,
+        // per-topic 分层模式（T-M4.3 v2：CreateTopics configs）；env 仍是
+        // broker 级缺省（topic 未显式指定时跟随——v1 行为保留）
+        tiered_topic: bool,
     ) -> std::io::Result<mpsc::Sender<PartitionCmd>> {
         let (tx, rx) = mpsc::channel(1024);
         // Log::open 是阻塞 IO：专用线程打开后移交 actor task
         let (opened_tx, opened_rx) = std::sync::mpsc::channel();
-        let tiered_mode = std::env::var("BASALT_STORAGE_MODE").as_deref() == Ok("tiered");
+        let tiered_mode =
+            tiered_topic || std::env::var("BASALT_STORAGE_MODE").as_deref() == Ok("tiered");
         let open_name = name.clone();
         let open_index = index;
         let (offload_tx, offload_rx) = mpsc::channel::<OffloadJob>(64);
@@ -1739,6 +1743,7 @@ mod truncate_fencing_tests {
             LogOptions { segment_max_bytes: 1 << 30, fsync: FsyncSchedule::Os, retention_ms: 0, retention_max_bytes: 0 },
             ReplicaConfig { min_insync: 1, isr_lag: Duration::from_millis(500), transaction_timeout: Duration::from_secs(60) },
             pool,
+            false,
         )
         .unwrap();
 
@@ -1806,6 +1811,7 @@ mod truncate_fencing_tests {
             LogOptions { segment_max_bytes: 1 << 30, fsync: FsyncSchedule::Os, retention_ms: 0, retention_max_bytes: 0 },
             ReplicaConfig { min_insync: 1, isr_lag: Duration::from_millis(500), transaction_timeout: Duration::from_secs(60) },
             pool,
+            false,
         ).unwrap();
         tx.send(PartitionCmd::SetRole { leader: true, epoch: 1, replicas: vec![0, 1, 2] }).await.unwrap();
 
@@ -1858,6 +1864,7 @@ mod truncate_fencing_tests {
             LogOptions { segment_max_bytes: 1 << 30, fsync: FsyncSchedule::Os, retention_ms: 0, retention_max_bytes: 0 },
             ReplicaConfig { min_insync: 1, isr_lag: Duration::from_millis(500), transaction_timeout: Duration::from_secs(60) },
             pool,
+            false,
         )
         .unwrap();
         tx.send(PartitionCmd::SetRole { leader: true, epoch: 1, replicas: vec![0] }).await.unwrap();
@@ -1932,6 +1939,7 @@ mod frozen_face_tests {
             LogOptions { segment_max_bytes: 1 << 30, fsync: FsyncSchedule::Os, retention_ms: 0, retention_max_bytes: 0 },
             ReplicaConfig { min_insync: 1, isr_lag: Duration::from_millis(500), transaction_timeout: Duration::from_secs(60) },
             pool,
+            false,
         )
         .unwrap();
 
@@ -2015,6 +2023,7 @@ mod idempotence_tests {
             LogOptions { segment_max_bytes: 1 << 30, fsync: FsyncSchedule::Os, retention_ms: 0, retention_max_bytes: 0 },
             ReplicaConfig { min_insync: 1, isr_lag: Duration::from_millis(500), transaction_timeout: Duration::from_secs(60) },
             pool,
+            false,
         ).unwrap();
         tx.send(PartitionCmd::SetRole { leader: true, epoch: 1, replicas: vec![0] }).await.unwrap();
         (tx, dir)
@@ -2125,7 +2134,7 @@ mod txn_tests {
 
     async fn spawn_on(dir: std::path::PathBuf, txn_timeout: Duration) -> mpsc::Sender<PartitionCmd> {
         let pool = std::sync::Arc::new(BufferPool::new());
-        let tx = PartitionActor::spawn("txn".into(), 0, 0, dir, opts(), cfg(txn_timeout), pool).unwrap();
+        let tx = PartitionActor::spawn("txn".into(), 0, 0, dir, opts(), cfg(txn_timeout), pool, false).unwrap();
         tx.send(PartitionCmd::SetRole { leader: true, epoch: 1, replicas: vec![0] }).await.unwrap();
         tx
     }

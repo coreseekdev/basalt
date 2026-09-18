@@ -63,6 +63,7 @@ pub mod handlers_layout_tests {
                     replicas: vec![0],
                     leader: 0,
                     epoch: 1,
+                    tiered: false,
                 });
             }
         }
@@ -358,7 +359,7 @@ pub mod handlers_layout_tests {
             let mut state = basalt_metadata::cluster::ClusterState::default();
             state.brokers.insert(0, basalt_metadata::cluster::BrokerInfo { node_id: 0, host: "localhost".into(), port: 9092 });
             state.assignments.push(basalt_metadata::cluster::ReplicaAssignment {
-                topic: "t1".into(), partition: 0, replicas: vec![0], leader: 0, epoch: 1,
+                topic: "t1".into(), partition: 0, replicas: vec![0], leader: 0, epoch: 1, tiered: false,
             });
             let _ = ctx.meta_tx.send(MetaCmd::ApplyCluster(Box::new(state))).await;
             std::thread::sleep(std::time::Duration::from_millis(20));
@@ -884,6 +885,7 @@ pub mod handlers_layout_tests {
             LogOptions { segment_max_bytes: 1 << 30, fsync: FsyncSchedule::Os, retention_ms: 0, retention_max_bytes: 0 },
             ReplicaConfig { min_insync: 1, isr_lag: std::time::Duration::from_millis(500), transaction_timeout: std::time::Duration::from_secs(60) },
             pool,
+            false,
         ).unwrap();
         ptx.send(PartitionCmd::SetRole { leader: true, epoch: 1, replicas: vec![0] }).await.unwrap();
         // marker 路由器（内存直连）

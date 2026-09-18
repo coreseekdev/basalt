@@ -12,6 +12,10 @@ pub struct ReplicaAssignment {
     pub replicas: Vec<i32>,
     pub leader: i32,
     pub epoch: i32,
+    /// 分层存储模式（T-M4.3 v2：CreateTopics configs 指定；serde default
+    /// 兼容旧快照/旧记录）
+    #[serde(default)]
+    pub tiered: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
@@ -31,7 +35,13 @@ pub struct ClusterState {
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub enum ClusterRecord {
     RegisterBroker(BrokerInfo),
-    CreateTopic { name: String, partitions: i32, rf: i32 },
+    CreateTopic {
+        name: String,
+        partitions: i32,
+        rf: i32,
+        #[serde(default)]
+        tiered: bool,
+    },
     DeleteTopic { name: String },
     LeaderChange { topic: String, partition: i32, leader: i32, epoch: i32 },
 }
@@ -42,7 +52,7 @@ impl ClusterState {
             ClusterRecord::RegisterBroker(b) => {
                 self.brokers.insert(b.node_id, b.clone());
             }
-            ClusterRecord::CreateTopic { name, partitions, rf } => {
+            ClusterRecord::CreateTopic { name, partitions, rf, tiered } => {
                 // 幂等：同名 topic 已存在则整体 no-op（metadata 重试打到不同
                 // 节点会产生重复 CreateTopic 记录；重复 push 使同一分区存在
                 // 多份 assignment，LeaderChange 只改第一份，metadata 可能
@@ -68,6 +78,7 @@ impl ClusterState {
                     self.assignments.push(ReplicaAssignment {
                         topic: name.clone(),
                         partition: p,
+                        tiered: *tiered,
                         replicas: replicas.clone(),
                         leader,
                         epoch: 0,
@@ -118,6 +129,7 @@ impl ClusterState {
             }
             b.extend_from_slice(&a.leader.to_be_bytes());
             b.extend_from_slice(&a.epoch.to_be_bytes());
+            b.push(a.tiered as u8);
         }
         b
     }
@@ -171,7 +183,9 @@ impl ClusterState {
             }
             let leader = r.g32();
             let epoch = r.g32();
-            st.assignments.push(ReplicaAssignment { topic, partition, replicas, leader, epoch });
+            let tiered = r.b[r.p] != 0;
+            r.p += 1;
+            st.assignments.push(ReplicaAssignment { topic, partition, replicas, leader, epoch, tiered });
         }
         Some(st)
     }
@@ -192,7 +206,7 @@ mod tests {
         st.apply(&ClusterRecord::RegisterBroker(BrokerInfo { node_id: 0, host: "h0".into(), port: 9092 }));
         st.apply(&ClusterRecord::RegisterBroker(BrokerInfo { node_id: 1, host: "h1".into(), port: 9093 }));
         st.apply(&ClusterRecord::RegisterBroker(BrokerInfo { node_id: 2, host: "h2".into(), port: 9094 }));
-        st.apply(&ClusterRecord::CreateTopic { name: "t".into(), partitions: 2, rf: 3 });
+        st.apply(&ClusterRecord::CreateTopic { name: "t".into(), partitions: 2, rf: 3, tiered: false });
         assert_eq!(st.assignment("t", 0).unwrap().replicas.len(), 3);
         st.apply(&ClusterRecord::LeaderChange { topic: "t".into(), partition: 0, leader: 1, epoch: 1 });
         let enc = st.encode();

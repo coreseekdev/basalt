@@ -15,6 +15,7 @@ pub mod key {
     pub const DESCRIBE_GROUPS: i16 = 15;
     pub const LIST_GROUPS: i16 = 16;
     pub const SASL_HANDSHAKE: i16 = 17;
+    pub const SASL_AUTHENTICATE: i16 = 36;
     pub const API_VERSIONS: i16 = 18;
     pub const CREATE_TOPICS: i16 = 19;
     pub const DELETE_TOPICS: i16 = 20;
@@ -116,6 +117,9 @@ pub enum ErrorCode {
     // 81 = GROUP_MAX_SIZE_REACHED（KIP-848 组容量上限；Errors.java:364 双源
     // 核对 81 非 68——不可重试。研究对照行动清单 P2）
     GroupMaxSizeReached = 81,
+    // 58 = SASL_AUTHENTICATION_FAILED（SASL 面认证失败：proof 不匹配/未知
+    // 用户；可重试性由客户端决定——Kafka broker 回该错误后关闭连接）
+    SaslAuthenticationFailed = 58,
 }
 
 impl From<ErrorCode> for i16 {
@@ -157,6 +161,14 @@ pub fn supported_versions() -> &'static [(i16, i16, i16)] {
         (key::DESCRIBE_GROUPS, 0, 5),
         (key::LIST_GROUPS, 0, 4),
         (key::OFFSET_FOR_LEADER_EPOCH, 0, 5),
+        // SASL 面（T-S1）：无鉴权模式下也宣告——客户端仅在配置了 SASL 时才走
+        // 17/36；authenticate 宣告 0-2（v2 flexible，客户端取公共最大）
+        (key::SASL_HANDSHAKE, 0, 1),
+        (key::SASL_AUTHENTICATE, 0, 2),
+        // 管理面对齐（T-S4，有限兼容）：DescribeConfigs schema 已删 v0，
+        // 基线 v1；DescribeCluster 全区间（v1 EndpointType / v2 IsFenced）
+        (key::DESCRIBE_CLUSTER, 0, 2),
+        (key::DESCRIBE_CONFIGS, 1, 4),
         // KIP-848 新消费组协议（ADR-19 块 b/c）：heartbeat 宣告 0-1——
         // franz-go v1.21 的 should848 硬性 supportsKIP848v1()（只认 broker
         // 宣告 max≥1，v0 宣告 = 客户端静默回退 classic 路径）。v1 差异：

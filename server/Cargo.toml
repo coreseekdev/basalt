@@ -34,6 +34,9 @@ raft-proto = { version = "0.7", features = ["protobuf-codec"] }
 protobuf = "2"
 slog = "2"
 crc32c = { workspace = true }
+tokio-rustls = "0.26"
+rustls = { version = "0.23", default-features = false, features = ["std", "aws-lc-rs", "tls12"] }
+rustls-pki-types = "1"
 
 [lints]
 workspace = true

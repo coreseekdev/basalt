@@ -16,6 +16,7 @@ mod internal;
 mod meta;
 mod partition;
 mod handlers_txn;
+mod tls;
 mod txn;
 
 use basalt_storage::pool::BufferPool;
@@ -45,6 +46,89 @@ fn controller_peer(cfg: &Config) -> Option<(i32, String, u16)> {
     cluster_peers(cfg).into_iter().min_by_key(|(id, _, _)| *id)
 }
 
+/// 每连接 Ctx 快照（明文/TLS listener 共用）
+fn ctx_for(c: &handlers::Ctx, pool: std::sync::Arc<BufferPool>) -> handlers::Ctx {
+    handlers::Ctx {
+        node_id: c.node_id,
+        controller_id: c.controller_id,
+        host: c.host.clone(),
+        port: c.port,
+        all_brokers: Vec::new(),
+        meta_tx: c.meta_tx.clone(),
+        group_tx: c.group_tx.clone(),
+        cg_tx: c.cg_tx.clone(),
+        routes_rx: c.routes_rx.clone(),
+        txn_tx: c.txn_tx.clone(),
+        brokers_cache: std::sync::Mutex::new(c.brokers_cache.lock().unwrap().clone()),
+        pool,
+        cluster_id: c.cluster_id.clone(),
+        segment_max_bytes: c.segment_max_bytes,
+        num_partitions: c.num_partitions,
+        min_isr: c.min_isr,
+        txn_timeout_ms: c.txn_timeout_ms,
+    }
+}
+
+/// TLS accept loop（'static：Ctx 经 CTX 全局取，pool 所有权移交）
+async fn tls_accept_loop(
+    l: tokio::net::TcpListener,
+    tls_cfg: std::sync::Arc<rustls::ServerConfig>,
+    pool: std::sync::Arc<BufferPool>,
+) {
+    let acceptor = tokio_rustls::TlsAcceptor::from(tls_cfg);
+    let ctx_ref = CTX.get().expect("ctx");
+    // 通告地址跟随客户端所连 listener（Kafka 语义：metadata 按请求到达口
+    // 通告对应 listener 地址）——否则 SSL 客户端 bootstrap 后被重定向到
+    // 明文口，TLS 面形同虚设
+    let adv_port = l.local_addr().map(|a| a.port()).unwrap_or(0);
+    loop {
+        match l.accept().await {
+            Ok((sock, peer)) => {
+                let mut ctx = ctx_for(ctx_ref, pool.clone());
+                if adv_port != 0 {
+                    ctx.port = adv_port;
+                }
+                let pool = pool.clone();
+                let acceptor = acceptor.clone();
+                tokio::spawn(async move {
+                    match acceptor.accept(sock).await {
+                        Ok(tls_sock) => conn::serve_connection(tls_sock, peer, ctx, pool).await,
+                        Err(e) => tracing::warn!(peer = %peer, error = %e, "tls handshake failed"),
+                    }
+                });
+            }
+            Err(e) => tracing::warn!(error = %e, "tls accept failed"),
+        }
+    }
+}
+/// （重启一致——客户端按 ClusterId 缓存/校验，逐次漂移会导致重连风暴）
+fn ensure_cluster_id(data_dir: &str) -> String {
+    if let Ok(id) = std::env::var("BASALT_CLUSTER_ID") {
+        if !id.trim().is_empty() {
+            return id.trim().to_string();
+        }
+    }
+    let path = std::path::Path::new(data_dir).join("cluster_id");
+    if let Ok(s) = std::fs::read_to_string(&path) {
+        let t = s.trim();
+        if !t.is_empty() {
+            return t.to_string();
+        }
+    }
+    // 熵源：RandomState 每实例随机键 × 纳秒时钟（无 rand 依赖）
+    use std::hash::{BuildHasher as _, Hasher as _};
+    let mut h = std::collections::hash_map::RandomState::new().build_hasher();
+    h.write_u64(
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos() as u64)
+            .unwrap_or(0),
+    );
+    let id = format!("basalt-{:016x}", h.finish());
+    let _ = std::fs::write(&path, &id);
+    id
+}
+
 async fn async_main(cfg: Config) {
     std::fs::create_dir_all(&cfg.data_dir).expect("data dir");
     let _peers = cluster_peers(&cfg);
@@ -55,6 +139,16 @@ async fn async_main(cfg: Config) {
         node_id = cfg.node_id, port = cfg.port, data = %cfg.data_dir,
         controller = ?ctrl.as_ref().map(|(id, _, _)| *id), is_controller, "basalt starting"
     );
+    if crate::sasl::auth_enabled() {
+        // 空用户表 = 所有认证必败：scram 模式下的配置疏漏信号
+        if std::env::var("BASALT_SASL_USERS").map(|v| v.trim().is_empty()).unwrap_or(true) {
+            tracing::warn!("BASALT_AUTH=scram but BASALT_SASL_USERS is empty; all authentications will fail");
+        } else {
+            tracing::info!("SASL/SCRAM-SHA-256 authentication enabled");
+        }
+    }
+    let cluster_id = ensure_cluster_id(&cfg.data_dir);
+    tracing::info!(cluster_id = %cluster_id, "cluster id resolved");
 
     // 内部端口：client port + 1
     let internal_port = cfg.port + 1;
@@ -423,6 +517,11 @@ async fn async_main(cfg: Config) {
         brokers_cache: std::sync::Mutex::new(None),
         pool: pool.clone(),
         txn_tx: txn_tx.clone(),
+        cluster_id: ensure_cluster_id(&cfg.data_dir),
+        segment_max_bytes: cfg.segment_max_bytes,
+        num_partitions: cfg.num_partitions,
+        min_isr: cfg.min_isr,
+        txn_timeout_ms: cfg.txn_timeout_ms,
     };
     CTX.set(ctx).ok();
 
@@ -431,20 +530,7 @@ async fn async_main(cfg: Config) {
         loop {
             match listener.accept().await {
                 Ok((sock, peer)) => {
-                    let ctx = handlers::Ctx {
-                        node_id: ctx_ref.node_id,
-                        controller_id: ctx_ref.controller_id,
-                        host: ctx_ref.host.clone(),
-                        port: ctx_ref.port,
-                        all_brokers: Vec::new(),
-                        meta_tx: ctx_ref.meta_tx.clone(),
-                        group_tx: ctx_ref.group_tx.clone(),
-                        cg_tx: ctx_ref.cg_tx.clone(),
-                        routes_rx: ctx_ref.routes_rx.clone(),
-                        txn_tx: ctx_ref.txn_tx.clone(),
-                        brokers_cache: std::sync::Mutex::new(ctx_ref.brokers_cache.lock().unwrap().clone()),
-                        pool: pool.clone(),
-                    };
+                    let ctx = ctx_for(ctx_ref, pool.clone());
                     tokio::spawn(conn::serve_connection(sock, peer, ctx, pool.clone()));
                 }
                 Err(e) => tracing::warn!(error = %e, "accept failed"),
@@ -452,9 +538,39 @@ async fn async_main(cfg: Config) {
         }
     });
 
+    // TLS listener（T-S1 加密面）：配置 BASALT_TLS_CERT/KEY 后于独立端口
+    // （默认 client+2）提供加密面——主口保持明文（Kafka 多 listener 语义）。
+    // TLS 握手在 serve_connection 之外完成，失败仅断该连接。
+    let tls_loop = match tls::listener_port(cfg.port) {
+        Some(tls_port) => match tls::server_config() {
+            None => {
+                tracing::warn!("TLS port configured but cert/key load failed; TLS disabled");
+                None
+            }
+            Some(tls_cfg) => match tokio::net::TcpListener::bind((cfg.host.as_str(), tls_port)).await {
+                Ok(l) => {
+                    tracing::info!(port = tls_port, "TLS listener bound");
+                    Some(Box::pin(tls_accept_loop(l, tls_cfg, pool.clone())))
+                }
+                Err(e) => {
+                    tracing::error!(error = %e, port = tls_port, "TLS listener bind failed");
+                    None
+                }
+            },
+        },
+        None => None,
+    };
+
     // 优雅停机：SIGTERM/SIGINT → 停 accept → 短暂 drain → sync
     tokio::select! {
         _ = &mut accept_loop => {},
+        // TLS 未配置时该臂必须永久挂起——空臂瞬间就绪会让服务启动即停机
+        _ = async {
+            match tls_loop {
+                Some(mut tls) => tls.await,
+                None => std::future::pending::<()>().await,
+            }
+        } => {},
         _ = async {
             let mut term = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate()).expect("SIGTERM handler");
             tokio::select! {

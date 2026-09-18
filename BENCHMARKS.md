@@ -39,6 +39,22 @@ Redpanda consume 快 29%，原因：
 两者 p50/p99 在同一量级（亚毫秒级）。Basalt p99=1.5ms 偏高可能因为
 tokio 调度延迟，后续可通过减少 per-request spawn 优化。
 
+## franz-go 直连面基线（2026-09-18，T-S5 配额基准配套）
+
+`testing/bench/run_bench.sh`（release 二进制 + franz-go 直连：无压缩、手动
+分区、MaxBufferedRecords=1M 解除客户端背压、acks=all 默认、4 分区、
+200k×1KB、tmpfs 数据目录）：
+
+| 指标 | 数值 | 说明 |
+|---|---|---|
+| Produce | **13.3 MB/s（13.3k msg/s）** | acks=all 逐批 RTT 主导（200 批 ×1MB / 4 分区并行，~75ms/批）——与历史 kafka-python/librdkafka 档（客户端调优后 150-600k msg/s）**不可直接对比**：本基线为配额/改动回归的固定设置面 |
+| Consume | **1022 MB/s** | 裸分区读穿透页缓存，与 produce 的 77× 差距坐实写 ack 路径为延迟主导 |
+
+**副产发现**：早前一次运行（客户端默认 MaxBufferedRecords=10000 背压档）
+consume 计数 200118/200000——produce 超时重试在服务端落成 118 条真重复，
+幂等去重跨重连失效（PID 未持久化/按连接重派）→ TASK P1（`run_bench.sh`
+为现成复现器）。
+
 ## 客户端多样性：confluent-kafka（librdkafka 2.15）档（2026-09-10）
 
 同场景与 kafka-python 档一一对应（`benches/throughput_confluent.py`，

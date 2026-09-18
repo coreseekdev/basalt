@@ -107,8 +107,8 @@ Basalt：Rust 版 Kafka 兼容消息流平台
 
 | ID | 状态 | 任务 | 产出物 | 验收标准 | 依赖 | 参考 |
 |---|---|---|---|---|---|---|
-| T-M4.1 | ⬜ | 安全 | SASL PLAIN/SCRAM-256/512（rsasl）、TLS（rustls+aws-lc-rs，ADR-13）、ACL（含 IDEMPOTENT_WRITE/CLUSTER） | 三客户端 SASL+TLS 矩阵全绿 | T-M1.5 | [生态 清单](../docs/08-ecosystem.md) |
-| T-M4.2 | ⬜ | 限流与会话 | quota（produce/fetch 带宽）、fetch session、fetch 大小 PID 控制器 | quota 生效有指标；session 复用降低 metadata 压力（基准） | T-M2.4 | [Redpanda §7](../docs/02-redpanda.md) |
+| T-M4.1 | 🟨 | 安全 | **一期 ✅（2026-09-18，[ADR-22](docs/adr-22-security-admin-plane.md)）**：SASL/SCRAM-SHA-256（自研 RFC 5802 服务端，未用 rsasl；凭据 env 派生、明文即弃）+ 认证门禁（未认证仅放行 18/17/36，越权/失败断连，58/33/34 语义）+ TLS（rustls 独立口 client+2，通告跟随 listener——账本 57）+ e2e 双档（run_auth.sh librdkafka SCRAM 正/负路径、run_tls.sh SSL 全链）。**待做**：ACL 骨架、SCRAM-512/OAUTH、kafka-python 裸 SCRAM 兼容（pre-KIP-152，P2） | 三客户端 SASL+TLS 矩阵全绿（librdkafka ✅；franz-go/kafka-clients 档待补） | T-M1.5 | [生态 清单](../docs/08-ecosystem.md) [ADR-22](docs/adr-22-security-admin-plane.md) |
+| T-M4.2 | 🟨 | 限流与会话 | **quota 一期 ✅（2026-09-18，[ADR-22](docs/adr-22-security-admin-plane.md)）**：逐连接字节率 token bucket（produce 请求字节/fetch 响应字节；负债制 + 持锁休眠串行化——账本 55：pipeline 并发稀释/休眠回补双计两缺陷）；run_quota.sh 限流生效 e2e + testing/bench 吞吐基线（release produce 13.3MB/s acks=all 批延迟主导、consume 1GB/s）。**待做**：per-user 配额、fetch session、fetch 大小 PID 控制器 | quota 生效有指标 ✅（e2e 断言速率）；session 复用基准 ⬜ | T-M2.4 | [Redpanda §7](../docs/02-redpanda.md) [ADR-22](docs/adr-22-security-admin-plane.md) |
 | T-M4.3 | 🟨 | 分层存储 + 存储模式插件 | **[ADR-21](docs/adr-21-tiered-storage.md) v1 落地（2026-09-18）**：前置阅读 ✅（Arroyo §11 + Morax §6 两路并评——取 CAS+权威记录路线，弃 RDS 权威）；块 a ObjectStore 四原语（create CAS 冲突回读）+ LocalFs/Memory 双实现 ✅；块 b 分层注册表（写序=段对象→段记录→本地回收，孤儿无害+启动期 GC）+ Log::release_sealed（回收不动 log_start）+ 读穿透/FetchSlice 分流/重启恢复 ✅；块 c e2e ✅（tiered 模式 400 条：滚动上传→本地回收→读穿透→重启恢复全链 PASS）。**联调副产修复：账本 53（幂等 last_seq 语义）/54（终态 fence 语义修订，ADR-18 §14）**。待做（v2 边界）：S3 适配器（契约已收窄）/per-topic storage-mode（穿控制器元数据）/对象侧 retention/GC 运行期化 | T-M3.2 | [Arroyo §11](../docs/12-arroyo.md) [Morax §6](../docs/16-morax.md) [ADR-21](docs/adr-21-tiered-storage.md) |
 | T-M4.3.1 | 🟨 | 分层存储 v1.1（[研究对照](docs/research/2026-09-18-reference-comparison.md) 行动清单） | **P1**：段 key 加 leader-epoch（终结同 base 漂移覆盖）+ 记录追加式；运行期孤儿 GC（mtime 宽限窗）；上传异步化（offloader 任务 + 配额，移出 produce 关键路径）。**P2**：读路径 range read + 段稀疏索引（上传时快照 offset 索引）；段记录 crc32；duramen S3 适配器（arrow-rs object_store，PutMode::Create 对接 If-None-Match） | T-M4.3 ✅ | slatedb/duramen 对照（docs/research/2026-09-18） |
 | T-M4.4 | ⬜ | 性能工程 | criterion 微基准；端到端基准管线（对标 Kafka/Redpanda）；io_uring 写路径（O_DIRECT+批量提交）与 thread-per-core（compio）评估报告 | 吞吐/延迟基线报表；演进建议（动/不动执行器） | T-M2.4 | [蓝图 §7](../docs/10-rust-blueprint.md) [Iggy §3](../docs/03-iggy.md) |
@@ -150,6 +150,17 @@ Basalt：Rust 版 Kafka 兼容消息流平台
     - 基准：produce 91045 msg/s（acks=all 流水线 1KB 消息）、consume 153891 msg/s、p50=0.2ms p99=0.5ms
   - ⏳ 已知问题：pod 重建竞态、failover 自动化 e2e 硬化、CreateTopic 注册竞态 RF 钳制
   - 📁 k8s：deploy/k8s（3 节点 Deployment + hostPath + chaos.sh）；microk8s 实测 Running
+
+- **2026-09-18（安全面/管理面/配额一期 + 基准）**：T-M4.1/T-M4.2 一期落地
+  （ADR-22）——SCRAM-SHA-256 鉴权 + 门禁 + 断连语义；TLS 独立 listener
+  （通告跟随所连 listener）；DescribeCluster/DescribeConfigs + 持久化
+  ClusterId（Metadata 同步回填）；逐连接字节率配额（负债制 token bucket +
+  持锁休眠串行化，账本 55/56/57）；e2e 三档（run_auth/run_quota/run_tls）
+  + franz-go 吞吐基准。**新遗留（P1）**：produce 重试重复——幂等去重跨
+  重连失效（PID 未持久化，200k 基准 118 条重复，`run_bench.sh` 复现）；
+  produce acks=all 吞吐延迟主导（13.3MB/s，批 RTT ~75ms，T-M4.4 杠杆面）。
+  **P2**：kafka-python 裸 SCRAM 兼容（pre-KIP-152）、ACL 骨架、per-user
+  配额、SCRAM-512。
 
 ## 关键决策记录（ADR 索引）
 

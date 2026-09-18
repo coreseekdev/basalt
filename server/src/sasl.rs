@@ -78,6 +78,20 @@ impl ScramUsers {
     }
 }
 
+/// 进程级凭据表（启动时一次性派生；每连接共享只读）
+pub fn global_users() -> &'static ScramUsers {
+    static U: std::sync::OnceLock<ScramUsers> = std::sync::OnceLock::new();
+    U.get_or_init(ScramUsers::from_env)
+}
+
+/// BASALT_AUTH=scram 时启用连接级认证门禁
+pub fn auth_enabled() -> bool {
+    std::env::var("BASALT_AUTH").as_deref() == Ok("scram")
+}
+
+/// 本 broker 支持的机制（Handshake 响应的 Mechanisms）
+pub const MECHANISMS: &[&str] = &["SCRAM-SHA-256"];
+
 /// 连接级 SCRAM 会话（conn.rs per connection）
 #[derive(Default)]
 pub struct ScramSession {
@@ -102,8 +116,9 @@ pub enum ScramState {
 /// SCRAM 协议步骤（conn.rs 的 SASL_AUTHENTICATE handler 调用）
 #[derive(Debug)]
 pub enum ScramOutcome {
-    /// 认证成功（连接已认证，user 可用）
-    Authenticated { user: String },
+    /// 认证成功（连接已认证，user 可用；server_final = `v=<sig>` 须回给
+    /// 客户端——RFC 5802 服务端最后一步，kafka-python/franz-go 均校验签名）
+    Authenticated { user: String, server_final: String },
     /// 需要下一轮：返回 server-first-message 的 base64（放入 SASL_AUTHENTICATE 响应）
     Continue { data: String },
     /// 认证失败（连接可关闭或允许重试）
@@ -202,16 +217,23 @@ pub fn scram_authenticate(
         if computed_stored.as_slice() != stored_key.as_slice() {
             return ScramOutcome::Failed { reason: "SCRAM proof mismatch".into() };
         }
-        // ServerSignature = HMAC(ServerKey, AuthMessage)
+        // ServerSignature = HMAC(ServerKey, AuthMessage)；AuthMessage 不含
+        // server-final 自身——先算签名再回填（auth_message 保持 RFC 5802 定义）
         let Some(server_key) = session.server_key else {
             return ScramOutcome::Failed { reason: "no server key".into() };
         };
         let server_sig = hmac_sha256(&server_key, session.auth_message.as_bytes());
-        session.auth_message = format!("{},{}", session.auth_message, b64_encode(&server_sig));
         session.state = ScramState::Authenticated;
-        session.user = session.user.clone();
-        ScramOutcome::Authenticated { user: session.user.clone() }
+        let server_final = format!("v={}", b64_encode(&server_sig));
+        ScramOutcome::Authenticated { user: session.user.clone(), server_final }
     }
+}
+
+/// 认证失败后会话回退 Idle（允许同一连接重新握手——Kafka broker 语义是
+/// 关连接，这里保留重试面，关闭决策归 conn.rs）
+pub fn reset_session(session: &mut ScramSession) {
+    let user = std::mem::take(&mut session.user);
+    *session = ScramSession { user, ..Default::default() };
 }
 
 /// base64 编码（RFC 4648 标准字母表，无 padding 需求时也兼容）
@@ -309,7 +331,13 @@ mod scram_tests {
         let client_proof: Vec<u8> = client_key.iter().zip(&client_sig).map(|(a, b)| a ^ b).collect();
         let client_final = format!("{client_final_without},p={}", b64_encode(&client_proof));
         match scram_authenticate(&mut sess, &users, client_final.as_bytes()) {
-            ScramOutcome::Authenticated { user } => assert_eq!(user, "admin"),
+            ScramOutcome::Authenticated { user, server_final } => {
+                assert_eq!(user, "admin");
+                // 客户端视角校验 server-final：ServerSignature = HMAC(ServerKey,
+                // AuthMessage)——kafka-python process_server_final_message 同式
+                let server_sig = hmac_sha256(&hmac_sha256(&salted, b"Server Key"), auth_msg.as_bytes());
+                assert_eq!(server_final, format!("v={}", b64_encode(&server_sig)));
+            }
             ScramOutcome::Failed { reason } => panic!("阶段 2 失败: {reason}"),
             _ => panic!("阶段 2 应为 Authenticated"),
         }

@@ -97,6 +97,11 @@ pub mod handlers_layout_tests {
             brokers_cache: std::sync::Mutex::new(None),
             pool,
             txn_tx: None,
+            cluster_id: "test-cluster".into(),
+            segment_max_bytes: 1 << 30,
+            num_partitions: 1,
+            min_isr: 1,
+            txn_timeout_ms: 60_000,
         }
     }
 
@@ -1168,5 +1173,96 @@ pub mod handlers_layout_tests {
 
         drop(coord);
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // ---- T-S4：DescribeCluster / DescribeConfigs（管理面有限兼容）----
+
+    #[tokio::test]
+    async fn describe_cluster_roundtrip_v0_v2() {
+        let ctx = make_ctx(&[]).await;
+        let k = basalt_protocol::api::key::DESCRIBE_CLUSTER;
+        let req = req_at(k, 0, &as_struct_owned(s([
+            ("IncludeClusterAuthorizedOperations", Value::Bool(true)),
+        ])));
+        for v in [0i16, 1, 2] {
+            let resp = crate::handlers::describe_cluster(&req, &ctx);
+            let r = resp_decode(k, v, &resp_bytes(k, v, &resp));
+            assert_eq!(fld(&r, "ErrorCode").as_i16(), 0);
+            assert_eq!(fld(&r, "ClusterId").as_str(), "test-cluster");
+            assert_eq!(fld(&r, "ControllerId").as_i32(), 0);
+            let brokers = arr(&r, "Brokers");
+            assert_eq!(brokers.len(), 1, "v{v}: 单 broker");
+            assert_eq!(sfield(&brokers[0], "BrokerId").as_i32(), 0);
+            assert_eq!(sfield(&brokers[0], "Port").as_i32(), 9092);
+            if v >= 1 {
+                assert_eq!(fld(&r, "EndpointType").as_i8(), 1, "v{v}: broker 端点型");
+            }
+            if v >= 2 {
+                assert_eq!(sfield(&brokers[0], "IsFenced").as_bool(), false, "v2 IsFenced");
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn describe_configs_topic_broker_and_unknown() {
+        let ctx = make_ctx(&[("cfg-topic", 1)]).await;
+        let k = basalt_protocol::api::key::DESCRIBE_CONFIGS;
+        let build = |rtype: i8, name: &str| {
+            req_at(k, 2, &as_struct_owned(s([
+                ("Resources", Value::Array(vec![s([
+                    ("ResourceType", Value::I8(rtype)),
+                    ("ResourceName", Value::str(name)),
+                    ("ConfigurationKeys", Value::Null),
+                ])])),
+            ])))
+        };
+        // topic：存在 → 静态默认投影（v2 非 flexible 基线 + v4 flexible 双探）
+        for v in [1i16, 4] {
+            let resp = crate::handlers::describe_configs(&build(2, "cfg-topic"), &ctx).await;
+            let r = resp_decode(k, v, &resp_bytes(k, v, &resp));
+            let results = arr(&r, "Results");
+            assert_eq!(results.len(), 1);
+            assert_eq!(fld(as_struct(&results[0]), "ErrorCode").as_i16(), 0);
+            let cfgs = arr(as_struct(&results[0]), "Configs");
+            let names: Vec<String> = cfgs.iter()
+                .map(|c| sfield(c, "Name").as_str().to_string()).collect();
+            assert!(names.contains(&"segment.bytes".to_string()), "v{v}: {names:?}");
+            assert!(names.contains(&"cleanup.policy".to_string()));
+            let seg = cfgs.iter().find(|c| sfield(c, "Name").as_str() == "segment.bytes").unwrap();
+            assert_eq!(sfield(seg, "Value").as_str(), (1u64 << 30).to_string());
+            assert_eq!(sfield(seg, "ConfigSource").as_i8(), 5, "DEFAULT_CONFIG");
+            assert_eq!(sfield(seg, "ReadOnly").as_bool(), true, "无 Alter 面");
+        }
+        // topic 不存在 → UNKNOWN_TOPIC_OR_PARTITION
+        let resp = crate::handlers::describe_configs(&build(2, "ghost"), &ctx).await;
+        let r = resp_decode(k, 2, &resp_bytes(k, 2, &resp));
+        let results = arr(&r, "Results");
+        assert_eq!(fld(as_struct(&results[0]), "ErrorCode").as_i16(), 3);
+        // broker：num.partitions 投影
+        let resp = crate::handlers::describe_configs(&build(4, ""), &ctx).await;
+        let r = resp_decode(k, 2, &resp_bytes(k, 2, &resp));
+        let results = arr(&r, "Results");
+        assert_eq!(fld(as_struct(&results[0]), "ErrorCode").as_i16(), 0);
+        let cfgs = arr(as_struct(&results[0]), "Configs");
+        let np = cfgs.iter().find(|c| sfield(c, "Name").as_str() == "num.partitions").unwrap();
+        assert_eq!(sfield(np, "Value").as_str(), "1");
+        // 未知资源型 → INVALID_REQUEST
+        let resp = crate::handlers::describe_configs(&build(16, "x"), &ctx).await;
+        let r = resp_decode(k, 2, &resp_bytes(k, 2, &resp));
+        let results = arr(&r, "Results");
+        assert_eq!(fld(as_struct(&results[0]), "ErrorCode").as_i16(), 42);
+        // 键过滤：只取一项时其余不回
+        let req = req_at(k, 2, &as_struct_owned(s([
+            ("Resources", Value::Array(vec![s([
+                ("ResourceType", Value::I8(2)),
+                ("ResourceName", Value::str("cfg-topic")),
+                ("ConfigurationKeys", Value::Array(vec![Value::str("retention.ms")])),
+            ])])),
+        ])));
+        let resp = crate::handlers::describe_configs(&req, &ctx).await;
+        let r = resp_decode(k, 2, &resp_bytes(k, 2, &resp));
+        let cfgs = arr(as_struct(&arr(&r, "Results")[0]), "Configs");
+        assert_eq!(cfgs.len(), 1, "键过滤");
+        assert_eq!(sfield(&cfgs[0], "Name").as_str(), "retention.ms");
     }
 }

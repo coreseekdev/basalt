@@ -34,9 +34,16 @@ pub struct Ctx {
     /// 事务协调器句柄（仅 controller 节点为 Some；§9 拓扑）。
     pub txn_tx: Option<mpsc::Sender<crate::txn::TxnCmd>>,
     pub brokers_cache: std::sync::Mutex<Option<Vec<basalt_metadata::cluster::BrokerInfo>>>,
+    /// 集群 ID（data_dir/cluster_id 持久化；Metadata/DescribeCluster 一致回填）
+    pub cluster_id: String,
+    /// 启动期配置投影（DescribeConfigs 的 broker/topic 默认值来源；T-S4）
+    pub segment_max_bytes: u64,
+    pub num_partitions: i32,
+    pub min_isr: i32,
+    pub txn_timeout_ms: u64,
     /// 读缓冲池（perf #2：writer 归还 + actor 读复用共享同一池）
-    // BufferPool 进程单例共享资源池（内部 Mutex 串行化）：Arc 表达资源共享而非
-    // 共享可变所有权，与 Bytes/mpsc 内部引用计数同级豁免（ADR-13）。
+    // BufferPool 进程单例共享资源池（内部 Mutex 串行化）：Arc 表达资源
+    // 共享而非共享可变所有权，与 Bytes/mpsc 内部引用计数同级豁免（ADR-13）。
     #[allow(clippy::disallowed_types)]
     pub pool: std::sync::Arc<basalt_storage::pool::BufferPool>,
 }
@@ -57,6 +64,11 @@ impl Ctx {
             txn_tx: self.txn_tx.clone(),
             pool: self.pool.clone(),
             brokers_cache: std::sync::Mutex::new(self.brokers_cache.lock().unwrap().clone()),
+            cluster_id: self.cluster_id.clone(),
+            segment_max_bytes: self.segment_max_bytes,
+            num_partitions: self.num_partitions,
+            min_isr: self.min_isr,
+            txn_timeout_ms: self.txn_timeout_ms,
         }
     }
 }
@@ -79,8 +91,14 @@ impl Ctx {
             .into_iter()
             .map(|b| (b.node_id, b.host, b.port))
             .collect();
-        if brokers.is_empty() {
-            brokers = vec![(self.node_id, self.host.clone(), self.port)];
+        // 本节点地址强制取当前连接的 listener（Kafka 语义：metadata 按请求
+        // 到达口通告对应 listener 地址——TLS 口连接通告 TLS 端口；缓存里的
+        // 集群拓扑是主口，不覆盖此修正）
+        if let Some(slot) = brokers.iter_mut().find(|(id, _, _)| *id == self.node_id) {
+            slot.1 = self.host.clone();
+            slot.2 = self.port;
+        } else {
+            brokers.push((self.node_id, self.host.clone(), self.port));
         }
         brokers.sort_unstable();
         Value::Array(
@@ -92,6 +110,9 @@ impl Ctx {
                         ("Host", Value::str(host)),
                         ("Port", Value::I32(port as i32)),
                         ("Rack", Value::Null),
+                        // DescribeCluster v2（KIP-1073）需要；Metadata 无此
+                        // 字段——编码器按 schema 取 key，多余项被忽略
+                        ("IsFenced", Value::Bool(false)),
                     ])
                 })
                 .collect(),
@@ -192,7 +213,7 @@ pub async fn metadata(req: &basalt_protocol::value::Struct, version: i16, ctx: &
     s([
         ("ThrottleTimeMs", Value::I32(0)),
         ("Brokers", ctx.broker_array()),
-        ("ClusterId", Value::Null),
+        ("ClusterId", Value::str(ctx.cluster_id.clone())),
         ("ControllerId", Value::I32(ctx.node_id)),
         ("Topics", Value::Array(topic_vals)),
         ("ClusterAuthorizedOperations", Value::I32(-2147483648)),
@@ -223,6 +244,133 @@ fn topic_value(t: &basalt_metadata::TopicMeta, ctx: &Ctx) -> Value {
         ("IsInternal", Value::Bool(t.internal)),
         ("Partitions", Value::Array(parts)),
         ("TopicAuthorizedOperations", Value::I32(-2147483648)),
+    ])
+}
+
+// ---------- DescribeCluster / DescribeConfigs（T-S4 管理面有限兼容）----------
+
+/// DescribeCluster v0-2：broker 全集 + controller + cluster id。
+/// EndpointType 恒 1（broker 端点）；AuthorizedOperations 恒 Int.MIN
+/// （无 ACL 面，与 Metadata 的 topic 级同值——客户端按「未上报」处理）。
+pub fn describe_cluster(_req: &basalt_protocol::value::Struct, ctx: &Ctx) -> Value {
+    s([
+        ("ThrottleTimeMs", Value::I32(0)),
+        ("ErrorCode", Value::I16(ErrorCode::None as i16)),
+        ("ErrorMessage", Value::Null),
+        ("EndpointType", Value::I8(1)),
+        ("ClusterId", Value::str(ctx.cluster_id.clone())),
+        ("ControllerId", Value::I32(ctx.controller_id)),
+        ("Brokers", ctx.broker_array()),
+        ("ClusterAuthorizedOperations", Value::I32(-2147483648)),
+    ])
+}
+
+/// ConfigResource.Type 常量（kafka-clients ConfigResource.java 核对：
+/// UNKNOWN=0 / TOPIC=2 / BROKER=4）
+const CONFIG_RESOURCE_TOPIC: i8 = 2;
+const CONFIG_RESOURCE_BROKER: i8 = 4;
+
+/// 配置项条目（ConfigSource=5 DEFAULT_CONFIG，ReadOnly=true——无 Alter 面，
+/// 如实标注不可变；ConfigType 0=UNKNOWN，Documentation 不提供）
+fn config_entry(name: &str, value: String, keys: &Option<Vec<String>>) -> Option<Value> {
+    if let Some(ks) = keys {
+        if !ks.iter().any(|k| k == name) {
+            return None;
+        }
+    }
+    Some(s([
+        ("Name", Value::str(name)),
+        ("Value", Value::str(value)),
+        ("ReadOnly", Value::Bool(true)),
+        ("ConfigSource", Value::I8(5)),
+        ("IsSensitive", Value::Bool(false)),
+        ("Synonyms", Value::Array(vec![])),
+        ("ConfigType", Value::I8(0)),
+        ("Documentation", Value::Null),
+    ]))
+}
+
+/// DescribeConfigs v1-4：topic（存在性校验经元数据）与 broker 两资源型，
+/// 返回启动期配置的静态投影（有限兼容边界：无 per-topic 覆盖面）。
+pub async fn describe_configs(req: &basalt_protocol::value::Struct, ctx: &Ctx) -> Value {
+    let mut results = Vec::new();
+    if let Some(Value::Array(resources)) = req.get("Resources") {
+        for r in resources {
+            let Value::Struct(rs) = r else { continue };
+            let rtype = rs.get("ResourceType").map(|v| v.as_i8()).unwrap_or(0);
+            let rname = rs.get("ResourceName").map(|v| v.as_str().to_string()).unwrap_or_default();
+            let keys: Option<Vec<String>> = match rs.get("ConfigurationKeys") {
+                Some(Value::Array(a)) => Some(
+                    a.iter()
+                        .filter_map(|k| match k {
+                            Value::Str(s) => Some(s.to_string()),
+                            _ => None,
+                        })
+                        .collect(),
+                ),
+                _ => None,
+            };
+            let (err, msg, entries) = match rtype {
+                CONFIG_RESOURCE_TOPIC => {
+                    let (reply_tx, reply_rx) = oneshot::channel();
+                    let _ = ctx.meta_tx.send(MetaCmd::Lookup {
+                        names: Some(vec![rname.clone()]),
+                        allow_create: false,
+                        reply: reply_tx,
+                    }).await;
+                    let (found, _brokers) = reply_rx.await.unwrap_or_default();
+                    if found.iter().all(|t| t.name != rname) {
+                        (
+                            ErrorCode::UnknownTopicOrPartition,
+                            Some(format!("Topic '{rname}' does not exist")),
+                            Vec::new(),
+                        )
+                    } else {
+                        (
+                            ErrorCode::None,
+                            None,
+                            vec![
+                                config_entry("cleanup.policy", "delete".into(), &keys),
+                                config_entry("retention.ms", "604800000".into(), &keys),
+                                config_entry("retention.bytes", "-1".into(), &keys),
+                                config_entry("segment.bytes", ctx.segment_max_bytes.to_string(), &keys),
+                                config_entry("min.insync.replicas", ctx.min_isr.to_string(), &keys),
+                            ],
+                        )
+                    }
+                }
+                CONFIG_RESOURCE_BROKER => (
+                    // broker 配置只应答自身节点（单机面；异节点名不存在的
+                    // 校验留给客户端——多节点拓扑管理面属后续版本）
+                    ErrorCode::None,
+                    None,
+                    vec![
+                        config_entry("num.partitions", ctx.num_partitions.to_string(), &keys),
+                        config_entry("default.replication.factor", "1".into(), &keys),
+                        config_entry("min.insync.replicas", ctx.min_isr.to_string(), &keys),
+                        config_entry("log.segment.bytes", ctx.segment_max_bytes.to_string(), &keys),
+                        config_entry("log.retention.ms", "604800000".into(), &keys),
+                        config_entry("transaction.max.timeout.ms", ctx.txn_timeout_ms.to_string(), &keys),
+                    ],
+                ),
+                _ => (
+                    ErrorCode::InvalidRequest,
+                    Some(format!("Unsupported resource type {rtype}")),
+                    Vec::new(),
+                ),
+            };
+            results.push(s([
+                ("ErrorCode", Value::I16(err as i16)),
+                ("ErrorMessage", msg.map(|m| Value::Str(m.into())).unwrap_or(Value::Null)),
+                ("ResourceType", Value::I8(rtype)),
+                ("ResourceName", Value::str(rname)),
+                ("Configs", Value::Array(entries.into_iter().flatten().collect())),
+            ]));
+        }
+    }
+    s([
+        ("ThrottleTimeMs", Value::I32(0)),
+        ("Results", Value::Array(results)),
     ])
 }
 

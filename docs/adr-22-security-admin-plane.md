@@ -58,9 +58,13 @@
      sleep，吞吐 = 配额 × 并发度。
   2. **负债制**：token 先扣减、允许为负，负值即欠账时长；休眠期回补不再
      产生可消费额度（否则睡醒请求把回补量瞬时吃掉，节流率翻倍）。
+- **per-user 覆盖**（T-M4.2 尾项，2026-09-18）：
+  `BASALT_QUOTA_USER_BYTES="app:p=500000;f=1000000,admin:f=2000000"`（条目
+  `,` 分隔、维度 `;` 分隔；0=不限）——SASL 认证完成后按键覆盖全局默认，
+  无条目回落。e2e：run_quota.sh 阶段二（覆盖生效 vs 回落双断言）。
 - 语义注记：节流以延迟响应实现（v0/v1 语义；Kafka v2+ 先响应后节流下一
-  请求，效果等同、形态不同，客户端无感）。无 per-user 配额（用户表为静态
-  派生，per-user quota 属 ACL 一期）。
+  请求，效果等同、形态不同，客户端无感）。(user, client-id) 二维实体面
+  属 ACL 一期。
 
 ### 2.4 管理面（DescribeCluster/DescribeConfigs + ClusterId）
 

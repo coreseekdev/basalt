@@ -31,6 +31,37 @@ fn env_u64(name: &str) -> u64 {
     }
 }
 
+/// per-user 配额覆盖（T-M4.2 尾项）：`BASALT_QUOTA_USER_BYTES="app:p=500000;f=1000000,admin:f=2000000"`
+/// ——条目 `,` 分隔、维度 `;` 分隔；SASL 认证完成后按键覆盖全局默认；
+/// 无条目回落全局。（有限兼容：Kafka 的 (user, client-id) 二维实体面
+/// 不做，user 一维先行）
+fn user_quotas() -> &'static std::collections::HashMap<String, (u64, u64)> {
+    static U: std::sync::OnceLock<std::collections::HashMap<String, (u64, u64)>> = std::sync::OnceLock::new();
+    U.get_or_init(|| parse_user_quotas(&std::env::var("BASALT_QUOTA_USER_BYTES").unwrap_or_default()))
+}
+
+/// 解析 `"user:p=1,f=2,user2:f=3"`（独立纯函数——env 缓存不可测试注入）
+fn parse_user_quotas(raw: &str) -> std::collections::HashMap<String, (u64, u64)> {
+    let mut m = std::collections::HashMap::new();
+    for ent in raw.split(',') {
+        let mut parts = ent.splitn(2, ':');
+        let (Some(user), Some(rest)) = (parts.next(), parts.next()) else { continue };
+        let (mut p, mut f) = (0u64, 0u64);
+        for kv in rest.split(';') {
+            let mut kv = kv.splitn(2, '=');
+            match (kv.next(), kv.next().and_then(|v| v.parse::<u64>().ok())) {
+                (Some("p"), Some(v)) => p = v,
+                (Some("f"), Some(v)) => f = v,
+                _ => {}
+            }
+        }
+        if !user.is_empty() {
+            m.insert(user.to_string(), (p, f));
+        }
+    }
+    m
+}
+
 /// 连接级认证/配额共享状态（T-S1/S5）。请求任务并发处理 → Mutex 串行；
 /// SASL 握手天然两轮串行，锁竞争可忽略。
 pub struct ConnState {
@@ -87,6 +118,16 @@ impl ConnState {
         }
     }
     pub fn quota_enabled(&self) -> bool { self.quota_produce_rate > 0 || self.quota_fetch_rate > 0 }
+    /// SASL 认证完成后套用 per-user 配额覆盖（无条目回落全局默认；
+    /// 桶重置为新速率的一秒突发——切换前后速率语义自洽）
+    pub fn apply_user_quota(&mut self, user: &str) {
+        if let Some(&(p, f)) = user_quotas().get(user) {
+            self.quota_produce_rate = p;
+            self.quota_fetch_rate = f;
+            self.produce_tokens = p as f64;
+            self.fetch_tokens = f as f64;
+        }
+    }
     /// 节流原语（连接锁内调用）：持锁休眠 = 后续请求在锁上排队，
     /// 请求按配额速率串行化——pipeline 并发不能稀释节流率（否则并发
     /// 任务各自看到空桶各自 sleep，吞吐 = 配额 × 并发度）
@@ -552,6 +593,7 @@ async fn sasl_authenticate(req: &Struct, conn: &tokio::sync::Mutex<ConnState>) -
         ),
         ScramOutcome::Authenticated { user, server_final } => {
             tracing::info!(user = %user, "sasl authenticated");
+            cs.apply_user_quota(&user);
             cs.user = Some(user);
             cs.handshake_done = false; // 会话终结；重认证须重新握手
             (
@@ -728,6 +770,16 @@ mod conn_tests {
         let cs = ConnState::with_params(false, 0, 0);
         assert!(cs.admits(key::PRODUCE), "无鉴权模式恒放行");
         assert_eq!(cs.user.as_deref(), Some("*"));
+    }
+
+    /// per-user 配额解析（T-M4.2）：键值面、部分字段、坏项容忍
+    #[test]
+    fn parse_user_quotas_matrix() {
+        let m = parse_user_quotas("app:p=500000;f=1000000,admin:f=2000000,bad-entry,,ghost:p=abc");
+        assert_eq!(m.get("app"), Some(&(500000, 1000000)));
+        assert_eq!(m.get("admin"), Some(&(0, 2000000)), "缺省维度=0（不限）");
+        assert_eq!(m.get("ghost"), Some(&(0, 0)), "坏值容忍为不限");
+        assert_eq!(m.len(), 3, "空项剔除、坏值项保留");
     }
 
     /// 配额 token bucket（S5）：额度内零延迟、耗尽后按缺口比例节流、

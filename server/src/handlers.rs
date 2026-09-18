@@ -540,7 +540,14 @@ pub struct FetchTarget {
     pub isolation: crate::partition::Isolation,
 }
 
-pub async fn fetch(targets: Vec<FetchTarget>, ctx: &Ctx) -> Value {
+pub async fn fetch(
+    targets: Vec<FetchTarget>,
+    ctx: &Ctx,
+    // KIP-227 增量模式：省略「空且无错」分区（空闲长轮询分区不占响应字节）
+    incremental: bool,
+    // 响应回填的 SessionId（0 = 无会话）
+    session_id: i32,
+) -> Value {
     // 快照路由 + 发送（不等待），await 只发生在末段收集
     struct Fetched {
         idx: usize,
@@ -633,8 +640,13 @@ pub async fn fetch(targets: Vec<FetchTarget>, ctx: &Ctx) -> Value {
             ("LogStartOffset", Value::I64(log_start)),
             ("AbortedTransactions", aborted_val),
             ("PreferredReadReplica", Value::I32(-1)),
-            ("Records", Value::Bytes(data)),
+            ("Records", Value::Bytes(data.clone())),
         ]);
+        // 增量模式（KIP-227）：空且无错的分区整条省略——空闲长轮询分区
+        // 不占响应字节（省略后客户端保留既有 HW 视图，正确性不受影响）
+        if incremental && err == ErrorCode::None && data.is_empty() {
+            continue;
+        }
         match topic_groups.iter_mut().find(|(n, id, _)| n == &t.topic && *id == t.topic_id) {
             Some((_, _, parts)) => parts.push(entry),
             None => topic_groups.push((t.topic.clone(), t.topic_id, vec![entry])),
@@ -654,7 +666,7 @@ pub async fn fetch(targets: Vec<FetchTarget>, ctx: &Ctx) -> Value {
     s([
         ("ThrottleTimeMs", Value::I32(0)),
         ("ErrorCode", Value::I16(ErrorCode::None as i16)),
-        ("SessionId", Value::I32(0)),
+        ("SessionId", Value::I32(session_id)),
         ("Responses", Value::Array(responses)),
         ("NodeEndpoints", Value::Array(vec![])),
     ])

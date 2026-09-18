@@ -7,6 +7,7 @@
 
 mod config;
 mod conn;
+mod fetch_session;
 mod handlers;
 mod sasl;
 mod handlers_consumer;

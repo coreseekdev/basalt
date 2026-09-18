@@ -461,7 +461,11 @@ async fn dispatch(
             let (v, acks_none) = handle_produce(&req, api_version, ctx, conn).await?;
             (v, acks_none, false)
         }
-        key::FETCH => (handlers::fetch(parse_fetch(&req, api_version)?, ctx).await, false, false),
+        key::FETCH => {
+            let parsed = parse_fetch(&req, api_version)?;
+            let (v, close) = handle_fetch(parsed, ctx).await?;
+            (v, false, close)
+        }
         key::LIST_OFFSETS => (handlers::list_offsets(&req, ctx).await, false, false),
         key::FIND_COORDINATOR => (handlers_groups::find_coordinator(api_version, &req, ctx).await, false, false),
         key::JOIN_GROUP => (handlers_groups::join_group(&req, api_version, ctx).await, false, false),
@@ -665,7 +669,15 @@ async fn handle_produce(
     Ok((v, acks == 0))
 }
 
-fn parse_fetch(req: &Struct, version: i16) -> Result<Vec<FetchTarget>, DispatchError> {
+/// Fetch 请求解析产物：分区目标 + KIP-227 会话面（v7+）
+pub(crate) struct ParsedFetch {
+    pub targets: Vec<FetchTarget>,
+    pub session_id: i32,
+    pub epoch: i32,
+    pub forgotten: Vec<crate::fetch_session::Forgotten>,
+}
+
+fn parse_fetch(req: &Struct, version: i16) -> Result<ParsedFetch, DispatchError> {
     let max_wait = req.get("MaxWaitMs").map(|v| v.as_i32()).unwrap_or(500);
     let min_bytes = req.get("MinBytes").map(|v| v.as_i32()).unwrap_or(1);
     // Fetch v4+ IsolationLevel（v4 之前无字段 = read_uncommitted）。
@@ -702,8 +714,83 @@ fn parse_fetch(req: &Struct, version: i16) -> Result<Vec<FetchTarget>, DispatchE
             }
         }
     }
-    let _ = version;
-    Ok(out)
+    // KIP-227 会话面（v7+）
+    let (session_id, epoch, forgotten) = if version >= 7 {
+        let sid = req.get("SessionId").map(|v| v.as_i32()).unwrap_or(0);
+        let ep = req.get("Epoch").map(|v| v.as_i32()).unwrap_or(0);
+        let mut fg = Vec::new();
+        if let Some(Value::Array(ft)) = req.get("ForgottenTopicsData") {
+            for t in ft {
+                let Value::Struct(ts) = t else { continue };
+                let name = ts.get("Topic").map(|x| x.as_str().to_string()).filter(|s| !s.is_empty());
+                let topic_id = ts.get("TopicId").map(|x| x.as_uuid()).filter(|u| *u != 0);
+                let mut parts = Vec::new();
+                if let Some(Value::Array(ps)) = ts.get("Partitions") {
+                    for p in ps {
+                        parts.push(p.as_i32());
+                    }
+                }
+                fg.push(crate::fetch_session::Forgotten { topic: name, topic_id, partitions: parts });
+            }
+        }
+        (sid, ep, fg)
+    } else {
+        (0, 0, Vec::new())
+    };
+    Ok(ParsedFetch { targets: out, session_id, epoch, forgotten })
+}
+
+/// fetch 分发：会话面结算 + 全量/增量服务（KIP-227，T-M4.2 尾项）
+async fn handle_fetch(parsed: ParsedFetch, ctx: &Ctx) -> Result<(Value, bool), DispatchError> {
+    let ParsedFetch { targets, session_id, epoch, forgotten } = parsed;
+    // 会话记账（错误路径响应级 70/71 + 空Responses，客户端按 KIP-227 重建）
+    let outcome = if epoch == 0 {
+        let reg: Vec<(String, u128, i32, i64, usize)> = targets
+            .iter()
+            .map(|t| (t.topic.clone(), t.topic_id, t.partition, t.offset, t.max_bytes))
+            .collect();
+        let id = crate::fetch_session::begin(&reg);
+        crate::fetch_session::SessionOutcome::Ok { session_id: id }
+    } else if epoch == -1 {
+        crate::fetch_session::close(session_id);
+        crate::fetch_session::SessionOutcome::Ok { session_id: 0 }
+    } else {
+        let reg: Vec<(String, u128, i32, i64, usize)> = targets
+            .iter()
+            .map(|t| (t.topic.clone(), t.topic_id, t.partition, t.offset, t.max_bytes))
+            .collect();
+        crate::fetch_session::incremental(session_id, epoch, &reg, &forgotten)
+    };
+    let sess_id_for_resp = match &outcome {
+        crate::fetch_session::SessionOutcome::Ok { session_id } => *session_id,
+        _ => 0,
+    };
+    if let (crate::fetch_session::SessionOutcome::Unknown, true) =
+        (&outcome, epoch >= 1)
+    {
+        let v = s([
+            ("ThrottleTimeMs", Value::I32(0)),
+            ("ErrorCode", Value::I16(70)), // UNKNOWN_FETCH_SESSION_ID
+            ("SessionId", Value::I32(0)),
+            ("Responses", Value::Array(vec![])),
+            ("NodeEndpoints", Value::Array(vec![])),
+        ]);
+        return Ok((v, false));
+    }
+    if let crate::fetch_session::SessionOutcome::InvalidEpoch = outcome {
+        let v = s([
+            ("ThrottleTimeMs", Value::I32(0)),
+            ("ErrorCode", Value::I16(71)), // INVALID_FETCH_SESSION_EPOCH
+            ("SessionId", Value::I32(0)),
+            ("Responses", Value::Array(vec![])),
+            ("NodeEndpoints", Value::Array(vec![])),
+        ]);
+        return Ok((v, false));
+    }
+    // 全量/增量服务：增量时省略「空且无错」分区（长轮询空闲分区不占字节）
+    let incremental = epoch >= 1;
+    let v = handlers::fetch(targets, ctx, incremental, sess_id_for_resp).await;
+    Ok((v, false))
 }
 
 /// 版本不支持时的兜底响应（ApiVersions 走 v0 特例语义）。

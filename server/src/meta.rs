@@ -77,6 +77,13 @@ pub enum MetaCmd {
         rf: i32,
         reply: oneshot::Sender<bool>,
     },
+    /// CreateTopics 语义：缺则按请求的 partitions/rf 建，存则查回。
+    EnsureTopic {
+        name: String,
+        partitions: i32,
+        rf: i32,
+        reply: oneshot::Sender<(Vec<TopicMeta>, Vec<BrokerInfo>)>,
+    },
     /// 删题（转发控制器，raft 复制后本地 assignment 消失）。
     DeleteTopic {
         name: String,
@@ -257,6 +264,21 @@ impl MetaService {
                 MetaCmd::CreateTopic { name, partitions, rf, reply } => {
                     let ok = self.create_via_controller(&name, partitions, rf).await;
                     let _ = reply.send(ok);
+                }
+                MetaCmd::EnsureTopic { name, partitions, rf, reply } => {
+                    // CreateTopics 语义：请求的 NumPartitions/RF 是**建题参数**
+                    // 而非查询——缺失时按请求值建（≠ Lookup allow_create 的
+                    // broker 默认值；账本 59：请求值被默认值覆盖）。
+                    let mut out = Vec::new();
+                    if let Some(m) = topic_meta_from_cluster(&self.cluster, &name) {
+                        out.push(m);
+                    } else if self.create_via_controller(&name, partitions, rf).await {
+                        if let Some(m) = topic_meta_from_cluster(&self.cluster, &name) {
+                            out.push(m);
+                        }
+                    }
+                    let brokers: Vec<BrokerInfo> = self.cluster.brokers.values().cloned().collect();
+                    let _ = reply.send((out, brokers));
                 }
             }
         }

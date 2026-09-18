@@ -1591,11 +1591,15 @@ impl PartitionActor {
     /// 应用永不见控制记录）+ read_committed 再剥 aborted 区间并汇总条目。
     fn read_for(&mut self, offset: i64, max_bytes: usize, iso: Isolation) -> FetchOutcome {
         let cap = self.cap_for(iso);
+        let probe = (offset, max_bytes, cap);
         if let Some(out) = self.read_through_tiered(offset, max_bytes, cap, iso == Isolation::ReadCommitted) {
             return out;
         }
         match self.log.read_ex(offset, max_bytes, &self.pool, ReadCap::At(cap)) {
-            Err(e) => FetchOutcome::err(e, self.lso),
+            Err(e) => {
+                eprintln!("PROBE-FETCH actor={}/{} off={} max={} cap={} next={} repl={} => {:?}", self.name, self.index, probe.0, probe.1, probe.2, self.log.next_offset, self.log.replicated, e);
+                FetchOutcome::err(e, self.lso)
+            }
             Ok(r) => {
                 let data = self.filter_batches(r.data, iso == Isolation::ReadCommitted);
                 FetchOutcome {

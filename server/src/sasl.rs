@@ -141,22 +141,14 @@ fn rand_server_nonce() -> String {
         .duration_since(UNIX_EPOCH)
         .map(|d| d.as_nanos() as u64)
         .unwrap_or(1);
-    let mut buf = [0u8; 18];
-    for b in buf.iter_mut() {
+    // RFC 5802 nonce：仅可打印 ASCII 且不含逗号——这里收紧为纯字母数字
+    // （Java kafka-clients 对 server-first 做严格解析，任何越界字符整轮
+    // 认证失败；宽松解析器如 librdkafka/franz-go 不设防，账本 60）
+    const ALPHA: &[u8; 62] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789";
+    let mut out = String::with_capacity(24);
+    for _ in 0..24 {
         seed = seed.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
-        *b = (seed >> 33) as u8;
-    }
-    let mut out = String::new();
-    for chunk in buf.chunks(3) {
-        let b = [chunk[0], *chunk.get(1).unwrap_or(&0), *chunk.get(2).unwrap_or(&0)];
-        for (i, byte) in b.iter().enumerate() {
-            match (i, chunk.len()) {
-                (0, _) => out.push(((*byte >> 2) as u8 + b'A') as char),
-                (1, _) => out.push((((byte >> 4) & 0x0F) as u8 + b'a') as char),
-                (2, 3) => out.push((((byte >> 6) & 0x03) as u8 + b'0') as char),
-                _ => {}
-            }
-        }
+        out.push(ALPHA[((seed >> 33) % 62) as usize] as char);
     }
     out
 }
@@ -363,6 +355,17 @@ mod scram_tests {
         match scram_authenticate(&mut sess, &users, client_final.as_bytes()) {
             ScramOutcome::Failed { .. } => {}
             other => panic!("期望失败，得 {other:?}"),
+        }
+    }
+
+    /// server nonce 字符集：仅字母数字（RFC 5802 + Java 严格解析面，
+    /// 账本 60——坏字符在宽松客户端面下长期潜伏）
+    #[test]
+    fn server_nonce_is_alphanumeric() {
+        for _ in 0..50 {
+            let n = rand_server_nonce();
+            assert_eq!(n.len(), 24, "nonce 长度");
+            assert!(n.chars().all(|c| c.is_ascii_alphanumeric()), "非法字符: {n}");
         }
     }
 

@@ -355,7 +355,14 @@ pub async fn create_topics(req: &basalt_protocol::value::Struct, ctx: &Ctx) -> V
             let num_partitions = ts.get("NumPartitions").map(|v| v.as_i32()).unwrap_or(1);
             let rf = ts.get("ReplicationFactor").map(|v| v.as_i32()).unwrap_or(1);
             let (reply_tx, reply_rx) = oneshot::channel();
-            let _ = ctx.meta_tx.send(MetaCmd::Lookup { names: Some(vec![name.clone()]), allow_create: true, reply: reply_tx }).await;
+            // EnsureTopic：请求的 NumPartitions/RF 是建题参数（≠ Lookup
+            // allow_create 的 broker 默认——那会把请求值静默覆盖，账本 59）
+            let _ = ctx.meta_tx.send(MetaCmd::EnsureTopic {
+                name: name.clone(),
+                partitions: num_partitions,
+                rf,
+                reply: reply_tx,
+            }).await;
             let (found, _brokers) = reply_rx.await.unwrap_or_default();
             let (err, msg) = if found.iter().any(|t| t.name == name) {
                 (ErrorCode::None, None)

@@ -689,6 +689,18 @@ impl<D: DiskIo> Log<D> {
         if from_offset > upper {
             return Err(StorageError::OffsetOutOfRange(from_offset));
         }
+        if from_offset >= self.next_offset {
+            // 空日志 / 读端恰在末尾：合法空读（消费长轮询超时空回的语义基础）。
+            // 未写过数据的段文件尚未落盘——此处若继续走段读取，StdDisk 对
+            // 不存在的活动段返回 NotFound，被上层映射为 15（可重试协调器
+            // 错误），客户端消费面对空分区永久 strip+刷新循环（账本 59）。
+            return Ok(ReadResult {
+                data: Bytes::new(),
+                first_offset: from_offset,
+                high_watermark: self.high_watermark,
+                log_start_offset: self.log_start_offset,
+            });
+        }
         let seg = self.segment_for(from_offset);
         let start_pos = seg.locate(from_offset);
         // perf #1：单次大读——将 [start_pos, start_pos+want) 一次读入内存，

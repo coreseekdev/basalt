@@ -161,6 +161,7 @@ impl ConsumerGroup {
             self.maybe_rebalance(now, true);
             return HeartbeatResult { member_id: member_id.into(), member_epoch: -1, ..Default::default() };
         }
+        let mut carry_assignment: Option<BTreeMap<String, Vec<i32>>> = None;
         if member_epoch == -2 {
             // 静态成员临时离开：保留分配（不重算），session timer 跳过
             if let Some(m) = self.members.values_mut().find(|m| m.instance_id.as_deref() == instance_id.as_deref()) {
@@ -170,8 +171,8 @@ impl ConsumerGroup {
         }
 
         if let Some(m) = self.members.get_mut(member_id) {
-            // 已知成员：续租 / 重同步 / fence
-            m.last_seen = now;
+            // 已知成员：续租 / 重同步 / fence（last_seen 在 stale 判定后
+            // 续期——僵尸心跳不得刷新 session timer）
             let stale = member_epoch != m.epoch
                 && !(member_epoch == m.prev_epoch
                     && prev_owned_subset(owned.as_ref(), &m.assignment))
@@ -186,6 +187,7 @@ impl ConsumerGroup {
             }
             if member_epoch != m.epoch {
                 // previous-epoch / epoch-0 恢复：服务端零状态，重发当前分配
+                m.last_seen = now;
                 m.owned = owned.unwrap_or_default();
                 let assignment = m.assignment.clone();
                 return HeartbeatResult {
@@ -200,8 +202,21 @@ impl ConsumerGroup {
                 m.owned = o;
             }
             m.paused = false;
+            m.last_seen = now;
         } else {
-            if member_epoch != 0 {
+            // 静态成员顶替（KIP-345/848 rejoin）：epoch 0 重入且 instance_id
+            // 命中现有成员 → 移除旧（净人数不变，豁免组容量）；分配沿用保
+            // 连续性，重算随 join 强制触发
+            let replaced = instance_id.as_ref().and_then(|iid| {
+                self.members
+                    .values()
+                    .find(|m| m.instance_id.as_deref() == Some(iid))
+                    .map(|m| (m.member_id.clone(), m.assignment.clone()))
+            });
+            if let Some((old_id, old_assignment)) = replaced {
+                self.members.remove(&old_id);
+                carry_assignment = Some(old_assignment);
+            } else if member_epoch != 0 {
                 return HeartbeatResult { fenced: true, unknown_member: true, ..Default::default() };
             }
             if self.max_size > 0 && self.members.len() >= self.max_size {
@@ -246,7 +261,7 @@ impl ConsumerGroup {
                     subscribed: subscribed.clone().unwrap_or_default(),
                     regex: regex.clone(),
                     instance_id: instance_id.clone(),
-                    assignment: BTreeMap::new(),
+                    assignment: carry_assignment.clone().unwrap_or_default(),
                     last_sent: BTreeMap::new(),
                     owned: owned.clone().unwrap_or_default(),
                     rebalance_timeout_ms,
@@ -258,15 +273,17 @@ impl ConsumerGroup {
 
         self.maybe_rebalance(now, is_join);
 
-        // 撤销确认：owner 的 owned 已不含该分区（或已离组）→ 确认释放
+        // 撤销确认：owner 的 owned 已不含该分区（或已离组）→ 确认释放。
+        // 宽限到期的条目保留给 sweep 处理（sweep 会 fence 未完成撤销的
+        // 僵尸 owner，而非静默放行）
         self.pending_release.retain(|tp, (owner, deadline)| {
             if *deadline <= now {
-                return false; // 宽限到期：确认代办
+                return true; // sweep 的 rebalance-timeout fence 面
             }
             self.members
                 .get(owner)
                 .map(|m| !released_by(&m.owned, &tp.0, tp.1))
-                .unwrap_or(true)
+                .unwrap_or(false)
         });
 
         // 差分下发：target −（他人尚未确认释放的分区）。full request
@@ -344,17 +361,33 @@ impl ConsumerGroup {
     /// 释放（确认代办）。返回是否有成员被移除。
     pub fn sweep(&mut self, now: Instant) -> bool {
         let before = self.members.len();
+        // session timeout（paused 静态成员跳过）
         self.members.retain(|_, m| {
             m.paused
                 || now.duration_since(m.last_seen)
                     < Duration::from_millis(self.session_timeout_ms.max(0))
         });
         let removed = self.members.len() != before;
-        self.pending_release.retain(|_, (owner, deadline)| {
-            self.members.contains_key(owner) && *deadline > now
+        // rebalance-timeout fence（T-M3.3.1）：撤销宽限到期且 owner 仍在
+        // 组（未完成撤销也未离组）→ 注销 owner（Kafka rebalance-timeout
+        // fence 语义）；宽限内条目保留
+        let mut fenced: Vec<String> = Vec::new();
+        self.pending_release.retain(|tp, (owner, deadline)| {
+            if *deadline > now {
+                return true;
+            }
+            if self.members.contains_key(owner) {
+                fenced.push(owner.clone());
+            }
+            false
         });
-        if removed {
+        for owner in &fenced {
+            self.members.remove(owner);
+            tracing::info!(member = %owner, "rebalance timeout → member fenced");
+        }
+        if removed || !fenced.is_empty() {
             self.maybe_rebalance(now, true);
+            return true;
         }
         removed
     }
@@ -1008,6 +1041,54 @@ let d = x.cg.describe();
         hb_ka(&mut x, &a_id, u.member_epoch);
         assert_eq!(x.cg.describe().state, "Stable", "窗口过后补算完成");
         assert!(x.cg.members[&a_id].assignment.is_empty(), "退订最终生效");
+    }
+
+    /// 静态成员顶替（T-M3.3.1 P2）：崩溃后的新进程以新 memberId + 同
+    /// InstanceId + epoch 0 重入 → 顶替旧成员，分配连续（KIP-345 rejoin）。
+    #[test]
+    fn static_member_rejoin_replaces() {
+        let mut x = Ctx::new(Default::default());
+        x.cg.partition_counts.insert("t".into(), 2);
+        let a = hb(&mut x, "", 0, vec!["t"], vec![]);
+        let a_id = a.member_id.clone();
+        x.cg.members.get_mut(&a_id).unwrap().instance_id = Some("i1".into());
+        // 新进程：新 member id + 同 InstanceId + epoch 0 → 顶替
+        let n = x.cg.heartbeat(
+            "new-process-id", 0,
+            Some(vec!["t".into()]), None, None,
+            Some("i1".into()), None, 10_000, x.now,
+        );
+        assert_eq!(n.error_code, None, "顶替豁免组容量");
+        assert_eq!(n.member_id, "new-process-id");
+        assert!(x.cg.members.contains_key("new-process-id"));
+        assert!(!x.cg.members.contains_key(&a_id), "旧成员被移除");
+        assert_eq!(x.cg.members["new-process-id"].assignment[&"t".to_string()], vec![0, 1], "分配沿用（重算确定性同结果）");
+        // 顶替后旧 id 心跳 = 僵尸
+        let old = hb(&mut x, &a_id, a.member_epoch, vec!["t"], vec![("t", vec![0])]);
+        assert!(old.fenced && old.unknown_member, "被顶替的旧 id = 25");
+    }
+
+    /// rebalance-timeout fence（T-M3.3.1）：撤销宽限到期且 owner 仍未完成
+    /// 撤销 → owner 注销（Kafka rebalance-timeout fence）。
+    #[test]
+    fn rebalance_timeout_fences_stuck_owner() {
+        let mut x = Ctx::new(Default::default());
+        x.cg.partition_counts.insert("t".into(), 2);
+        let a = hb(&mut x, "", 0, vec!["t"], vec![("t", vec![0, 1])]);
+        let a_id = a.member_id.clone();
+        let b = hb(&mut x, "", 0, vec!["t"], vec![]);
+        let b_id = b.member_id.clone();
+        // pending (t,1)→a，宽限 = a 的 rebalance timeout(10s)
+        assert_eq!(x.cg.pending_release.len(), 1);
+        x.tick(11_000); // 宽限到期，a 未确认（owned 仍含 [0,1]）
+        let removed = x.cg.sweep(x.now);
+        assert!(removed, "宽限到期 → 僵尸 owner 被 fence");
+        assert!(!x.cg.members.contains_key(&a_id), "a 被注销");
+        assert!(x.cg.pending_release.is_empty(), "fence 后 pending 清除");
+        // b 接管全部
+        let b_epoch = x.cg.members[&b_id].epoch;
+        let b2 = hb(&mut x, &b_id, b_epoch, vec!["t"], vec![("t", vec![0, 1])]);
+        assert_eq!(parts_of(&b2, "t"), vec![0, 1], "b 接管全部");
     }
 
     /// 静态成员（T-M3.3.1 P2）：epoch=-2 临时离开保留分配；恢复心跳解除。

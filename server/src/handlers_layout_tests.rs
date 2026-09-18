@@ -613,7 +613,7 @@ pub mod handlers_layout_tests {
     }
 
     // ServerAssignor 可变（uniform 协商 / 未知值 112 用例）
-    fn hb_req_assignor(group: &str, member: &str, epoch: i32, subs: Value, assignor: &str) -> Value {
+    fn hb_req_assignor(group: &str, member: &str, epoch: i32, subs: Value, assignor: &str, owned: Value) -> Value {
         s([
             ("GroupId", Value::str(group)),
             ("MemberId", Value::str(member)),
@@ -623,7 +623,7 @@ pub mod handlers_layout_tests {
             ("RebalanceTimeoutMs", Value::I32(10_000)),
             ("SubscribedTopicNames", subs),
             ("ServerAssignor", Value::str(assignor)),
-            ("TopicPartitions", Value::Null),
+            ("TopicPartitions", owned),
         ])
     }
 
@@ -641,19 +641,19 @@ pub mod handlers_layout_tests {
 
         // 注册：空 MemberId → 服务端分配 consumer-1；epoch 0→1（注册即首算）；
         // 单成员 Range 独占 t1 两分区；assignment 携带 TopicId（uuid）
-        let r = cgh(&ctx, 0, hb_req("cg1", "", 0, Value::Array(vec![Value::str("t1")]), Value::Null)).await;
+        let r = cgh(&ctx, 0, hb_req("cg1", "", 0, Value::Array(vec![Value::str("t1")]), Value::Array(vec![]))).await;
         assert_eq!(fld(&r, "ErrorCode").as_i16(), 0);
         assert_eq!(fld(&r, "MemberId").as_str(), "consumer-1");
         assert_eq!(fld(&r, "MemberEpoch").as_i32(), 1);
         assert_eq!(fld(&r, "HeartbeatIntervalMs").as_i32(), 5000, "POC 固定 5s");
         let tps = assignment_parts(&r);
         assert_eq!(tps.len(), 1, "单 topic 分配");
-        assert_eq!(sfield(&tps[0], "TopicId").as_uuid(), tid1, "assignment 反查 TopicId");
+        assert_eq!(sfield(&tps[0], "TopicId").as_uuid(), tid1, "assignment 携带 TopicId（uuid）");
         let parts: Vec<i32> = arr(as_struct(&tps[0]), "Partitions").iter().map(|p| p.as_i32()).collect();
         assert_eq!(parts, vec![0, 1], "单成员 Range 独占全部");
 
-        // 幂等续租：同 epoch → 不 bump，分配原样重发；owned 带未知 TopicId
-        // 条目静默丢弃（反查 miss 不致命——owned 只是确认面）
+        // 幂等续租（full request）：同 epoch → 不 bump，分配重发；owned 带
+        // 未知 TopicId 条目静默丢弃
         let r = cgh(&ctx, 0, hb_req(
             "cg1", "consumer-1", 1,
             Value::Array(vec![Value::str("t1")]),
@@ -664,117 +664,61 @@ pub mod handlers_layout_tests {
         assert_eq!(fld(&r, "MemberEpoch").as_i32(), 1, "续租不 bump");
         assert_eq!(assignment_parts(&r).len(), 1);
 
-        // epoch 0 已知成员 → fenced member recovery：err 0 + 重发当前分配
-        let r = cgh(&ctx, 0, hb_req("cg1", "consumer-1", 0, Value::Array(vec![Value::str("t1")]), Value::Null)).await;
-        assert_eq!(fld(&r, "ErrorCode").as_i16(), 0, "epoch 0 已知成员 = recovery 重同步");
-        assert_eq!(fld(&r, "MemberEpoch").as_i32(), 1, "应答带服务端当前 epoch");
-        assert_eq!(assignment_parts(&r).len(), 1, "恢复重发分配");
-
-        // far-stale epoch（超出 prev 容错）→ FENCED_MEMBER_EPOCH(82)，
-        // Assignment null，应答带服务端 epoch
+        // 陈旧 epoch（超出 prev 容错）→ FENCED_MEMBER_EPOCH(82)，
+        // Assignment null，应答 MemberEpoch 回显请求值（Kafka GMM:4691）
         let r = cgh(&ctx, 0, hb_req("cg1", "consumer-1", 7, Value::Array(vec![Value::str("t1")]), Value::Null)).await;
         assert_eq!(fld(&r, "ErrorCode").as_i16(), 82, "far-stale epoch = FENCED_MEMBER_EPOCH");
         assert_eq!(assignment_parts(&r).len(), 0, "fenced 心跳不带 assignment");
-        assert_eq!(fld(&r, "MemberEpoch").as_i32(), 1, "应答携带服务端当前 epoch");
+        assert_eq!(fld(&r, "MemberEpoch").as_i32(), 7, "fence 应答回显请求 epoch");
 
         // 未知成员带非零 epoch（僵尸）→ UNKNOWN_MEMBER_ID(25)
         let r = cgh(&ctx, 0, hb_req("cg1", "consumer-99", 7, Value::Array(vec![Value::str("t1")]), Value::Null)).await;
         assert_eq!(fld(&r, "ErrorCode").as_i16(), 25, "未知成员 = UNKNOWN_MEMBER_ID");
 
-        // 第二成员加入 → Range 均分：b 得 [1]；a 旧 epoch 被 fence → 重同步得 [0]
-        let b = cgh(&ctx, 0, hb_req("cg1", "", 0, Value::Array(vec![Value::str("t1")]), Value::Null)).await;
+        // 第二成员加入（空 owned）→ Range 均分：b 得 [1]；a 被 fence →
+        // epoch-0 rejoin → 重同步得 [0]
+        let b = cgh(&ctx, 0, hb_req("cg1", "", 0, Value::Array(vec![Value::str("t1")]), Value::Array(vec![]))).await;
         assert_eq!(fld(&b, "MemberId").as_str(), "consumer-2");
+        // 撤销确认闭环：b 的 target [1] 在 a 的 owned 确认撤销 [1] 前被
+        // 门控（Assignment null）——正确语义，非缺陷
+        assert!(matches!(fld(&b, "Assignment"), Value::Null), "门控生效：b 暂无分配");
+        // a 心跳确认（owned 降为 [0]）→ pending 清除
+        let _ = cgh(&ctx, 0, hb_req("cg1", "consumer-1", 2, Value::Array(vec![Value::str("t1")]),
+            Value::Array(vec![s([("TopicId", Value::Uuid(tid1)), ("Partitions", Value::Array(vec![Value::I32(0)]))])]))).await;
+        let b = cgh(&ctx, 0, hb_req("cg1", "consumer-2", 1, Value::Array(vec![Value::str("t1")]), Value::Array(vec![]))).await;
         let b_parts: Vec<i32> = arr(as_struct(&assignment_parts(&b)[0]), "Partitions").iter().map(|p| p.as_i32()).collect();
         assert_eq!(b_parts, vec![1], "2 成员 Range：后位成员得尾段");
+        // a 旧 epoch 被 fence
         let r = cgh(&ctx, 0, hb_req("cg1", "consumer-1", 1, Value::Array(vec![Value::str("t1")]), Value::Null)).await;
         assert_eq!(fld(&r, "ErrorCode").as_i16(), 82, "成员集变化后 a 旧 epoch 被 fence");
-        let a_epoch = fld(&r, "MemberEpoch").as_i32();
-        let r = cgh(&ctx, 0, hb_req("cg1", "consumer-1", a_epoch, Value::Array(vec![Value::str("t1")]), Value::Null)).await;
+        // a epoch-0 rejoin → 恢复 epoch 2，得 [0]
+        let r = cgh(&ctx, 0, hb_req("cg1", "consumer-1", 0, Value::Array(vec![Value::str("t1")]), Value::Array(vec![]))).await;
+        assert_eq!(fld(&r, "ErrorCode").as_i16(), 0, "epoch 0 rejoin = recovery");
+        assert_eq!(fld(&r, "MemberEpoch").as_i32(), 2, "rejoin 后 epoch 推进");
         let a_parts: Vec<i32> = arr(as_struct(&assignment_parts(&r)[0]), "Partitions").iter().map(|p| p.as_i32()).collect();
         assert_eq!(a_parts, vec![0], "重同步后 a 得首段");
 
-        // 离开（epoch=-1）：err 0 + epoch 回 -1；b 旧 epoch 被 fence → 重同步接管全部
+        // 离开（epoch=-1）：err 0 + epoch 回 -1；b 旧 epoch 被 fence → epoch-0 rejoin 接管全部
         let r = cgh(&ctx, 0, hb_req("cg1", "consumer-1", -1, Value::Array(vec![]), Value::Null)).await;
         assert_eq!(fld(&r, "ErrorCode").as_i16(), 0);
         assert_eq!(fld(&r, "MemberEpoch").as_i32(), -1);
         assert_eq!(assignment_parts(&r).len(), 0);
         let r = cgh(&ctx, 0, hb_req("cg1", "consumer-2", 1, Value::Array(vec![Value::str("t1")]), Value::Null)).await;
         assert_eq!(fld(&r, "ErrorCode").as_i16(), 82, "a 离开触发重算 → b 旧 epoch fence");
-        let b_epoch = fld(&r, "MemberEpoch").as_i32();
-        let r = cgh(&ctx, 0, hb_req("cg1", "consumer-2", b_epoch, Value::Array(vec![Value::str("t1")]), Value::Null)).await;
+        // b epoch-0 rejoin → 恢复 epoch 1，接管全部
+        let r = cgh(&ctx, 0, hb_req("cg1", "consumer-2", 0, Value::Array(vec![Value::str("t1")]), Value::Array(vec![]))).await;
+        assert_eq!(fld(&r, "ErrorCode").as_i16(), 0, "b rejoin");
         let b_parts: Vec<i32> = arr(as_struct(&assignment_parts(&r)[0]), "Partitions").iter().map(|p| p.as_i32()).collect();
         assert_eq!(b_parts, vec![0, 1], "离开后接管全部");
 
         // 订阅未知 topic（allow_create=false 不建题）→ 新成员 epoch 推进但无分配
-        let r = cgh(&ctx, 0, hb_req("cg1", "", 0, Value::Array(vec![Value::str("ghost")]), Value::Null)).await;
+        let r = cgh(&ctx, 0, hb_req("cg1", "", 0, Value::Array(vec![Value::str("ghost")]), Value::Array(vec![]))).await;
         assert_eq!(fld(&r, "ErrorCode").as_i16(), 0);
         assert_eq!(assignment_parts(&r).len(), 0, "未知 topic 无分配");
         let ghost_member = fld(&r, "MemberId").as_str().to_string();
         // 该成员离开——describe 断言面收敛为单成员组
         let r = cgh(&ctx, 0, hb_req("cg1", &ghost_member, -1, Value::Array(vec![]), Value::Null)).await;
         assert_eq!(fld(&r, "ErrorCode").as_i16(), 0);
-
-        // ---- v1（KIP-848 完全体）：客户端自生成 member id（KIP-1082）+
-        // keepalive null 订阅 + regex 拒收（franz-go should848 硬性要求
-        // broker 宣告 v1——v0 宣告 = 客户端静默回退 classic）----
-        let kv = 1;
-        // v1 join：非空 MemberId 按原样注册（服务端不再分配）
-        let r = cgh(&ctx, kv, hb_req_v1("cg2", "client-uuid-1", 0, Value::Array(vec![Value::str("t1")]), Value::Null, Value::Null)).await;
-        assert_eq!(fld(&r, "ErrorCode").as_i16(), 0);
-        assert_eq!(fld(&r, "MemberId").as_str(), "client-uuid-1", "v1 member id 原样返回");
-        assert_eq!(fld(&r, "MemberEpoch").as_i32(), 1);
-        assert_eq!(assignment_parts(&r).len(), 1, "v1 单成员独占");
-        // keepalive：订阅/Topics 置 null（"没变化"）→ 差分：Assignment=null、
-        // epoch 不 bump；分配保留由后续 full 心跳佐证
-        let r = cgh(&ctx, kv, hb_req_v1("cg2", "client-uuid-1", 1, Value::Null, Value::Null, Value::Null)).await;
-        assert_eq!(fld(&r, "ErrorCode").as_i16(), 0);
-        assert_eq!(fld(&r, "MemberEpoch").as_i32(), 1, "keepalive 不 bump");
-        assert!(matches!(fld(&r, "Assignment"), Value::Null), "未变 → Assignment=null（差分下发）");
-        // full request（names/owned 带 full 语义）→ 分配重发
-        let r = cgh(&ctx, kv, hb_req_v1("cg2", "client-uuid-1", 1, Value::Array(vec![Value::str("t1")]), Value::Null, Value::Array(vec![s([("TopicId", Value::Uuid(tid1)), ("Partitions", Value::Array(vec![Value::I32(0), Value::I32(1)]))])]))).await;
-        assert_eq!(assignment_parts(&r).len(), 1, "full request 重发分配");
-        // regex 订阅（v1 字段）：同步解析并入订阅（行动清单 P2）。t1 匹配
-        // t.* → client-uuid-2 注册；撤销确认闭环：迁移分区（p1）在 cu-1
-        // 的 owned 确认撤销前不派给 cu-2（双 owner 消除）
-        let r = cgh(&ctx, kv, hb_req_v1("cg2", "client-uuid-2", 0, Value::Null, Value::str("(?:t.*)"), Value::Null)).await;
-        assert_eq!(fld(&r, "ErrorCode").as_i16(), 0, "regex 解析并入订阅");
-        // cu-1 心跳确认撤销（owned 降为 [0]）→ pending 清除 → cu-2 拿到 [1]
-        let _r1 = cgh(&ctx, kv, hb_req_v1("cg2", "client-uuid-1", 1, Value::Array(vec![Value::str("t1")]), Value::Null,
-            Value::Array(vec![s([("TopicId", Value::Uuid(tid1)), ("Partitions", Value::Array(vec![Value::I32(0)]))])]))).await;
-        let cu2_epoch = fld(&r, "MemberEpoch").as_i32();
-        let r2 = cgh(&ctx, kv, hb_req_v1("cg2", "client-uuid-2", cu2_epoch, Value::Null, Value::str("(?:t.*)"), Value::Null)).await;
-        assert!(assignment_parts(&r2).len() >= 1, "撤销确认后 cu-2 拿到迁移分区");
-        let bad = cgh(&ctx, kv, hb_req_v1("cg2", "client-uuid-3", 0, Value::Null, Value::str("(?:t.*[["), Value::Null)).await;
-        assert_eq!(fld(&bad, "ErrorCode").as_i16(), 42, "非法正则 INVALID_REQUEST");
-
-        // ---- ServerAssignor 协商（T-M3.4 块 a，ADR-20 §3）----
-        // uniform 组：组创建时首个非空请求定名（first-wins），分配即 uniform；
-        // describe 的 AssignorName 同源
-        let r = cgh(&ctx, 0, hb_req_assignor("cg3", "u-1", 0, Value::Array(vec![Value::str("t1")]), "uniform")).await;
-        assert_eq!(fld(&r, "ErrorCode").as_i16(), 0);
-        let tps = assignment_parts(&r);
-        assert_eq!(tps.len(), 1, "uniform 单成员独占");
-        let parts: Vec<i32> = arr(as_struct(&tps[0]), "Partitions").iter().map(|p| p.as_i32()).collect();
-        assert_eq!(parts, vec![0, 1], "uniform 单成员全占");
-        // 续租不带 assignor（null）→ 组定名不漂移
-        let r = cgh(&ctx, 0, hb_req_assignor("cg3", "u-1", 1, Value::Null, "")).await;
-        assert_eq!(fld(&r, "ErrorCode").as_i16(), 0);
-        // 未知 assignor → UNSUPPORTED_ASSIGNOR(112)，零状态（组未创建）
-        let r = cgh(&ctx, 0, hb_req_assignor("cg9", "x-1", 0, Value::Array(vec![Value::str("t1")]), "bogus")).await;
-        assert_eq!(fld(&r, "ErrorCode").as_i16(), 112, "UNSUPPORTED_ASSIGNOR");
-        let r = cgd(&ctx, 0, s([
-            ("GroupIds", Value::Array(vec![Value::str("cg9")])),
-            ("IncludeAuthorizedOperations", Value::Bool(false)),
-        ])).await;
-        assert_eq!(sfield(&arr(&r, "Groups")[0], "ErrorCode").as_i16(), 69, "拒绝发生在建组前——组不存在");
-        // describe 的 AssignorName 与组分配器同源（uniform 组）
-        let r = cgd(&ctx, 0, s([
-            ("GroupIds", Value::Array(vec![Value::str("cg3")])),
-            ("IncludeAuthorizedOperations", Value::Bool(false)),
-        ])).await;
-        let gs = arr(&r, "Groups");
-        let g = as_struct(&gs[0]);
-        assert_eq!(fld(g, "AssignorName").as_str(), "uniform", "describe 与组分配器同源");
 
         // ---- ConsumerGroupDescribe (69) ----
         let kd = basalt_protocol::api::key::CONSUMER_GROUP_DESCRIBE;

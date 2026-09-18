@@ -114,6 +114,8 @@ pub struct HeartbeatResult {
     pub fenced: bool,
     pub unknown_member: bool,
     pub error_code: Option<i16>,
+    /// 错误消息（error_code 同级；协议面回 ErrorMessage）
+    pub error_message: Option<String>,
     pub changed: bool,
 }
 
@@ -158,10 +160,30 @@ impl ConsumerGroup {
     ) -> HeartbeatResult {
         if member_epoch == -1 {
             self.members.remove(member_id);
+            // 离开者的撤销确认条目随之作废（人已走，分区由重算重新分配）
+            self.pending_release.retain(|_, (owner, _)| owner != member_id);
             self.maybe_rebalance(now, true);
             return HeartbeatResult { member_id: member_id.into(), member_epoch: -1, ..Default::default() };
         }
-        let mut carry_assignment: Option<BTreeMap<String, Vec<i32>>> = None;
+        // epoch 范围与 -2 静态离开校验（任意心跳，含已知成员）；
+        // join 校验矩阵（GCS:474-516 对照）在 unknown 分支内——已知成员的
+        // epoch-0 恢复不受 join 校验约束
+        if member_epoch < -2 {
+            return HeartbeatResult {
+                member_epoch,
+                error_code: Some(42),
+                error_message: Some("member epoch must be >= -2".into()),
+                ..Default::default()
+            };
+        }
+        if member_epoch == -2 && instance_id.is_none() {
+            return HeartbeatResult {
+                member_epoch,
+                error_code: Some(42),
+                error_message: Some("static member leave requires InstanceId".into()),
+                ..Default::default()
+            };
+        }
         if member_epoch == -2 {
             // 静态成员临时离开：保留分配（不重算），session timer 跳过
             if let Some(m) = self.members.values_mut().find(|m| m.instance_id.as_deref() == instance_id.as_deref()) {
@@ -170,6 +192,8 @@ impl ConsumerGroup {
             return HeartbeatResult { member_id: member_id.into(), member_epoch: -2, ..Default::default() };
         }
 
+        let mut carry_assignment: Option<BTreeMap<String, Vec<i32>>> = None;
+        let known = self.members.contains_key(member_id);
         if let Some(m) = self.members.get_mut(member_id) {
             // 已知成员：续租 / 重同步 / fence（last_seen 在 stale 判定后
             // 续期——僵尸心跳不得刷新 session timer）
@@ -178,9 +202,11 @@ impl ConsumerGroup {
                     && prev_owned_subset(owned.as_ref(), &m.assignment))
                 && member_epoch != 0;
             if stale {
+                // fence 应答 MemberEpoch = 请求原值（Kafka GMM:4691 对齐；
+                // 客户端凭 error code 决定重新 join，非服务端 epoch 回显）
                 return HeartbeatResult {
                     member_id: member_id.into(),
-                    member_epoch: m.epoch,
+                    member_epoch,
                     fenced: true,
                     ..Default::default()
                 };
@@ -204,9 +230,40 @@ impl ConsumerGroup {
             m.paused = false;
             m.last_seen = now;
         } else {
-            // 静态成员顶替（KIP-345/848 rejoin）：epoch 0 重入且 instance_id
-            // 命中现有成员 → 移除旧（净人数不变，豁免组容量）；分配沿用保
-            // 连续性，重算随 join 强制触发
+            // 未知成员 = 候选 join：join 校验矩阵（GCS:474-516 对照——
+            // 仅作用于真正的 join，已知成员的 epoch-0 恢复不受影响）
+            if member_epoch == 0 {
+                if rebalance_timeout_ms == -1 {
+                    return HeartbeatResult {
+                        member_epoch,
+                        error_code: Some(42),
+                        error_message: Some("join requires RebalanceTimeoutMs".into()),
+                        ..Default::default()
+                    };
+                }
+                // 「空」= 没有声明任何非空分区列表（{"t": []} 合法——
+                // topic 声明不等于持有声明）
+                if owned.as_ref().map(|o| o.values().any(|ps| !ps.is_empty())).unwrap_or(true) {
+                    return HeartbeatResult {
+                        member_epoch,
+                        error_code: Some(42),
+                        error_message: Some("TopicPartitions must be empty when joining".into()),
+                        ..Default::default()
+                    };
+                }
+                if subscribed.is_none() && regex.is_none() {
+                    return HeartbeatResult {
+                        member_epoch,
+                        error_code: Some(42),
+                        error_message: Some("join requires SubscribedTopicNames or SubscribedTopicRegex".into()),
+                        ..Default::default()
+                    };
+                }
+            } else {
+                return HeartbeatResult { fenced: true, unknown_member: true, ..Default::default() };
+            }
+            // 静态成员顶替（KIP-345/848 rejoin）：instance_id 命中现有成员
+            // → 移除旧（净人数不变，豁免组容量）；分配沿用保连续性
             let replaced = instance_id.as_ref().and_then(|iid| {
                 self.members
                     .values()
@@ -216,8 +273,6 @@ impl ConsumerGroup {
             if let Some((old_id, old_assignment)) = replaced {
                 self.members.remove(&old_id);
                 carry_assignment = Some(old_assignment);
-            } else if member_epoch != 0 {
-                return HeartbeatResult { fenced: true, unknown_member: true, ..Default::default() };
             }
             if self.max_size > 0 && self.members.len() >= self.max_size {
                 return HeartbeatResult {
@@ -304,6 +359,7 @@ impl ConsumerGroup {
             fenced: false,
             unknown_member: false,
             error_code: None,
+            error_message: None,
             changed,
         }
     }
@@ -815,20 +871,21 @@ mod consumer_group_tests {
 
         let b = hb(&mut x, "", 0, vec!["t"], vec![]);
         assert!(b.member_epoch >= 1);
-        // b 加入重算后：a 旧 epoch + owned ⊄ 新分配 → fence
+        // b 加入重算后：a 旧 epoch + owned ⊄ 新分配 → fence（应答回显
+        // 请求 epoch——Kafka GMM:4691 对齐）；fenced 客户端以 epoch 0
+        // rejoin 恢复
         let fenced = hb(&mut x, &a.member_id, a.member_epoch, vec!["t"], vec![("t", vec![0, 1])]);
         assert!(fenced.fenced, "旧 epoch + owned 超集必须 fence");
-        let a_epoch = fenced.member_epoch;
-        let a2 = hb(&mut x, &a.member_id, a_epoch, vec!["t"], vec![("t", vec![0])]);
-        assert_eq!(a2.member_epoch, a_epoch, "重同步后续租");
+        assert_eq!(fenced.member_epoch, a.member_epoch, "fence 应答回显请求 epoch");
+        let a2 = hb(&mut x, &a.member_id, 0, vec!["t"], vec![]);
+        assert_eq!(a2.member_epoch, 2, "epoch 0 rejoin → 恢复到服务端 epoch");
         assert_eq!(parts_of(&a2, "t").len(), 1, "2 成员 2 分区各持 1");
 
         hb(&mut x, &b.member_id, -1, vec![], vec![]);
-        // b 离开重算后：a 的 prev-epoch + owned 子集 = 应答丢失恢复（放行，
-        // 账本 54 对照语义）；更老的 epoch（落后于 prev）才是 fence
-        let leave = hb(&mut x, &a.member_id, a2.member_epoch - 1, vec!["t"], vec![("t", vec![0])]);
-        assert!(leave.fenced, "落后于 prev 的 epoch 必须 fence");
-        let a3 = hb(&mut x, &a.member_id, leave.member_epoch, vec!["t"], vec![("t", vec![0])]);
+        // b 离开重算后：a 以 epoch-0 rejoin 恢复 → 接管全部
+        // （leave.member_epoch - 1 的 far-stale 方向已在 fence 断言覆盖）
+        let a3 = hb(&mut x, &a.member_id, 0, vec!["t"], vec![]);
+        assert_eq!(a3.member_epoch, 3, "epoch-0 rejoin → 服务端 epoch +1");
         assert_eq!(parts_of(&a3, "t"), vec![0, 1], "恢复后接管全部");
     }
 
@@ -841,7 +898,9 @@ mod consumer_group_tests {
         let a = hb(&mut x, "", 0, vec!["t"], vec![]);
         hb(&mut x, "", 0, vec!["t"], vec![]); // 第二成员加入 → a epoch 2 / prev 1
         // prev-epoch + owned ⊆ → 重同步（应答丢失恢复，不再 fence）
+        eprintln!("DBG before sync: a.epoch={} a.prev={}", x.cg.members[&a.member_id].epoch, x.cg.members[&a.member_id].prev_epoch);
         let sync = hb(&mut x, &a.member_id, a.member_epoch.saturating_sub(1), vec!["t"], vec![("t", vec![0])]);
+        eprintln!("DBG sync: fenced={} member_epoch={}", sync.fenced, sync.member_epoch);
         assert!(!sync.fenced, "prev-epoch + owned ⊆ 分配 = 应答丢失恢复，放行");
         assert_eq!(sync.member_epoch, a.member_epoch + 1, "重同步回服务端当前 epoch");
         // 已知成员 epoch 0 → fenced member recovery，重发分配
@@ -866,9 +925,10 @@ mod consumer_group_tests {
         let ka = hb_ka(&mut x, &a.member_id, a.member_epoch);
         assert!(!ka.fenced && !ka.changed, "keepalive 无差分下发");
         assert_eq!(x.cg.members[&a.member_id].assignment[&"t".to_string()], vec![0, 1], "target 保留");
-        // 新成员带 None 订阅 = 空订阅（无分配但不挂）
-        let b = hb_ka(&mut x, "", 0);
-        assert!(!b.fenced && b.assignment.is_empty());
+        // 新成员 join 缺订阅（names/regex 双 null）→ INVALID_REQUEST(42)
+        // （Kafka 对齐：join 必须声明订阅）
+        let bad = hb_ka(&mut x, "", 0);
+        assert_eq!(bad.error_code, Some(42), "null 订阅 join = INVALID_REQUEST");
     }
 
     /// 退订：订阅集变化 → 重算后该 topic 不在 target。
@@ -952,8 +1012,10 @@ let d = x.cg.describe();
     fn revocation_gates_new_owner() {
         let mut x = Ctx::new(Default::default());
         x.cg.partition_counts.insert("t".into(), 2);
-        let a = hb(&mut x, "", 0, vec!["t"], vec![("t", vec![0, 1])]);
+        // a 的 join 必带空 owned（GCS:474 对齐）；持有经续租上报
+        let a = hb(&mut x, "", 0, vec!["t"], vec![]);
         let a_id = a.member_id.clone();
+        let _ = hb(&mut x, &a_id, a.member_epoch, vec!["t"], vec![("t", vec![0, 1])]);
         // B 加入：target 拆 [0]/[1]，但 A 的 owned 仍含 [0,1]（未确认撤销）
         let b = hb(&mut x, "", 0, vec!["t"], vec![("t", vec![])]).member_id.clone();
         let b_view = &x.cg.members[&b].assignment;
@@ -1055,7 +1117,7 @@ let d = x.cg.describe();
         // 新进程：新 member id + 同 InstanceId + epoch 0 → 顶替
         let n = x.cg.heartbeat(
             "new-process-id", 0,
-            Some(vec!["t".into()]), None, None,
+            Some(vec!["t".into()]), None, Some(BTreeMap::new()),
             Some("i1".into()), None, 10_000, x.now,
         );
         assert_eq!(n.error_code, None, "顶替豁免组容量");
@@ -1074,8 +1136,10 @@ let d = x.cg.describe();
     fn rebalance_timeout_fences_stuck_owner() {
         let mut x = Ctx::new(Default::default());
         x.cg.partition_counts.insert("t".into(), 2);
-        let a = hb(&mut x, "", 0, vec!["t"], vec![("t", vec![0, 1])]);
+        let a = hb(&mut x, "", 0, vec!["t"], vec![]);
         let a_id = a.member_id.clone();
+        // a 上报持有（pending 门控的前提）
+        let _ = hb(&mut x, &a_id, a.member_epoch, vec!["t"], vec![("t", vec![0, 1])]);
         let b = hb(&mut x, "", 0, vec!["t"], vec![]);
         let b_id = b.member_id.clone();
         // pending (t,1)→a，宽限 = a 的 rebalance timeout(10s)

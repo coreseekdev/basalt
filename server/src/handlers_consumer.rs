@@ -205,6 +205,11 @@ pub async fn consumer_group_heartbeat(req: &basalt_protocol::value::Struct, ctx:
     } else {
         ErrorCode::None as i16
     };
+    let err_msg = if err_i16 == 0 {
+        Value::Null
+    } else {
+        res.error_message.clone().map(|m| Value::Str(m.into())).unwrap_or(Value::Null)
+    };
     let assignment_val = if !res.fenced && res.error_code.is_none() && res.changed {
         assignment_value(&res.assignment, &tids)
     } else {
@@ -214,7 +219,7 @@ pub async fn consumer_group_heartbeat(req: &basalt_protocol::value::Struct, ctx:
     s([
         throttle_field(),
         ("ErrorCode", Value::I16(err_i16)),
-        ("ErrorMessage", Value::Null),
+        ("ErrorMessage", err_msg),
         ("MemberId", Value::str(res.member_id)),
         ("MemberEpoch", Value::I32(res.member_epoch)),
         ("HeartbeatIntervalMs", Value::I32(HEARTBEAT_INTERVAL_MS)),

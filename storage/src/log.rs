@@ -954,6 +954,22 @@ impl<D: DiskIo> Log<D> {
         self.disk.read_all(&seg.path)
     }
 
+    /// sealed 段文件路径（分层 offloader 直读用）
+    pub fn sealed_path(&self, base: i64) -> Option<std::path::PathBuf> {
+        self.sealed
+            .iter()
+            .find(|s| s.base_offset == base)
+            .map(|s| s.path.clone())
+    }
+
+    /// sealed 段稀疏批边界索引快照（分层上传随记录存档）
+    pub fn sealed_index_entries(&self, base: i64) -> Option<Vec<(u32, u32)>> {
+        self.sealed
+            .iter()
+            .find(|s| s.base_offset == base)
+            .map(|s| s.offset_index.entries().to_vec())
+    }
+
     /// 分层回收（T-M4.3，ADR-21 §2）：移除指定 sealed 段的内存与本地文件，
     /// **不推进 log_start_offset**——分层数据仍可读（log start 由 retention
     /// 决定，不由分层回收决定）；读路径对 < 首个本地段 base 的区间由

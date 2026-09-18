@@ -28,6 +28,17 @@ pub trait ObjectStore: Send + Sync {
     fn delete(&self, key: &str) -> Result<()>;
     /// 列出前缀下全部 key（字典序）。
     fn list(&self, prefix: &str) -> Result<Vec<String>>;
+    /// 范围读（大段部分读；S3 = Range header）。越界部分截断。
+    fn get_range(&self, key: &str, start: u64, len: usize) -> Result<Vec<u8>> {
+        let all = self.get(key)?;
+        let s = (start as usize).min(all.len());
+        let e = (s + len).min(all.len());
+        Ok(all[s..e].to_vec())
+    }
+    /// 对象修改时刻（epoch ms）；None = 实现不提供（GC 跳过该对象）。
+    fn mtime_ms(&self, _key: &str) -> Option<u64> {
+        None
+    }
 }
 
 /// create 的成功/幂等结果：Stored = 本调用写入；AlreadyExistsStored(已有字节)
@@ -101,6 +112,29 @@ impl ObjectStore for LocalFsObjectStore {
             }
             Err(e) => Err(StorageError::Other(format!("objectstore create {key}: {e}"))),
         }
+    }
+
+    fn get_range(&self, key: &str, start: u64, len: usize) -> Result<Vec<u8>> {
+        use std::io::{Read, Seek, SeekFrom};
+        let p = self.path_of(key);
+        let mut f = std::fs::File::open(&p)
+            .map_err(|e| StorageError::Other(format!("objectstore open {key}: {e}")))?;
+        let flen = f.metadata().map(|m| m.len()).unwrap_or(0);
+        let start = start.min(flen);
+        let len = len.min((flen - start) as usize);
+        f.seek(SeekFrom::Start(start))
+            .map_err(|e| StorageError::Other(format!("objectstore seek {key}: {e}")))?;
+        let mut buf = vec![0u8; len];
+        f.read_exact(&mut buf).map_err(|e| StorageError::Other(format!("objectstore read {key}: {e}")))?;
+        Ok(buf)
+    }
+
+    fn mtime_ms(&self, key: &str) -> Option<u64> {
+        std::fs::metadata(self.path_of(key))
+            .ok()
+            .and_then(|m| m.modified().ok())
+            .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+            .map(|d| d.as_millis() as u64)
     }
 
     fn delete(&self, key: &str) -> Result<()> {
@@ -259,13 +293,15 @@ mod object_store_tests {
     }
 }
 
-/// 段对象/段记录 key 生成（ADR-21 §2；与本地段 20 位命名对齐）。
+/// 段对象/段记录 key 生成（ADR-21 §2 + v1.1：key 编入 leader epoch——
+/// failover/截断后的同 base 新内容 = 新 key，对象层面永不覆盖；
+/// Redpanda term-in-key 同款）
 pub mod keys {
-    pub fn segment(topic: &str, partition: i32, base: i64) -> String {
-        format!("/{topic}/p{partition}/seg/{base:020}.log")
+    pub fn segment(topic: &str, partition: i32, base: i64, epoch: i32) -> String {
+        format!("/{topic}/p{partition}/seg/{base:020}.e{epoch}.log")
     }
-    pub fn record(topic: &str, partition: i32, base: i64) -> String {
-        format!("/{topic}/p{partition}/rec/{base:020}.json")
+    pub fn record(topic: &str, partition: i32, base: i64, epoch: i32) -> String {
+        format!("/{topic}/p{partition}/rec/{base:020}.e{epoch}.json")
     }
     pub fn segment_prefix(topic: &str, partition: i32) -> String {
         format!("/{topic}/p{partition}/seg/")
@@ -282,8 +318,14 @@ pub struct SegmentRecord {
     pub base: i64,
     pub last_offset: i64,
     pub bytes: u64,
-    /// 段对象 key
+    /// 段对象 key（含 leader epoch）
     pub key: String,
+    /// 上传时的 leader epoch（记录追加式：同 base 不同 epoch = 不同对象）
+    pub epoch: i32,
+    /// 段对象 crc32c（读回校验）
+    pub crc32: u32,
+    /// 稀疏批边界索引 (rel_offset, pos)——range 读定位用
+    pub index: Vec<(u32, u32)>,
 }
 
 pub fn encode_record(r: &SegmentRecord) -> Result<Vec<u8>> {

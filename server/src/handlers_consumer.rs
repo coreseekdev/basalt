@@ -44,7 +44,7 @@ pub async fn consumer_group_heartbeat(req: &basalt_protocol::value::Struct, ctx:
     let member_epoch = req.get("MemberEpoch").map(|v| v.as_i32()).unwrap_or(-1);
     // KIP-848 keepalive 语义：未变字段置 null = "没变化"——null 订阅不得当
     // 退订（franz-go topicsMatch 路径每拍都发 null，误判 = 成员每拍丢分配）
-    let subscribed: Option<Vec<String>> = match req.get("SubscribedTopicNames") {
+    let mut subscribed: Option<Vec<String>> = match req.get("SubscribedTopicNames") {
         Some(Value::Array(a)) => Some(
             a.iter()
                 .map(|x| x.as_str().to_string())
@@ -53,26 +53,54 @@ pub async fn consumer_group_heartbeat(req: &basalt_protocol::value::Struct, ctx:
         ),
         _ => None,
     };
-    // SubscribedTopicRegex（v1）：正则订阅是 ADR-19 §1 非目标——显式拒收
-    // （INVALID_REQUEST=42，848 支持错误集内），不静默吞掉（吞掉 = 客户端
-    // 零订阅零消费，假绿）
+    // SubscribedTopicRegex（v1，行动清单 P2）：同步解析为显式 topic 名单
+    // 并入订阅（Kafka 为异步解析——basalt 简化为心跳时解析，新 topic 下拍
+    // 心跳自然纳入；语义差异记录 ADR-19 §7）。非法正则 → INVALID_REQUEST(42)。
+    let mut regex_field: Option<String> = None;
     if let Some(v) = req.get("SubscribedTopicRegex") {
-        let regex = v.as_str();
-        if !regex.is_empty() {
-            return s([
-                throttle_field(),
-                ("ErrorCode", Value::I16(ErrorCode::InvalidRequest as i16)),
-                ("ErrorMessage", Value::Str("SubscribedTopicRegex is not supported (POC boundary)".into())),
-                ("MemberId", Value::str(member_id)),
-                ("MemberEpoch", Value::I32(member_epoch)),
-                ("HeartbeatIntervalMs", Value::I32(HEARTBEAT_INTERVAL_MS)),
-                ("Assignment", Value::Null),
-            ]);
+        let pattern = v.as_str();
+        if !pattern.is_empty() {
+            let resolved = match regex::Regex::new(pattern) {
+                Ok(re) => {
+                    let (amtx, amrx) = oneshot::channel();
+                    let _ = ctx
+                        .meta_tx
+                        .send(MetaCmd::Lookup { names: None, allow_create: false, reply: amtx })
+                        .await;
+                    let (metas, _brokers) = amrx.await.unwrap_or_default();
+                    metas
+                        .iter()
+                        .map(|t| t.name.clone())
+                        .filter(|n| re.is_match(n))
+                        .collect::<Vec<_>>()
+                }
+                Err(_) => {
+                    return s([
+                        throttle_field(),
+                        ("ErrorCode", Value::I16(ErrorCode::InvalidRequest as i16)),
+                        ("ErrorMessage", Value::Str(format!("invalid SubscribedTopicRegex {pattern}").into())),
+                        ("MemberId", Value::str(member_id.clone())),
+                        ("MemberEpoch", Value::I32(member_epoch)),
+                        ("HeartbeatIntervalMs", Value::I32(HEARTBEAT_INTERVAL_MS)),
+                        ("Assignment", Value::Null),
+                    ]);
+                }
+            };
+            // names ∪ resolved（Kafka 语义：订阅 = 显式名 ∪ 正则解析）
+            let mut merged = subscribed.clone().unwrap_or_default();
+            for n in resolved {
+                if !merged.contains(&n) {
+                    merged.push(n);
+                }
+            }
+            subscribed = Some(merged);
+            regex_field = Some(pattern.to_string());
         }
     }
     // 请求 owned 的 TopicId → 名反查（接线要点①）：组状态机以名字为键。
-    // 未知 TopicId 的 owned 条目丢弃——owned 是增量确认面，状态机不据此分配。
-    let owned: BTreeMap<String, Vec<i32>> = {
+    // None = 请求未带（null）；未知 TopicId 的 owned 条目丢弃——owned 是
+    // 增量确认面，状态机不据此分配。
+    let owned: Option<BTreeMap<String, Vec<i32>>> = if matches!(req.get("TopicPartitions"), Some(Value::Array(_))) {
         let routes = ctx.routes();
         let mut out = BTreeMap::new();
         if let Some(Value::Array(tps)) = req.get("TopicPartitions") {
@@ -87,8 +115,16 @@ pub async fn consumer_group_heartbeat(req: &basalt_protocol::value::Struct, ctx:
                 out.insert(name, parts);
             }
         }
-        out
+        Some(out)
+    } else {
+        None
     };
+    let instance_id = req
+        .get("InstanceId")
+        .map(|v| v.as_str())
+        .filter(|s| !s.is_empty())
+        .map(|s| s.to_string());
+    let rebalance_timeout_ms = req.get("RebalanceTimeoutMs").map(|v| v.as_i32()).unwrap_or(-1);
 
     // ServerAssignor 协商（T-M3.4，ADR-20 §3）：null = 未变；POC 支持
     // range/uniform，未知值直接拒绝——UNSUPPORTED_ASSIGNOR=112（kerr/
@@ -132,6 +168,9 @@ pub async fn consumer_group_heartbeat(req: &basalt_protocol::value::Struct, ctx:
         subscribed,
         assignor,
         owned,
+        instance_id,
+        regex: regex_field,
+        rebalance_timeout_ms,
         counts,
         reply: tx,
     });
@@ -156,17 +195,25 @@ pub async fn consumer_group_heartbeat(req: &basalt_protocol::value::Struct, ctx:
         tids.extend(tids2);
     }
 
-    // fenced 三态 → 错误码（接线要点③）：fenced 心跳不带 assignment、零状态
-    let (err, assignment_val) = if res.fenced {
+    // fenced 三态 → 错误码（接线要点③）：fenced 心跳不带 assignment、零
+    // 状态；error_code 直透（组容量 81 等）；差分：未变 → Assignment=null
+    let err_i16: i16 = if res.fenced {
         let code = if res.unknown_member { ErrorCode::UnknownMemberId } else { ErrorCode::FencedMemberEpoch };
-        (code, Value::Null)
+        code as i16
+    } else if let Some(code) = res.error_code {
+        code
     } else {
-        (ErrorCode::None, assignment_value(&res.assignment, &tids))
+        ErrorCode::None as i16
+    };
+    let assignment_val = if !res.fenced && res.error_code.is_none() && res.changed {
+        assignment_value(&res.assignment, &tids)
+    } else {
+        Value::Null
     };
 
     s([
         throttle_field(),
-        ("ErrorCode", Value::I16(err as i16)),
+        ("ErrorCode", Value::I16(err_i16)),
         ("ErrorMessage", Value::Null),
         ("MemberId", Value::str(res.member_id)),
         ("MemberEpoch", Value::I32(res.member_epoch)),

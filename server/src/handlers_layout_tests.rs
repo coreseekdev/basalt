@@ -595,8 +595,9 @@ pub mod handlers_layout_tests {
         ])
     }
 
-    // v1 请求：+ SubscribedTopicRegex 字段（宣告 0-1）
-    fn hb_req_v1(group: &str, member: &str, epoch: i32, subs: Value, regex: Value) -> Value {
+    // v1 请求：+ SubscribedTopicRegex 字段（宣告 0-1）；owned 透传（full
+    // request 判定 = names/regex 与 owned 均非 null，Kafka GMM:2715）
+    fn hb_req_v1(group: &str, member: &str, epoch: i32, subs: Value, regex: Value, owned: Value) -> Value {
         s([
             ("GroupId", Value::str(group)),
             ("MemberId", Value::str(member)),
@@ -607,7 +608,7 @@ pub mod handlers_layout_tests {
             ("SubscribedTopicNames", subs),
             ("SubscribedTopicRegex", regex),
             ("ServerAssignor", Value::str("range")),
-            ("TopicPartitions", Value::Null),
+            ("TopicPartitions", owned),
         ])
     }
 
@@ -663,9 +664,16 @@ pub mod handlers_layout_tests {
         assert_eq!(fld(&r, "MemberEpoch").as_i32(), 1, "续租不 bump");
         assert_eq!(assignment_parts(&r).len(), 1);
 
-        // 陈旧 epoch → FENCED_MEMBER_EPOCH(82)，Assignment null，应答带服务端 epoch
+        // epoch 0 已知成员 → fenced member recovery：err 0 + 重发当前分配
         let r = cgh(&ctx, 0, hb_req("cg1", "consumer-1", 0, Value::Array(vec![Value::str("t1")]), Value::Null)).await;
-        assert_eq!(fld(&r, "ErrorCode").as_i16(), 82, "stale epoch = FENCED_MEMBER_EPOCH");
+        assert_eq!(fld(&r, "ErrorCode").as_i16(), 0, "epoch 0 已知成员 = recovery 重同步");
+        assert_eq!(fld(&r, "MemberEpoch").as_i32(), 1, "应答带服务端当前 epoch");
+        assert_eq!(assignment_parts(&r).len(), 1, "恢复重发分配");
+
+        // far-stale epoch（超出 prev 容错）→ FENCED_MEMBER_EPOCH(82)，
+        // Assignment null，应答带服务端 epoch
+        let r = cgh(&ctx, 0, hb_req("cg1", "consumer-1", 7, Value::Array(vec![Value::str("t1")]), Value::Null)).await;
+        assert_eq!(fld(&r, "ErrorCode").as_i16(), 82, "far-stale epoch = FENCED_MEMBER_EPOCH");
         assert_eq!(assignment_parts(&r).len(), 0, "fenced 心跳不带 assignment");
         assert_eq!(fld(&r, "MemberEpoch").as_i32(), 1, "应答携带服务端当前 epoch");
 
@@ -711,19 +719,33 @@ pub mod handlers_layout_tests {
         // broker 宣告 v1——v0 宣告 = 客户端静默回退 classic）----
         let kv = 1;
         // v1 join：非空 MemberId 按原样注册（服务端不再分配）
-        let r = cgh(&ctx, kv, hb_req_v1("cg2", "client-uuid-1", 0, Value::Array(vec![Value::str("t1")]), Value::Null)).await;
+        let r = cgh(&ctx, kv, hb_req_v1("cg2", "client-uuid-1", 0, Value::Array(vec![Value::str("t1")]), Value::Null, Value::Null)).await;
         assert_eq!(fld(&r, "ErrorCode").as_i16(), 0);
         assert_eq!(fld(&r, "MemberId").as_str(), "client-uuid-1", "v1 member id 原样返回");
         assert_eq!(fld(&r, "MemberEpoch").as_i32(), 1);
         assert_eq!(assignment_parts(&r).len(), 1, "v1 单成员独占");
-        // keepalive：订阅/Topics 置 null（"没变化"）→ 订阅保持、分配保留、不 bump
-        let r = cgh(&ctx, kv, hb_req_v1("cg2", "client-uuid-1", 1, Value::Null, Value::Null)).await;
+        // keepalive：订阅/Topics 置 null（"没变化"）→ 差分：Assignment=null、
+        // epoch 不 bump；分配保留由后续 full 心跳佐证
+        let r = cgh(&ctx, kv, hb_req_v1("cg2", "client-uuid-1", 1, Value::Null, Value::Null, Value::Null)).await;
         assert_eq!(fld(&r, "ErrorCode").as_i16(), 0);
         assert_eq!(fld(&r, "MemberEpoch").as_i32(), 1, "keepalive 不 bump");
-        assert_eq!(assignment_parts(&r).len(), 1, "null 订阅 = 未变，分配保留");
-        // regex 订阅（v1 字段）：POC 非目标 → INVALID_REQUEST(42)，非静默吞
-        let r = cgh(&ctx, kv, hb_req_v1("cg2", "client-uuid-2", 0, Value::Null, Value::str("(?:t.*)"))).await;
-        assert_eq!(fld(&r, "ErrorCode").as_i16(), 42, "regex 订阅显式拒收");
+        assert!(matches!(fld(&r, "Assignment"), Value::Null), "未变 → Assignment=null（差分下发）");
+        // full request（names/owned 带 full 语义）→ 分配重发
+        let r = cgh(&ctx, kv, hb_req_v1("cg2", "client-uuid-1", 1, Value::Array(vec![Value::str("t1")]), Value::Null, Value::Array(vec![s([("TopicId", Value::Uuid(tid1)), ("Partitions", Value::Array(vec![Value::I32(0), Value::I32(1)]))])]))).await;
+        assert_eq!(assignment_parts(&r).len(), 1, "full request 重发分配");
+        // regex 订阅（v1 字段）：同步解析并入订阅（行动清单 P2）。t1 匹配
+        // t.* → client-uuid-2 注册；撤销确认闭环：迁移分区（p1）在 cu-1
+        // 的 owned 确认撤销前不派给 cu-2（双 owner 消除）
+        let r = cgh(&ctx, kv, hb_req_v1("cg2", "client-uuid-2", 0, Value::Null, Value::str("(?:t.*)"), Value::Null)).await;
+        assert_eq!(fld(&r, "ErrorCode").as_i16(), 0, "regex 解析并入订阅");
+        // cu-1 心跳确认撤销（owned 降为 [0]）→ pending 清除 → cu-2 拿到 [1]
+        let _r1 = cgh(&ctx, kv, hb_req_v1("cg2", "client-uuid-1", 1, Value::Array(vec![Value::str("t1")]), Value::Null,
+            Value::Array(vec![s([("TopicId", Value::Uuid(tid1)), ("Partitions", Value::Array(vec![Value::I32(0)]))])]))).await;
+        let cu2_epoch = fld(&r, "MemberEpoch").as_i32();
+        let r2 = cgh(&ctx, kv, hb_req_v1("cg2", "client-uuid-2", cu2_epoch, Value::Null, Value::str("(?:t.*)"), Value::Null)).await;
+        assert!(assignment_parts(&r2).len() >= 1, "撤销确认后 cu-2 拿到迁移分区");
+        let bad = cgh(&ctx, kv, hb_req_v1("cg2", "client-uuid-3", 0, Value::Null, Value::str("(?:t.*[["), Value::Null)).await;
+        assert_eq!(fld(&bad, "ErrorCode").as_i16(), 42, "非法正则 INVALID_REQUEST");
 
         // ---- ServerAssignor 协商（T-M3.4 块 a，ADR-20 §3）----
         // uniform 组：组创建时首个非空请求定名（first-wins），分配即 uniform；

@@ -18,3 +18,19 @@ basalt-record = { path = "../record" }
 
 [lints]
 workspace = true
+
+[features]
+default = ["objstore-s3"]
+# S3 适配器（v1.1）：经 arrow-rs object_store 对接 S3 兼容端点（含自研
+# duramen——If-None-Match:* 条件写已实现）。离线禁用：--no-default-features
+objstore-s3 = ["dep:object_store", "dep:tokio", "object_store/aws"]
+
+[dependencies.object_store]
+package = "object_store"
+version = "0.14"
+optional = true
+
+[dependencies.tokio]
+version = "1"
+features = ["rt"]
+optional = true

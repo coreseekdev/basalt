@@ -61,6 +61,8 @@ pub enum Role {
 }
 
 pub enum PartitionCmd {
+    /// 分层上传完成回流（offloader → actor）：注册表插入 + 本地回收。
+    TieredUploaded { base: i64, record: basalt_storage::SegmentRecord },
     /// 元数据应用：设置本 actor 的角色与副本集（epoch fencing 依据）。
     SetRole { leader: bool, epoch: i32, replicas: Vec<i32> },
     Produce {
@@ -260,7 +262,54 @@ pub struct PartitionActor {
     /// 分层存储（T-M4.3，ADR-21）：BASALT_STORAGE_MODE=tiered 时 Some。
     /// 注册表权威在对象存储（每段一条 immutable 记录），内存视图是缓存。
     tier: Option<basalt_storage::tiered::TieredPartition>,
-    tier_store: Option<Box<dyn basalt_storage::ObjectStore>>,
+    tier_store: Option<std::sync::Arc<dyn basalt_storage::ObjectStore>>,
+    /// 异步上传通道（v1.1：上传移出 produce 关键路径）+ 在途集合
+    offload_tx: Option<mpsc::Sender<OffloadJob>>,
+    offload_inflight: std::collections::BTreeSet<i64>,
+}
+
+/// 异步上传任务载荷：base 段文件由 offloader 直读（sealed 段不可变），
+/// index 快照在入队时由 actor 捕获。
+pub struct OffloadJob {
+    pub partition: i32,
+    pub base: i64,
+    pub epoch: i32,
+    pub last_offset: i64,
+    pub path: std::path::PathBuf,
+    pub index: Vec<(u32, u32)>,
+}
+
+fn now_ms_u64() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0)
+}
+
+/// 简单字节配额（窗口 = 1s）：rate=0 时不限速。
+struct UploadQuota {
+    rate: u64,
+    state: std::sync::Mutex<(Instant, u64)>,
+}
+impl UploadQuota {
+    fn take(&self, bytes: u64) -> Duration {
+        if self.rate == 0 {
+            return Duration::ZERO;
+        }
+        let mut st = self.state.lock().unwrap();
+        let now = Instant::now();
+        let (start, used) = *st;
+        if now.duration_since(start) >= Duration::from_secs(1) {
+            *st = (now, 0);
+            return Duration::ZERO;
+        }
+        if used + bytes <= self.rate {
+            *st = (start, used + bytes);
+            return Duration::ZERO;
+        }
+        let over = used + bytes - self.rate;
+        Duration::from_millis((over * 1000 / self.rate.max(1)).max(1))
+    }
 }
 
 impl PartitionActor {
@@ -280,18 +329,38 @@ impl PartitionActor {
         let tiered_mode = std::env::var("BASALT_STORAGE_MODE").as_deref() == Ok("tiered");
         let open_name = name.clone();
         let open_index = index;
+        let (offload_tx, offload_rx) = mpsc::channel::<OffloadJob>(64);
         std::thread::spawn(move || {
             let log = Log::open(StdDisk::new(), dir.clone(), opts);
             // 分层初始化（同为阻塞 IO，同线程）：启动期孤儿 GC（上传中途
             // 崩溃的垃圾，此时无在途竞态）+ 注册表恢复（权威在 store）
             let tier = if tiered_mode {
-                let store = Box::new(basalt_storage::LocalFsObjectStore::new(dir.join("tiered-objectstore")));
-                match basalt_storage::tiered::TieredPartition::gc_orphans_at_startup(store.as_ref(), &open_name, open_index)
-                    .and_then(|n| {
-                        tracing::info!(topic = %open_name, partition = open_index, orphans = n, "tiered startup gc");
-                        basalt_storage::tiered::TieredPartition::load(store.as_ref(), &open_name, open_index)
-                    }) {
-                    Ok(t) => Some((store as Box<dyn basalt_storage::ObjectStore>, t)),
+                let store: std::sync::Arc<dyn basalt_storage::ObjectStore> =
+                    if std::env::var("BASALT_OBJECT_STORE").as_deref() == Ok("s3") {
+                        match basalt_storage::object_store_s3::S3ObjectStore::from_env() {
+                            Ok(s) => std::sync::Arc::new(s),
+                            Err(e) => {
+                                tracing::warn!(error = %e, "S3 init failed → local fallback");
+                                std::sync::Arc::new(basalt_storage::LocalFsObjectStore::new(
+                                    dir.join("tiered-objectstore"),
+                                ))
+                            }
+                        }
+                    } else {
+                        std::sync::Arc::new(basalt_storage::LocalFsObjectStore::new(
+                            dir.join("tiered-objectstore"),
+                        ))
+                    };
+                let grace = std::env::var("BASALT_TIERED_GC_GRACE_MS")
+                    .ok().and_then(|v| v.parse().ok()).unwrap_or(600_000u64);
+                match basalt_storage::tiered::TieredPartition::gc_orphans(
+                    store.as_ref(), &open_name, open_index, now_ms_u64(), grace,
+                )
+                .and_then(|n| {
+                    tracing::info!(topic = %open_name, partition = open_index, orphans = n, "tiered startup gc");
+                    basalt_storage::tiered::TieredPartition::load(store.as_ref(), &open_name, open_index)
+                }) {
+                    Ok(t) => Some((store, t)),
                     Err(e) => {
                         tracing::warn!(topic = %open_name, partition = open_index, error = %e, "tiered init failed → local-only fallback");
                         None
@@ -300,15 +369,70 @@ impl PartitionActor {
             } else {
                 None
             };
-            let _ = opened_tx.send((log, tier));
+            let _ = opened_tx.send((log, tier, offload_tx));
         });
-        let (log, tier_parts) = match opened_rx.recv().expect("log open thread") {
-            (Ok(l), tier) => (l, tier),
-            (Err(e), _) => return Err(std::io::Error::other(e.to_string())),
+        let (log, tier_store, tier, offload_tx) = match opened_rx.recv().expect("log open thread") {
+            (Ok(l), tier_parts, ot) => {
+                let (s, t) = match tier_parts {
+                    Some((s, t)) => (Some(s), Some(t)),
+                    None => (None, None),
+                };
+                (l, s, t, ot)
+            }
+            (Err(e), _, _) => return Err(std::io::Error::other(e.to_string())),
         };
-        let (tier_store, tier) = match tier_parts {
-            Some((s, t)) => (Some(s), Some(t)),
-            None => (None, None),
+        // 异步上传 offloader（v1.1 行动清单）：上传移出 produce 关键路径；
+        // 字节配额限速；完成经 TieredUploaded 回流（注册表插入 + 本地回收）
+        let offload_tx = if let Some(store) = tier_store.clone() {
+            let rate = std::env::var("BASALT_TIERED_UPLOAD_RATE_BYTES")
+                .ok().and_then(|v| v.parse().ok()).unwrap_or(0u64);
+            let quota = std::sync::Arc::new(UploadQuota {
+                rate,
+                state: std::sync::Mutex::new((Instant::now(), 0)),
+            });
+            let done_tx = tx.clone();
+            let topic = name.clone();
+            let mut offload_rx = offload_rx;
+            // 专用 OS 线程（阻塞 IO + 嵌套 block_on——tokio::spawn 内嵌
+            // block_on 会 panic "runtime from within a runtime"，任务静默
+            // 死亡 → receiver 掉线 → channel closed，联调实证）
+            std::thread::spawn(move || {
+                while let Some(job) = offload_rx.blocking_recv() {
+                    let data = match std::fs::read(&job.path) {
+                        Ok(d) => d,
+                        Err(e) => {
+                            tracing::warn!(base = job.base, error = %e, "tiered offload read failed");
+                            continue;
+                        }
+                    };
+                    let wait = quota.take(data.len() as u64);
+                    if !wait.is_zero() {
+                        std::thread::sleep(wait);
+                    }
+                    match basalt_storage::tiered::TieredPartition::upload_static(
+                        store.as_ref(),
+                        &topic,
+                        job.partition,
+                        job.base,
+                        job.last_offset,
+                        job.epoch,
+                        &data,
+                        job.index,
+                    ) {
+                        Ok(record) => {
+                            let _ = done_tx.blocking_send(PartitionCmd::TieredUploaded {
+                                base: job.base,
+                                record,
+                            });
+                        }
+                        Err(e) => tracing::warn!(base = job.base, error = %e, "tiered upload failed"),
+                    }
+                }
+            });
+            Some(offload_tx)
+        } else {
+            drop(offload_rx);
+            None
         };
         tracing::info!(topic = %name, partition = index, "partition actor started");
         let mut actor = PartitionActor {
@@ -337,6 +461,8 @@ impl PartitionActor {
             repl,
             tier,
             tier_store,
+            offload_tx,
+            offload_inflight: std::collections::BTreeSet::new(),
         };
         // 恢复收割（ADR-18 §4.4）：重启后事务视图从日志扫描重建——开事务
         // 锚住 LSO（abort 落地前不泄露）、终态 fence 与 aborted 过滤跨重启有效。
@@ -895,7 +1021,29 @@ impl PartitionActor {
                 PartitionCmd::Retention { reply } => {
                     let n = self.log.delete_old_segments();
                     self.maybe_offload();
+                    if let (Some(store), Some(tier)) = (self.tier_store.as_deref(), self.tier.as_ref()) {
+                        let grace = std::env::var("BASALT_TIERED_GC_GRACE_MS")
+                            .ok().and_then(|v| v.parse().ok()).unwrap_or(600_000u64);
+                        match basalt_storage::tiered::TieredPartition::gc_orphans(
+                            store, &self.name, self.index, now_ms_u64(), grace,
+                        ) {
+                            Ok(0) => {}
+                            Ok(n) => tracing::info!(topic = %self.name, partition = self.index, orphans = n, "tiered periodic gc"),
+                            Err(e) => tracing::warn!(topic = %self.name, partition = self.index, error = %e, "tiered gc failed"),
+                        }
+                    }
                     let _ = reply.send(n);
+                }
+                PartitionCmd::TieredUploaded { base, record } => {
+                    // offloader 完成回流：注册表插入 + 本地回收（同 base
+                    // 更大 epoch 才生效——failover 后旧 epoch 回流丢弃）
+                    if let Some(tier) = self.tier.as_mut() {
+                        tier.insert_record(record);
+                    }
+                    if let Err(e) = self.log.release_sealed(base) {
+                        tracing::warn!(topic = %self.name, partition = self.index, base, error = %e, "tiered release failed");
+                    }
+                    self.offload_inflight.remove(&base);
                 }
                 PartitionCmd::WriteTxnMarker { producer_id, producer_epoch, outcome, reply } => {
                     // coordinator 编排路径：仅 leader 受理（迟到路由 → NotLeader
@@ -1364,44 +1512,45 @@ impl PartitionActor {
     /// （release_sealed 不动 log_start——分层数据仍可读）。失败留待下一
     /// 触发点重试（produce / retention sweep）；batch_io 窗口内跳过
     /// （文件尚未 flush，读到的是半截内容）。
+    /// 分层上传入队（v1.1 异步化，行动清单）：sealed 段 → OffloadJob
+    /// （offloader 任务直读段文件 + 上传 + TieredUploaded 完成回流）；
+    /// 在途/已分层去重；入队失败丢弃本轮（下个触发点重入队）。
     fn maybe_offload(&mut self) {
-        if self.tier.is_none() {
-            return;
-        }
-        if self.log.batch_io {
+        if self.tier.is_none() || self.log.batch_io {
             return;
         }
         for base in self.log.sealed_bases() {
-            let (Some(store), Some(tier)) = (self.tier_store.as_deref(), self.tier.as_mut()) else {
-                return;
-            };
-            if tier.has(base) {
+            if self.offload_inflight.contains(&base)
+                || self.tier.as_ref().map(|t| t.has(base)).unwrap_or(true)
+            {
                 continue;
             }
-            let Some((last, _)) = self.log.sealed_extent(base) else { continue };
-            let data = match self.log.read_sealed_bytes(base) {
-                Ok(d) => d,
-                Err(e) => {
-                    tracing::warn!(topic = %self.name, partition = self.index, base, error = %e, "tiered read segment failed");
-                    continue;
-                }
+            let Some((last, _bytes)) = self.log.sealed_extent(base) else { continue };
+            let Some(index) = self.log.sealed_index_entries(base) else { continue };
+            let Some(path) = self.log.sealed_path(base) else { continue };
+            self.offload_inflight.insert(base);
+            let job = OffloadJob {
+                partition: self.index,
+                base,
+                epoch: self.epoch,
+                last_offset: last,
+                path,
+                index,
             };
-            match tier.upload(store, base, last, &data) {
-                Ok(_) => {
-                    if let Err(e) = self.log.release_sealed(base) {
-                        tracing::warn!(topic = %self.name, partition = self.index, base, error = %e, "tiered release failed (will retry)");
-                    } else {
-                        tracing::info!(topic = %self.name, partition = self.index, base, last, "segment offloaded");
-                    }
-                }
-                Err(e) => {
-                    tracing::warn!(topic = %self.name, partition = self.index, base, error = %e, "tiered upload failed (retry next trigger)");
-                    return;
-                }
+            let Some(tx) = self.offload_tx.as_ref() else {
+                self.offload_inflight.remove(&base);
+                continue;
+            };
+            if let Err(e) = tx.try_send(job) {
+                self.offload_inflight.remove(&base);
+                tracing::warn!(topic = %self.name, partition = self.index, base, error = %e, "tiered offload enqueue failed");
             }
         }
     }
 
+    /// 分层读穿透：请求起点低于本地首段 base（区间已回收）且分层覆盖时
+    /// 服务；其余一律 None 走本地路径（含 retention 已删的更早区间——
+    /// 原路 OffsetOutOfRange 语义不变）。
     /// 分层读穿透：请求起点低于本地首段 base（区间已回收）且分层覆盖时
     /// 服务；其余一律 None 走本地路径（含 retention 已删的更早区间——
     /// 原路 OffsetOutOfRange 语义不变）。
@@ -1421,9 +1570,9 @@ impl PartitionActor {
         if offset < tier_min || !tier.covers(offset) || offset >= cap {
             return None;
         }
-        let data = tier
-            .read_through(self.tier_store.as_deref()?, offset, max_bytes)
-            .ok()??;
+        let Some(data) = tier.read_through(self.tier_store.as_deref()?, offset, max_bytes).ok().flatten() else {
+            return None;
+        };
         let data = self.filter_batches(data, committed);
         let log_start = self.log.log_start_offset.min(tier_min);
         Some(FetchOutcome {

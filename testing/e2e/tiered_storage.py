@@ -2,6 +2,7 @@
 # 用法（由 run_tiered.sh 驱动，两阶段夹一次 broker 重启）：
 #   python3 tiered_storage.py produce   # 产 120 条（小段触发滚动+分层回收）
 #   python3 tiered_storage.py consume   # 从 0 全量消费（读穿透 + 本地尾段）
+import os
 import sys
 import tempfile
 
@@ -59,11 +60,14 @@ def produce():
 
 def consume():
     wait_leader()
-    c = Consumer(conf({
+    confd = conf({
         "group.id": "tiered-e2e",
         "enable.auto.commit": False,
         "auto.offset.reset": "earliest",
-    }))
+    })
+    if os.environ.get("TIER_DEBUG"):
+        confd["debug"] = "fetch"
+    c = Consumer(confd)
     md = c.list_topics(topic=TOPIC, timeout=10)
     parts = [TopicPartition(TOPIC, pid, 0) for pid in md.topics[TOPIC].partitions]
     c.assign(parts)

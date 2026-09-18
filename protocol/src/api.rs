@@ -113,6 +113,9 @@ pub enum ErrorCode {
     // 器不受支持；kerr/Errors.java 双源核对 112 非 57，不可重试——
     // ADR-20 §3 uniform/range 协商面）
     UnsupportedAssignor = 112,
+    // 81 = GROUP_MAX_SIZE_REACHED（KIP-848 组容量上限；Errors.java:364 双源
+    // 核对 81 非 68——不可重试。研究对照行动清单 P2）
+    GroupMaxSizeReached = 81,
 }
 
 impl From<ErrorCode> for i16 {

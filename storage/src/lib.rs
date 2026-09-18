@@ -14,6 +14,8 @@ pub mod error;
 pub mod index;
 pub mod log;
 pub mod object_store;
+#[cfg(feature = "objstore-s3")]
+pub mod object_store_s3;
 pub mod pool;
 pub mod segment;
 pub mod sim_disk;

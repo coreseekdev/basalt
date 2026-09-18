@@ -17,6 +17,11 @@ impl OffsetIndex {
     }
 
     /// ≤ target 的最近项位置（无则 0）。
+    /// 稀疏索引条目快照（分层上传时随记录存档，range 读定位用）
+    pub fn entries(&self) -> &[(u32, u32)] {
+        &self.entries
+    }
+
     pub fn lookup(&self, target: i64) -> u32 {
         let rel = target.max(0) as u32;
         match self.entries.binary_search_by(|&(o, _)| o.cmp(&rel)) {

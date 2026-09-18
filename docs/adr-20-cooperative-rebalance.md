@@ -1,6 +1,6 @@
 # ADR-20：cooperative-sticky rebalance（T-M3.4）
 
-- 状态：设计草案（2026-09-18，随块实现收口）
+- 状态：✅ 全部落地（2026-09-18，`d6d6dd6`；T-M3.4 闭合）
 - 依据：TASK.md T-M3.4（验收：franz-go/rdkafka cooperative 模式跑通且无
   停顿式双全量 rebalance）；KIP-429（classic 增量协作）；KIP-848 §服务端
   分配器（uniform/range）；生态 §C。
@@ -51,16 +51,29 @@ range 协议组（cooperative-sticky 直接中招）的 JoinGroup 应答都回�
   与经典 spec 的关系：ADR-19 §3「sticky 性质由只在必须移动时移动的差分
   实现兑现」。
 
-## 4. 验收面
+## 4. 验收面（全部 ✅ 2026-09-18）
 
-- **a. 848 分配器**：确定性单测金样（3 分区 [2,1] → C 加入：A/B 保留、
-  C 补派——与 range 的行为分叉点即金样断言；C 离开回归原分配）+ 布局
-  回归（uniform 组协商 + 未知 assignor 57）；
-- **b. classic 协议选择**：单测（cooperative-sticky 组选中该协议名；
-  混合偏好取 leader 序交集）；
-- **c. e2e**：franz-go cooperative-sticky（classic 路径，无 opt-in）——
-  B 中流加入，A 不断流、全组不重不漏（run_franzgo_coop.sh）；
-- d. TASK 验收面即 e2e，规格化不另设（848 分配器确定性单测即行为锁定）。
+- **a. 848 分配器 ✅**：确定性单测金样 ×2（3 分区 [2,1] → C 加入：A/B
+  保留、C 补派——与 range 的行为分叉点即金样断言；C 离开回归原分配；
+  多 topic 场景订阅约束优先于份额）+ 布局回归（uniform 组协商 /
+  describe AssignorName 同源 / 未知 assignor 112 且不建组）。
+  **实现要点（评审中补强）**：保留段按「topic 订阅者数升序」排序——否则
+  唯一订阅 topic 会被泛订阅 topic 挤出而饿死唯一订阅者；补派段带订阅
+  过滤 + 全满时任一订阅者兜底（订阅约束优先于份额）。错误码 112 经
+  kerr 双源核对（**非 57**——凭记忆错号被语义表纪律拦下）。
+- **b. classic 协议选择 ✅**：单测探针（cooperative-sticky 组选中该协议
+  名；第二成员偏好序不同不漂移；leader 保持；generation 推进）。
+  **过程中抓到协调器缺陷（账本 52）**：rebalance 中途组清空时
+  pending_joins/pending_syncs 悬挂（oneshot 永不答复）——协作探针挂死
+  实证。修复：组→Empty 双路径回可重试 27 + maybe_complete 只数在组
+  pending + complete_rebalance 对 stale pending 回 27 + 探针 deadline
+  分支回归锁定。
+- **c. e2e ✅**：testing/franzgo/coop（run_franzgo_coop.sh）——franz-go
+  cooperative-sticky 经典路径（无 848 opt-in）：B 中流加入，A 不断流
+  （窗口内最大间隙 501ms）、B 分得增量（15 条）、全组 60/60 不重不漏；
+  四套 e2e（kafkaclients/franzgo/848/coop）全 PASS 零回归。
+- d. TASK 验收面即 e2e，规格化不另设（848 分配器确定性单测即行为锁定）；
+  rdkafka（librdkafka）cooperative 档列后续（§1 非目标）。
 
 ## 5. 已知边界
 

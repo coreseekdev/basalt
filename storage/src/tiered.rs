@@ -21,6 +21,9 @@ pub struct TieredPartition {
     pub partition: i32,
     /// base → 段记录（缓存；权威在 store）
     segments: BTreeMap<i64, SegmentRecord>,
+    /// base → 上传时刻（对象侧 retention 的时间基准）。恢复后未知 →
+    /// 以 load 时刻计（保守偏晚：宁多留不误删）。
+    uploaded_at: BTreeMap<i64, std::time::Instant>,
 }
 
 impl TieredPartition {
@@ -38,9 +41,11 @@ impl TieredPartition {
                 }
             }
         }
+        let now = std::time::Instant::now();
         Ok(Self {
             topic: topic.to_string(),
             partition,
+            uploaded_at: segments.keys().map(|b| (*b, now)).collect(),
             segments,
         })
     }
@@ -112,6 +117,7 @@ impl TieredPartition {
             }
         }
         self.segments.insert(rec.base, rec.clone());
+        self.uploaded_at.insert(rec.base, std::time::Instant::now());
         Ok(rec)
     }
 
@@ -225,7 +231,35 @@ impl TieredPartition {
             Some(old) if old.epoch >= rec.epoch => return,
             _ => {}
         }
-        self.segments.insert(rec.base, rec);
+        let base = rec.base;
+        self.segments.insert(base, rec);
+        self.uploaded_at.insert(base, std::time::Instant::now());
+    }
+
+    /// (base, record) 枚举（retention sweep 的候选遍历；base 升序）
+    pub fn iter_segments(&self) -> impl Iterator<Item = (&i64, &SegmentRecord)> {
+        self.segments.iter()
+    }
+
+    /// 上传时刻（retention 时间基准；恢复后 = load 时刻）
+    pub fn uploaded_at(&self, base: i64) -> Option<std::time::Instant> {
+        self.uploaded_at.get(&base).copied()
+    }
+
+    /// 对象侧 retention 删除：该 base 的**全部 epoch 变体**（段对象 + 段
+    /// 记录）+ 注册表项。幂等：缺失即 Ok。调用方保证 last < 删除水位
+    /// （log_start 推进语义由上层统一结算）。
+    pub fn purge(&mut self, store: &dyn ObjectStore, base: i64) -> Result<()> {
+        self.segments.remove(&base);
+        self.uploaded_at.remove(&base);
+        for rk in store.list(&keys::record_prefix(&self.topic, self.partition))? {
+            let Ok(rec) = decode_record(&store.get(&rk)?) else { continue };
+            if rec.base == base {
+                let _ = store.delete(&rec.key);
+                let _ = store.delete(&rk);
+            }
+        }
+        Ok(())
     }
 
     /// 孤儿 GC（有段对象、无段记录 = 上传中途崩溃的垃圾）：mtime 早于
@@ -317,6 +351,27 @@ mod tiered_tests {
         assert!(!d.is_empty(), "首批即便超预算也带上（log 同义）");
         // 无覆盖
         assert!(t.read_through(&store, 100, 1 << 20).unwrap().is_none());
+    }
+
+    #[test]
+    fn purge_removes_all_variants_and_registry() {
+        let store = MemoryObjectStore::default();
+        let mut t = TieredPartition::load(&store, "t", 0).unwrap();
+        t.upload(&store, 0, 4, 0, &seg_bytes(0, 5), vec![]).unwrap();
+        t.upload(&store, 5, 9, 0, &seg_bytes(5, 5), vec![]).unwrap();
+        t.upload(&store, 10, 14, 0, &seg_bytes(10, 5), vec![]).unwrap();
+        assert_eq!(t.segment_count(), 3);
+        t.purge(&store, 5).unwrap();
+        assert_eq!(t.segment_count(), 2);
+        assert_eq!(t.min_base(), Some(0));
+        assert!(!t.covers(5), "被清除段不可再读穿透");
+        assert!(t.covers(12), "其余段不受影响");
+        // 段对象 + 段记录都删净
+        assert!(store.get(&keys::segment("t", 0, 5, 0)).is_err());
+        assert!(store.get(&keys::record("t", 0, 5, 0)).is_err());
+        assert!(store.get(&keys::segment("t", 0, 0, 0)).is_ok());
+        // 幂等：重复 purge 不报错
+        t.purge(&store, 5).unwrap();
     }
 
     #[test]

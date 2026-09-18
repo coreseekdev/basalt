@@ -1009,6 +1009,19 @@ impl<D: DiskIo> Log<D> {
         self.sealed.first().map(|s| s.base_offset).unwrap_or(self.active.base_offset)
     }
 
+    /// 只进不退的 log_start 推进（对象侧 retention 用；调用方保证 v 处
+    /// 数据确已全部不可读——本地段/分层段两者的下界归调用方取 min）。
+    /// 推进后持久化 checkpoint（重启语义一致）。
+    pub fn advance_log_start(&mut self, v: i64) -> bool {
+        if v > self.log_start_offset {
+            self.log_start_offset = v;
+            self.persist_checkpoint();
+            true
+        } else {
+            false
+        }
+    }
+
     /// Retention：按大小删除最老的 sealed 段。
     pub fn delete_old_segments(&mut self) -> usize {
         let mut deleted = 0usize;
@@ -1287,4 +1300,68 @@ fn scan_and_truncate<D: DiskIo>(disk: &D, seg: &mut Segment, expect_base: i64, h
     seg.offset_index = offset_ix;
     seg.time_index = time_ix;
     Ok(())
+}
+
+#[cfg(test)]
+mod retention_reopen_tests {
+    //! 对象侧 retention 的 reopen 链（T-M4.3 v2）：roll → 本地 sealed 回收
+    //! （release_sealed）→ advance_log_start → 重开 → 后缀可读。
+
+    use super::*;
+    use crate::disk::StdDisk;
+    use basalt_record::{encode_batch, Rec};
+
+    fn batch(base: i64, count: i64) -> Bytes {
+        let recs: Vec<Rec> = (0..count)
+            .map(|i| Rec {
+                timestamp_delta: i,
+                key: None,
+                value: Some(bytes::Bytes::from(format!("r-{:04}-{}", base + i, "x".repeat(96)))),
+                headers: vec![],
+            })
+            .collect();
+        let mut b = bytes::BytesMut::new();
+        encode_batch(base, 0, 1000 + base, 0, -1, -1, -1, &recs, &mut b);
+        b.freeze()
+    }
+
+    #[test]
+    fn reopen_after_log_start_advance_reads_suffix() {
+        let dir = std::env::temp_dir().join(format!("basalt-ret-{}-{}", std::process::id(), std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let opts = LogOptions { segment_max_bytes: 2048, fsync: FsyncSchedule::Os, retention_ms: 0, retention_max_bytes: 0 };
+        let mut log = Log::open(StdDisk::new(), dir.clone(), opts.clone()).unwrap();
+        for b in 0..6i64 {
+            let raw = batch(b * 20, 20);
+            let r = log.append(&raw, AssignPolicy::Assign, 1000).unwrap();
+            assert_eq!(r.base_offset, b * 20);
+        }
+        assert_eq!(log.next_offset, 120);
+        // 分层回收：前 5 段本地文件删除（release_sealed），log_start 推进到 100
+        while let Some(base) = log.sealed.first().map(|s| s.base_offset) {
+            if base >= 100 { break; }
+            assert!(log.release_sealed(base).unwrap().is_some());
+        }
+        assert!(log.advance_log_start(100));
+        assert_eq!(log.log_start_offset, 100);
+        let local_files = std::fs::read_dir(&dir).unwrap()
+            .filter_map(|e| e.ok())
+            .filter(|e| e.path().extension().map(|x| x == "log").unwrap_or(false))
+            .count();
+        assert_eq!(local_files, 1, "只剩 active 本地段");
+        drop(log);
+
+        // 重开：后缀可读
+        let log2 = Log::open(StdDisk::new(), dir.clone(), opts).unwrap();
+        assert_eq!(log2.log_start_offset, 100, "checkpoint 的 log_start 恢复");
+        assert_eq!(log2.next_offset, 120);
+        let pool = crate::pool::BufferPool::new();
+        let r = log2.read_ex(100, 1 << 20, &pool, ReadCap::At(120)).unwrap();
+        assert!(!r.data.is_empty(), "后缀读取为空——reopen 读路径断裂");
+        let h = basalt_record::BatchHeader::parse(&r.data).unwrap();
+        assert_eq!(h.base_offset, 100);
+        // log_start 之下拒读
+        assert!(log2.read_ex(99, 1 << 20, &pool, ReadCap::At(120)).is_err());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 }

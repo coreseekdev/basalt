@@ -266,6 +266,11 @@ pub struct PartitionActor {
     /// 异步上传通道（v1.1：上传移出 produce 关键路径）+ 在途集合
     offload_tx: Option<mpsc::Sender<OffloadJob>>,
     offload_inflight: std::collections::BTreeSet<i64>,
+    /// 分层对象侧 retention（T-M4.3 v2）：BASALT_RETENTION_MS（0=关闭）
+    retention_ms: u64,
+    /// sweep 周期（BASALT_RETENTION_SWEEP_MS）+ 下次触发时刻
+    retention_sweep_ms: u64,
+    next_retention_sweep: Option<Instant>,
 }
 
 /// 异步上传任务载荷：base 段文件由 offloader 直读（sealed 段不可变），
@@ -438,6 +443,9 @@ impl PartitionActor {
             drop(offload_rx);
             None
         };
+        // retention 参数（env 一次性读取；0 = 时间 retention 关闭）
+        let retention_ms = std::env::var("BASALT_RETENTION_MS").ok().and_then(|v| v.parse().ok()).unwrap_or(0);
+        let retention_sweep_ms = std::env::var("BASALT_RETENTION_SWEEP_MS").ok().and_then(|v| v.parse().ok()).unwrap_or(30_000);
         tracing::info!(topic = %name, partition = index, "partition actor started");
         let mut actor = PartitionActor {
             name,
@@ -467,6 +475,9 @@ impl PartitionActor {
             tier_store,
             offload_tx,
             offload_inflight: std::collections::BTreeSet::new(),
+            retention_ms,
+            retention_sweep_ms,
+            next_retention_sweep: Some(Instant::now() + Duration::from_millis(retention_sweep_ms.max(100))),
         };
         // 恢复收割（ADR-18 §4.4）：重启后事务视图从日志扫描重建——开事务
         // 锚住 LSO（abort 落地前不泄露）、终态 fence 与 aborted 过滤跨重启有效。
@@ -491,6 +502,7 @@ impl PartitionActor {
                 .chain(self.parked_markers.iter().map(|p| p.deadline))
                 .chain(self.pending_replica.iter().map(|p| p.deadline))
                 .chain(self.txn_open.values().map(|t| t.deadline))
+                .chain(self.next_retention_sweep)
                 .min();
             let first = match next_deadline {
                 Some(d) => {
@@ -539,6 +551,13 @@ impl PartitionActor {
 
     fn on_deadline(&mut self) {
         let now = Instant::now();
+        // 分层对象侧 retention 周期触发（T-M4.3 v2）
+        if let Some(t) = self.next_retention_sweep {
+            if now >= t {
+                self.tiered_retention_sweep();
+                self.next_retention_sweep = Some(now + Duration::from_millis(self.retention_sweep_ms.max(100)));
+            }
+        }
         // fetch 超时：正常空回（带上界内可读数据），不可映射 OOR。
         // 上界按隔离级取（read_committed = LSO）——超时回包同样不得
         // 泄露未提交/已 abort 数据（ADR-18 §4.2 三接触点之三）。
@@ -1514,6 +1533,58 @@ impl PartitionActor {
     /// 分层上传（best-effort，ADR-21 §2 写序）：枚举 sealed 段 → 注册表
     /// 未有者上传（段对象 create → 段记录 create）→ 本地回收
     /// （release_sealed 不动 log_start——分层数据仍可读）。失败留待下一
+    /// 分层对象侧 retention（T-M4.3 v2，ADR-21 §2 联动）：
+    /// ① DeleteRecords 联动——last < log_start 的已上传段必删（无时间条件）；
+    /// ② 时间维度——uploaded_at 早于 BASALT_RETENTION_MS 的段删除并推进
+    ///    log_start 至剩余可读下界（min(剩余分层 base, 首个本地 base)）。
+    /// 只作用于已回收的完整段（active 恒不在注册表）；恢复后 uploaded_at
+    /// 以 load 时刻计——保守偏晚，宁多留不误删。
+    fn tiered_retention_sweep(&mut self) {
+        let Some(store) = self.tier_store.as_deref() else { return };
+        let Some(tier) = self.tier.as_ref() else { return };
+        let log_start = self.log.log_start_offset;
+        let mut victims: Vec<i64> = Vec::new();
+        for (base, rec) in tier.iter_segments() {
+            if rec.last_offset < log_start {
+                victims.push(*base);
+                continue;
+            }
+            if self.retention_ms > 0 {
+                let aged = tier
+                    .uploaded_at(*base)
+                    .map(|t| t.elapsed().as_millis() as u64 >= self.retention_ms)
+                    .unwrap_or(false);
+                if aged {
+                    victims.push(*base);
+                }
+            }
+        }
+        drop(tier);
+        if victims.is_empty() {
+            return;
+        }
+        let Some(store) = self.tier_store.clone() else { return };
+        let Some(tier) = self.tier.as_mut() else { return };
+        let mut purged = 0usize;
+        for base in victims {
+            match tier.purge(store.as_ref(), base) {
+                Ok(()) => purged += 1,
+                Err(e) => tracing::warn!(topic = %self.name, partition = self.index, base, error = %e, "tiered retention purge failed"),
+            }
+        }
+        if purged == 0 {
+            return;
+        }
+        // 推进可读下界：min(剩余分层 base, 首个本地 base)
+        let floor = tier
+            .min_base()
+            .map(|m| m.min(self.log.first_local_base()))
+            .unwrap_or_else(|| self.log.first_local_base());
+        if self.log.advance_log_start(floor) {
+            tracing::info!(topic = %self.name, partition = self.index, purged, log_start = floor, "tiered retention deleted objects");
+        }
+    }
+
     /// 触发点重试（produce / retention sweep）；batch_io 窗口内跳过
     /// （文件尚未 flush，读到的是半截内容）。
     /// 分层上传入队（v1.1 异步化，行动清单）：sealed 段 → OffloadJob

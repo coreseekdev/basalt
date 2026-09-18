@@ -184,6 +184,11 @@ impl MetaService {
     }
 
     async fn run(mut self) {
+        // 重启恢复（账本 62）：MetaService 起始为空簇——多节点由 main.rs
+        // 同步循环持续拉取，单节点此前无人刷新，既有题 metadata 恒 UNKNOWN
+        // 直至某次 create/allow_create 请求侥幸触发（librdkafka 恒发
+        // allow_create=false，重启后消费永久失败）。启动即拉一次控制器快照。
+        self.refresh_cluster_snapshot().await;
         while let Some(cmd) = self.rx.recv().await {
             match cmd {
                 MetaCmd::ApplyCluster(state) => self.apply_cluster(state).await,

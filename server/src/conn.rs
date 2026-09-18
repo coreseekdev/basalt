@@ -254,7 +254,13 @@ pub async fn serve_connection<S>(
             }
         }
         // 慢消费者背压：响应通道满时暂停读（客户端不读就不给它读下一请求）
-        let ctx = ctx.clone_for_request();
+        let mut ctx = ctx.clone_for_request();
+        ctx.principal = conn
+            .lock()
+            .await
+            .user
+            .clone()
+            .unwrap_or_else(|| "ANONYMOUS".into());
         let resp_tx = resp_tx.clone();
         let conn = conn.clone();
         let close_tx = close_tx.clone();
@@ -491,6 +497,9 @@ async fn dispatch(
         key::LIST_GROUPS => (handlers_groups::list_groups(&req, ctx).await, false, false),
         key::DESCRIBE_CLUSTER => (handlers::describe_cluster(&req, ctx), false, false),
         key::DESCRIBE_CONFIGS => (handlers::describe_configs(&req, ctx).await, false, false),
+        key::DESCRIBE_ACLS => (handlers::describe_acls(&req), false, false),
+        key::CREATE_ACLS => (handlers::create_acls(&req), false, false),
+        key::DELETE_ACLS => (handlers::delete_acls(&req), false, false),
         _ => {
             return Err(DispatchError::UnsupportedVersion(api_key, api_version));
         }

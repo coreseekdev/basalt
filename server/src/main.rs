@@ -5,6 +5,7 @@
 //! - follower 拉取：非 leader 副本持续从 leader 拉切片（Absolute 追加），
 //!   拉取即 LEO 上报 → leader HW 推进 → acks=all 停等放行。
 
+mod acl;
 mod config;
 mod conn;
 mod fetch_session;
@@ -50,6 +51,7 @@ fn controller_peer(cfg: &Config) -> Option<(i32, String, u16)> {
 /// 每连接 Ctx 快照（明文/TLS listener 共用）
 fn ctx_for(c: &handlers::Ctx, pool: std::sync::Arc<BufferPool>) -> handlers::Ctx {
     handlers::Ctx {
+        principal: "ANONYMOUS".into(),
         node_id: c.node_id,
         controller_id: c.controller_id,
         host: c.host.clone(),
@@ -150,6 +152,9 @@ async fn async_main(cfg: Config) {
     }
     let cluster_id = ensure_cluster_id(&cfg.data_dir);
     tracing::info!(cluster_id = %cluster_id, "cluster id resolved");
+    // ACL 骨架（T-M4.1 尾）：装载持久化 ACL + 数据目录注册（变更即落盘）
+    acl::set_data_dir(&cfg.data_dir);
+    acl::load_from_dir(std::path::Path::new(&cfg.data_dir));
 
     // 内部端口：client port + 1
     let internal_port = cfg.port + 1;
@@ -518,6 +523,7 @@ async fn async_main(cfg: Config) {
         brokers_cache: std::sync::Mutex::new(None),
         pool: pool.clone(),
         txn_tx: txn_tx.clone(),
+        principal: "ANONYMOUS".into(),
         cluster_id: ensure_cluster_id(&cfg.data_dir),
         segment_max_bytes: cfg.segment_max_bytes,
         num_partitions: cfg.num_partitions,

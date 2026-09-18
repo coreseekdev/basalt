@@ -183,7 +183,8 @@ mod tests {
         // 关闭后未知
         close(id);
         assert!(matches!(incremental(id, 3, &tgts(60), &[]), SessionOutcome::Unknown));
-        assert_eq!(session_count(), 0);
+        // 会话总数断言不放此处——并行测试共享进程级缓存（唯一性由 id
+        // 断言与 Unknown 结果承载）
     }
 
     #[test]

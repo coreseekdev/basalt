@@ -28,6 +28,9 @@ pub mod key {
     pub const DESCRIBE_TRANSACTIONS: i16 = 65;
     pub const LIST_TRANSACTIONS: i16 = 66;
     pub const OFFSET_FOR_LEADER_EPOCH: i16 = 23;
+    pub const DESCRIBE_ACLS: i16 = 29;
+    pub const CREATE_ACLS: i16 = 30;
+    pub const DELETE_ACLS: i16 = 31;
     pub const DESCRIBE_CLUSTER: i16 = 60;
     pub const DESCRIBE_CONFIGS: i16 = 32;
     pub const ALTER_CONFIGS: i16 = 33;
@@ -169,6 +172,10 @@ pub fn supported_versions() -> &'static [(i16, i16, i16)] {
         // 基线 v1；DescribeCluster 全区间（v1 EndpointType / v2 IsFenced）
         (key::DESCRIBE_CLUSTER, 0, 2),
         (key::DESCRIBE_CONFIGS, 1, 4),
+        // ACL Admin（T-M4.1 骨架；v1 基线——v0 已随 Kafka 4.0 删除）
+        (key::DESCRIBE_ACLS, 1, 3),
+        (key::CREATE_ACLS, 1, 3),
+        (key::DELETE_ACLS, 1, 3),
         // KIP-848 新消费组协议（ADR-19 块 b/c）：heartbeat 宣告 0-1——
         // franz-go v1.21 的 should848 硬性 supportsKIP848v1()（只认 broker
         // 宣告 max≥1，v0 宣告 = 客户端静默回退 classic 路径）。v1 差异：

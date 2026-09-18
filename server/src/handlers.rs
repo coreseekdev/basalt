@@ -36,6 +36,8 @@ pub struct Ctx {
     pub brokers_cache: std::sync::Mutex<Option<Vec<basalt_metadata::cluster::BrokerInfo>>>,
     /// 集群 ID（data_dir/cluster_id 持久化；Metadata/DescribeCluster 一致回填）
     pub cluster_id: String,
+    /// 请求主体（SASL 用户；未认证 = ANONYMOUS）——ACL 授权决策面（T-M4.1）
+    pub principal: String,
     /// 启动期配置投影（DescribeConfigs 的 broker/topic 默认值来源；T-S4）
     pub segment_max_bytes: u64,
     pub num_partitions: i32,
@@ -64,6 +66,7 @@ impl Ctx {
             txn_tx: self.txn_tx.clone(),
             pool: self.pool.clone(),
             brokers_cache: std::sync::Mutex::new(self.brokers_cache.lock().unwrap().clone()),
+            principal: self.principal.clone(),
             cluster_id: self.cluster_id.clone(),
             segment_max_bytes: self.segment_max_bytes,
             num_partitions: self.num_partitions,
@@ -445,6 +448,11 @@ pub async fn produce(version: i16, acks: i16, targets: Vec<ProduceTarget>, ctx: 
         }
         let mut in_flight: Vec<InFlight> = Vec::new();
         for (t, r) in targets.iter().zip(&resolved) {
+            // ACL（T-M4.1）：TOPIC:WRITE（骨架）——分区级 TOPIC_AUTHORIZATION_FAILED
+            if !crate::acl::authorize(&ctx.principal, crate::acl::OP_WRITE, crate::acl::RT_TOPIC, &t.topic) {
+                in_flight.push(InFlight { target: t, rx: None, pre_err: Some(Value::I16(ErrorCode::TopicAuthorizationFailed as i16)), leader: -1 });
+                continue;
+            }
             if let Some(err) = r.err {
                 in_flight.push(InFlight { target: t, rx: None, pre_err: Some(Value::I16(err as i16)), leader: r.leader });
                 continue;
@@ -558,6 +566,7 @@ pub async fn fetch(
     // 阶段一（borrow 作用域内只做解析与 clone，绝无 await）
     enum Resolved {
         Missing,
+        Authz,
         NotLeader(#[allow(dead_code)] i32),
         Ready(mpsc::Sender<PartitionCmd>),
     }
@@ -566,6 +575,16 @@ pub async fn fetch(
         targets
             .iter()
             .map(|t| {
+                // ACL（T-M4.1）：TOPIC:READ（骨架）。Fetch v13+ 可仅带
+                // TopicId（librdkafka 实测 name 空）——先反查名字再决策
+                let topic_name = if t.topic.is_empty() {
+                    routes.name_for(t.topic_id).unwrap_or_default()
+                } else {
+                    t.topic.clone()
+                };
+                if !crate::acl::authorize(&ctx.principal, crate::acl::OP_READ, crate::acl::RT_TOPIC, &topic_name) {
+                    return Resolved::Authz;
+                }
                 let route = routes
                     .find(&t.topic, t.partition)
                     .or_else(|| routes.find_by_id(t.topic_id, t.partition));
@@ -581,6 +600,7 @@ pub async fn fetch(
     for (i, t) in targets.iter().enumerate() {
         match &resolved[i] {
             Resolved::Missing => futs.push(Fetched { idx: i, err: ErrorCode::UnknownTopicOrPartition, rx: None }),
+            Resolved::Authz => futs.push(Fetched { idx: i, err: ErrorCode::TopicAuthorizationFailed, rx: None }),
             Resolved::NotLeader(_) => futs.push(Fetched { idx: i, err: ErrorCode::NotLeaderOrFollower, rx: None }),
             Resolved::Ready(tx) => {
                 let deadline = std::time::Instant::now()
@@ -1009,4 +1029,154 @@ mod error_semantics_tests {
             let _ = name;
         }
     }
+}
+
+// ---------- ACL Admin（T-M4.1 尾：Describe/Create/DeleteAcls）----------
+
+fn acl_entry_value(a: &crate::acl::Acl) -> Value {
+    s([
+        ("Principal", Value::str(a.principal.clone())),
+        ("Host", Value::str(a.host.clone())),
+        ("Operation", Value::I8(a.operation)),
+        ("PermissionType", Value::I8(a.permission)),
+    ])
+}
+
+/// DescribeAcls v1-3：filter → 匹配条目（resource 分组）
+pub fn describe_acls(req: &basalt_protocol::value::Struct) -> Value {
+    let rt = req.get("ResourceTypeFilter").map(|v| v.as_i8()).unwrap_or(crate::acl::RT_ANY);
+    let rname = req.get("ResourceNameFilter").map(|v| v.as_str().to_string()).unwrap_or_default();
+    let principal = req.get("PrincipalFilter").map(|v| v.as_str().to_string()).unwrap_or_default();
+    let host = req.get("HostFilter").map(|v| v.as_str().to_string()).unwrap_or_default();
+    let op = req.get("Operation").map(|v| v.as_i8()).unwrap_or(crate::acl::OP_ANY);
+    let perm = req.get("PermissionType").map(|v| v.as_i8()).unwrap_or(1);
+    let filter = crate::acl::Acl {
+        resource_type: rt,
+        resource_name: rname,
+        pattern_type: 0,
+        principal,
+        host,
+        operation: op,
+        permission: perm,
+    };
+    // 分组：同 (rtype, name, pattern) 聚合多条 principal 行
+    let mut groups: Vec<(i8, String, i8, Vec<Value>)> = Vec::new();
+    for a in crate::acl::list() {
+        // 复用 delete_by 的匹配谓词（只读描述，不删除）
+        if !crate::acl::filter_matches(&filter, &a) {
+            continue;
+        }
+        match groups.iter_mut().find(|(r, n, p, _)| *r == a.resource_type && *n == a.resource_name && *p == a.pattern_type) {
+            Some((_, _, _, acls)) => acls.push(acl_entry_value(&a)),
+            None => groups.push((a.resource_type, a.resource_name.clone(), a.pattern_type, vec![acl_entry_value(&a)])),
+        }
+    }
+    let resources: Vec<Value> = groups
+        .into_iter()
+        .map(|(rt, name, pt, acls)| {
+            s([
+                ("ResourceType", Value::I8(rt)),
+                ("ResourceName", Value::str(name)),
+                ("PatternType", Value::I8(pt)),
+                ("Acls", Value::Array(acls)),
+            ])
+        })
+        .collect();
+    s([
+        ("ThrottleTimeMs", Value::I32(0)),
+        ("ErrorCode", Value::I16(ErrorCode::None as i16)),
+        ("ErrorMessage", Value::Null),
+        ("Resources", Value::Array(resources)),
+    ])
+}
+
+/// CreateAcls v1-3：逐条创建（重复幂等）
+pub fn create_acls(req: &basalt_protocol::value::Struct) -> Value {
+    let mut results = Vec::new();
+    let mut created = Vec::new();
+    if let Some(Value::Array(creations)) = req.get("Creations") {
+        for c in creations {
+            let Value::Struct(cs) = c else { continue };
+            let get_i8 = |k: &str| cs.get(k).map(|v| v.as_i8()).unwrap_or(0);
+            let get_s = |k: &str| cs.get(k).map(|v| v.as_str().to_string()).unwrap_or_default();
+            let (err, msg) = match get_i8("ResourcePatternType") {
+                3 | 4 => {
+                    if get_s("Principal").is_empty() || get_s("ResourceName").is_empty() {
+                        (ErrorCode::InvalidRequest, Some("empty principal/resource name".into()))
+                    } else {
+                        created.push(crate::acl::Acl {
+                            resource_type: get_i8("ResourceType"),
+                            resource_name: get_s("ResourceName"),
+                            pattern_type: get_i8("ResourcePatternType"),
+                            principal: get_s("Principal"),
+                            host: {
+                                let h = get_s("Host");
+                                if h.is_empty() { "*".into() } else { h }
+                            },
+                            operation: get_i8("Operation"),
+                            permission: get_i8("PermissionType"),
+                        });
+                        (ErrorCode::None, None)
+                    }
+                }
+                pt => (ErrorCode::InvalidRequest, Some(format!("unsupported pattern type {pt}（骨架仅 LITERAL/PREFIXED）"))),
+            };
+            results.push(s([
+                ("ErrorCode", Value::I16(err as i16)),
+                ("ErrorMessage", msg.map(|m| Value::Str(m.into())).unwrap_or(Value::Null)),
+            ]));
+        }
+    }
+    if results.iter().all(|r| matches!(r, Value::Struct(st) if st.get("ErrorCode") == Some(&Value::I16(0)))) {
+        crate::acl::add(created);
+    }
+    s([
+        ("ThrottleTimeMs", Value::I32(0)),
+        ("Results", Value::Array(results)),
+    ])
+}
+
+/// DeleteAcls v1-3：逐 filter 删除，返回被删条目
+pub fn delete_acls(req: &basalt_protocol::value::Struct) -> Value {
+    let mut results = Vec::new();
+    if let Some(Value::Array(filters)) = req.get("Filters") {
+        for f in filters {
+            let Value::Struct(fs) = f else { continue };
+            let get_i8 = |k: &str| fs.get(k).map(|v| v.as_i8()).unwrap_or(0);
+            let get_s = |k: &str| fs.get(k).map(|v| v.as_str().to_string()).unwrap_or_default();
+            let filter = crate::acl::Acl {
+                resource_type: get_i8("ResourceTypeFilter"),
+                resource_name: get_s("ResourceNameFilter"),
+                pattern_type: get_i8("PatternTypeFilter"),
+                principal: get_s("PrincipalFilter"),
+                host: get_s("HostFilter"),
+                operation: get_i8("Operation"),
+                permission: get_i8("PermissionType"),
+            };
+            let removed = crate::acl::delete_by(&filter);
+            let matching: Vec<Value> = removed
+                .iter()
+                .map(|a| {
+                    let mut v = acl_entry_value(a);
+                    if let Value::Struct(st) = &mut v {
+                        st.set("ErrorCode", Value::I16(0));
+                        st.set("ErrorMessage", Value::Null);
+                        st.set("ResourceType", Value::I8(a.resource_type));
+                        st.set("ResourceName", Value::str(a.resource_name.clone()));
+                        st.set("PatternType", Value::I8(a.pattern_type));
+                    }
+                    v
+                })
+                .collect();
+            results.push(s([
+                ("ErrorCode", Value::I16(ErrorCode::None as i16)),
+                ("ErrorMessage", Value::Null),
+                ("MatchingAcls", Value::Array(matching)),
+            ]));
+        }
+    }
+    s([
+        ("ThrottleTimeMs", Value::I32(0)),
+        ("FilterResults", Value::Array(results)),
+    ])
 }

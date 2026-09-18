@@ -98,6 +98,7 @@ pub mod handlers_layout_tests {
             brokers_cache: std::sync::Mutex::new(None),
             pool,
             txn_tx: None,
+            principal: "ANONYMOUS".into(),
             cluster_id: "test-cluster".into(),
             segment_max_bytes: 1 << 30,
             num_partitions: 1,

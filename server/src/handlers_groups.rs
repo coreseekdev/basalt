@@ -68,6 +68,19 @@ pub async fn find_coordinator(version: i16, req: &basalt_protocol::value::Struct
 
 pub async fn join_group(req: &basalt_protocol::value::Struct, version: i16, ctx: &Ctx) -> Value {
     let group = req.get("GroupId").map(|v| v.as_str().to_string()).unwrap_or_default();
+    // ACL（T-M4.1）：GROUP:READ（骨架）——join 是组数据面入口，拒绝即
+    // 无法 commit/heartbeat（member 状态不存在时 commit 自然失败）
+    if !crate::acl::authorize(&ctx.principal, crate::acl::OP_READ, crate::acl::RT_GROUP, &group) {
+        return s([
+            ("ThrottleTimeMs", Value::I32(0)),
+            ("ErrorCode", Value::I16(ErrorCode::GroupAuthorizationFailed as i16)),
+            ("GenerationId", Value::I32(-1)),
+            ("GroupProtocol", Value::Null),
+            ("Leader", Value::str("")),
+            ("MemberId", Value::Str("".into())),
+            ("Members", Value::Array(vec![])),
+        ]);
+    }
     let member_id = req.get("MemberId").map(|v| v.as_str().to_string()).unwrap_or_default();
     let protocol_type = req.get("ProtocolType").map(|v| v.as_str().to_string()).unwrap_or_else(|| "consumer".to_string());
     let session_timeout = req.get("SessionTimeoutMs").map(|v| v.as_i32()).unwrap_or(10_000);
@@ -363,6 +376,21 @@ pub async fn create_topics(req: &basalt_protocol::value::Struct, ctx: &Ctx) -> V
                 }),
                 _ => false,
             };
+            // ACL（T-M4.1）：TOPIC:CREATE 或 CLUSTER:CREATE（骨架）
+            let authorized = crate::acl::authorize(&ctx.principal, crate::acl::OP_CREATE, crate::acl::RT_TOPIC, &name)
+                || crate::acl::authorize(&ctx.principal, crate::acl::OP_CREATE, crate::acl::RT_CLUSTER, "");
+            if !authorized {
+                results.push(s([
+                    ("Name", Value::str(name)),
+                    ("TopicId", Value::Uuid(0)),
+                    ("ErrorCode", Value::I16(ErrorCode::TopicAuthorizationFailed as i16)),
+                    ("ErrorMessage", Value::Null),
+                    ("NumPartitions", Value::I32(num_partitions)),
+                    ("ReplicationFactor", Value::I32(rf)),
+                    ("Configs", Value::Array(vec![])),
+                ]));
+                continue;
+            }
             let (reply_tx, reply_rx) = oneshot::channel();
             // EnsureTopic：请求的 NumPartitions/RF 是建题参数（≠ Lookup
             // allow_create 的 broker 默认——那会把请求值静默覆盖，账本 59）
@@ -414,6 +442,16 @@ pub async fn delete_topics(req: &basalt_protocol::value::Struct, ctx: &Ctx) -> V
     let mut results = Vec::new();
     for (name, tid) in targets {
         // 仅按名删除；纯 TopicId（Name 为空）请求暂不支持（返回 UNKNOWN_TOPIC_ID）
+        // ACL（T-M4.1）：TOPIC:DELETE（骨架）
+        if !crate::acl::authorize(&ctx.principal, crate::acl::OP_DELETE, crate::acl::RT_TOPIC, &name) {
+            results.push(s([
+                ("Name", Value::str(name)),
+                ("TopicId", Value::Uuid(0)),
+                ("ErrorCode", Value::I16(ErrorCode::TopicAuthorizationFailed as i16)),
+                ("ErrorMessage", Value::Null),
+            ]));
+            continue;
+        }
         let err = if name.is_empty() {
             ErrorCode::UnknownTopicId
         } else {

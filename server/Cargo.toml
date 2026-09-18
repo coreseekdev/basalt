@@ -12,6 +12,8 @@ name = "basalt-server"
 path = "src/main.rs"
 
 [dependencies]
+hmac = "0.12"
+sha2 = "0.10"
 regex = "1"
 openraft = "0.9"
 serde = { version = "1", features = ["derive"] }

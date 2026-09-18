@@ -8,6 +8,7 @@
 mod config;
 mod conn;
 mod handlers;
+mod sasl;
 mod handlers_consumer;
 mod handlers_groups;
 mod ctrl_raft;

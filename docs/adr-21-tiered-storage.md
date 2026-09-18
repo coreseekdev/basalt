@@ -50,6 +50,19 @@ sealed base)。
 local）。per-topic storage-mode（CreateTopics configs → TopicMeta →
 controller raft 复制）为下一块边界——元数据面穿越控制器，独立成块。
 
+## 2.5 v1.1（2026-09-18，研究行动清单落地）
+
+对照研究（docs/research/2026-09-18-reference-comparison.md §3/§4）三笔
+结构项当日落地：①段 key 编入 leader epoch（记录追加式，同 base 漂移
+不再覆盖——Redpanda term-in-key 同款）；②上传异步化（OffloadJob 通道 +
+专用 OS 线程 offloader + 字节配额；嵌套 block_on panic 实证后弃
+tokio::spawn 改 OS 线程——阻塞 IO 专用线程纪律同 Log::open）；③运行期
+孤儿 GC（mtime 宽限窗，retention sweep 周期驱动）。读穿透 range 化
+（记录带 crc32c + 稀疏批边界索引）。**duramen S3 适配器落地**（arrow-rs
+0.14 AmazonS3 薄层，feature objstore-s3 默认开）：实机联调发现并推动
+修复 duramen Last-Modified 头格式（ISO-8601 → RFC 2822，duramen
+2f2a8ec）——produce→上传→读穿透→重启恢复 400/400 全链 PASS。
+
 ## 3. 已知边界（v1）
 
 - cloud-direct（S3）适配器未接：契约面已按 Arroyo 四原语收窄，换入即用；

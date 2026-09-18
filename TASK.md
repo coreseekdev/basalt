@@ -151,16 +151,18 @@ Basalt：Rust 版 Kafka 兼容消息流平台
   - ⏳ 已知问题：pod 重建竞态、failover 自动化 e2e 硬化、CreateTopic 注册竞态 RF 钳制
   - 📁 k8s：deploy/k8s（3 节点 Deployment + hostPath + chaos.sh）；microk8s 实测 Running
 
-- **2026-09-18（安全面/管理面/配额一期 + 基准）**：T-M4.1/T-M4.2 一期落地
-  （ADR-22）——SCRAM-SHA-256 鉴权 + 门禁 + 断连语义；TLS 独立 listener
-  （通告跟随所连 listener）；DescribeCluster/DescribeConfigs + 持久化
-  ClusterId（Metadata 同步回填）；逐连接字节率配额（负债制 token bucket +
-  持锁休眠串行化，账本 55/56/57）；e2e 三档（run_auth/run_quota/run_tls）
-  + franz-go 吞吐基准。**新遗留（P1）**：produce 重试重复——幂等去重跨
-  重连失效（PID 未持久化，200k 基准 118 条重复，`run_bench.sh` 复现）；
-  produce acks=all 吞吐延迟主导（13.3MB/s，批 RTT ~75ms，T-M4.4 杠杆面）。
+- **2026-09-18（安全面/管理面/配额一期 + 基准 + 账本 58）**：T-M4.1/T-M4.2
+  一期落地（ADR-22）——SCRAM-SHA-256 鉴权 + 门禁 + 断连语义；TLS 独立
+  listener（通告跟随所连 listener）；DescribeCluster/DescribeConfigs + 持久
+  化 ClusterId（Metadata 同步回填）；逐连接字节率配额（负债制 token bucket
+  + 持锁休眠串行化，账本 55/56/57）；e2e 三档（run_auth/run_quota/run_tls）
+  + franz-go 吞吐基准。**账本 58（基准副产，当轮修复）**：produce 处理序
+  乱序 → OOOSN 自激级联（吞吐假象 13.3MB/s + 200k 重复 118 条双重表现）；
+  PRODUCE 读循环内联后 produce **1703MB/s**、零重复，八套 e2e 回归全绿。
+  初判「PID 未持久化」方向作废（非事务 PID per-session 是 Kafka 本尊语义）。
   **P2**：kafka-python 裸 SCRAM 兼容（pre-KIP-152）、ACL 骨架、per-user
-  配额、SCRAM-512。
+  配额、SCRAM-512；RF≥2 下 acks=all 停等期间 produce 内联的连接级队头
+  （purge 语义/分离应答面留 T-M4.4 评估）。
 
 ## 关键决策记录（ADR 索引）
 

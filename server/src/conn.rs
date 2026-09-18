@@ -219,6 +219,37 @@ pub async fn serve_connection<S>(
         let close_tx = close_tx.clone();
         req_seq += 1;
         let seq = req_seq;
+        // PRODUCE 内联处理（账本 58）：幂等生产者的 seq 序 = 连接请求序，
+        // 分区 actor 必须按请求序收到 produce——per-request 并发派发下，同一
+        // pipeline 的两个 produce 在 actor 邮箱上竞速，后发先至 → 服务端正确
+        // 回 OOOSN，但客户端侧语义是整 PID reload（本地 epoch bump + 回卷重
+        // 发 = 已落盘区间重复）+ 元数据 5s 停等 + produceTimeout 静默丢批的
+        // 级联（Kafka：produce 按连接序应用是幂等 seq 的前提）。处理序 = 读
+        // 序，零竞态。代价：produce 应答期间本连接暂停读——acks=all 停等
+        // （RF≥2）最长 10s；生产者连接不同时做长轮询消费，队头阻塞面可忽略。
+        let is_produce = frame_bytes.len() >= 8
+            && i16::from_be_bytes([frame_bytes[0], frame_bytes[1]]) == key::PRODUCE;
+        if is_produce {
+            match dispatch(frame_bytes, &ctx, &conn).await {
+                Ok(outcome) => {
+                    let _ = resp_tx.send((seq, outcome.resp)).await;
+                    if outcome.close_after {
+                        let _ = close_tx.send(true);
+                    }
+                }
+                Err(DispatchError::UnknownApi) | Err(DispatchError::Protocol(_)) => {
+                    let _ = resp_tx.send((seq, None)).await;
+                }
+                Err(DispatchError::UnsupportedVersion(api_key, version)) => {
+                    if let Some(b) = synth_unsupported(api_key, version).map(Bytes::from) {
+                        let _ = resp_tx.send((seq, Some(Bytes::from(b)))).await;
+                    } else {
+                        let _ = resp_tx.send((seq, None)).await;
+                    }
+                }
+            }
+            continue;
+        }
         tokio::spawn(async move {
             match dispatch(frame_bytes, &ctx, &conn).await {
                 Ok(outcome) => {

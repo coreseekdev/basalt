@@ -83,9 +83,10 @@
 - 客户端矩阵：librdkafka（SCRAM+SSL 两面 e2e）、kafka-clients/franz-go
   （管理面 Admin API 可用）、kafka-python（明文路径不受影响）。
 - 性能基线建立：`testing/bench/run_bench.sh`（release，franz-go 直连面）。
-  2026-09-18 基线：produce 13.3MB/s（acks=all，4 分区，批延迟主导）、
-  consume 1022MB/s（读穿透页缓存）。**基准同时暴露**：间歇性 produce
-  重试重复（200k 条出现 118 条，幂等去重跨重连失效，TASK P1）。
+  2026-09-18 基线（账本 58 修复后）：produce **1703MB/s**、consume
+  1058MB/s（页缓存读穿透）。**基准当轮暴露并修复**：produce 处理序乱序
+  → OOOSN 自激级联（初测 13.3MB/s 假象 + 200k 条 118 条重复，双重表现
+  同根；修复 = PRODUCE 读循环内联，见账本 58）。
 - TLA+ 面：本轮无新增规约（配额/鉴权为接入面语义，不涉核心复制/事务
   不变式；ACL 一期若引入授权决策面再评估）。
 

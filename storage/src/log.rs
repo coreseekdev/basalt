@@ -931,6 +931,56 @@ impl<D: DiskIo> Log<D> {
         (result_epoch, next_start.saturating_sub(1))
     }
 
+    /// 在组 sealed 段 base 列表（分层上传触发面的枚举）
+    pub fn sealed_bases(&self) -> Vec<i64> {
+        self.sealed.iter().map(|s| s.base_offset).collect()
+    }
+
+    /// sealed 段范围（last_offset, bytes）；不存在 → None
+    pub fn sealed_extent(&self, base: i64) -> Option<(i64, u64)> {
+        self.sealed
+            .iter()
+            .find(|s| s.base_offset == base)
+            .map(|s| (s.last_offset(), s.bytes))
+    }
+
+    /// 读 sealed 段原始文件字节（分层上传取料）
+    pub fn read_sealed_bytes(&self, base: i64) -> Result<Vec<u8>> {
+        let seg = self
+            .sealed
+            .iter()
+            .find(|s| s.base_offset == base)
+            .ok_or(StorageError::OffsetOutOfRange(base))?;
+        self.disk.read_all(&seg.path)
+    }
+
+    /// 分层回收（T-M4.3，ADR-21 §2）：移除指定 sealed 段的内存与本地文件，
+    /// **不推进 log_start_offset**——分层数据仍可读（log start 由 retention
+    /// 决定，不由分层回收决定）；读路径对 < 首个本地段 base 的区间由
+    /// partition 层走对象存储读穿透。段不存在（已回收/重复回收）→ Ok(None)。
+    pub fn release_sealed(&mut self, base: i64) -> Result<Option<(i64, u64)>> {
+        let Some(idx) = self.sealed.iter().position(|s| s.base_offset == base) else {
+            return Ok(None);
+        };
+        // 只允许回收完整段：active 之外的 sealed 本就是完整段；防御式校验
+        let seg = self.sealed.remove(idx);
+        debug_assert!(seg.next_rel > 0, "release empty sealed segment");
+        let last = seg.last_offset();
+        let bytes = seg.bytes;
+        let _ = self.disk.remove(&seg.path);
+        let _ = self.disk.remove(&seg.index_path);
+        let _ = self.disk.remove(&seg.time_path);
+        self.disk.sync_dir(&seg.path)?;
+        tracing::debug!(base, last, "tiered released sealed segment");
+        Ok(Some((last, bytes)))
+    }
+
+    /// 本地 sealed 段的最小 base（无 sealed 段 = active base）——分层读
+    /// 分流的本地起点。
+    pub fn first_local_base(&self) -> i64 {
+        self.sealed.first().map(|s| s.base_offset).unwrap_or(self.active.base_offset)
+    }
+
     /// Retention：按大小删除最老的 sealed 段。
     pub fn delete_old_segments(&mut self) -> usize {
         let mut deleted = 0usize;

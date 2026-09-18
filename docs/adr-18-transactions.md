@@ -335,3 +335,14 @@ Makefile `transaction-commit{,-noprepare,-nofence}` 入 CI。**
   （marker 也是数据，须过提交面才算落定，否则 torn transactions 复现；
   §4.1 与本条一字对齐——review P1 抓过此处自相矛盾）；
 - ㊼ 教训前置到 §11：阴性对照 cfg 的突变参数在门禁落地当天与文档三方核对。
+
+## 14. 语义修订注记（2026-09-18，账本 54）
+
+§4.1 终态数据 fence 的原始表述「同 (pid,epoch) 终态 marker 后拒绝新事务批」
+依赖 TV2 init-per-txn 前提（epoch 必 bump，同 epoch 续写 = 僵尸）。librdkafka
+联调（T-M3.5）实证真实客户端**一个 epoch 跑多个事务**：commit 后同 epoch 的
+新事务批与 abort marker 是协议合法流。修订：**数据/marker fence 均为 epoch
+单调**（仅更晚 epoch 出现后，旧 epoch 续写为僵尸）；中止可见性由 aborted
+区间过滤承担（§4.2 不变）；LSO 锚由 txn_register 以新 first_offset 重锚
+（「LSO 停滞洞」封口改由重锚实现，不强拒）。TV2 init-per-txn 流（java/
+franz-go 档）语义不变——四套 e2e + txn 27 测试回归锁定。

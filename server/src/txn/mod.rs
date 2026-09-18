@@ -1207,8 +1207,10 @@ mod jepsen_sim_tests {
     //! T-M3.6 门禁：Jepsen Bufstream 三场景（aborted reads / torn
     //! transactions / lost writes）进种子化仿真——真实组件（TxnLog 文件、
     //! 协调器、分区 actor、接管恢复）上的随机操作交错，每步观测断言。
-    //! 种子数可经 BASALT_TXN_SIM_SEEDS 覆盖（默认 50/commit 档；
-    //! nightly BASALT_TXN_SIM_SEEDS=500——约 1.5s/seed，大头是 TxnLog fsync）。
+    //! 种子数可经 BASALT_TXN_SIM_SEEDS 覆盖（默认 25/commit 档 ≈40s——
+    //! P1 降档定案 2026-09-18：jepsen 随机面收窄由 TLA+ 三门禁全空间
+    //! 兜底；nightly BASALT_TXN_SIM_SEEDS=500——约 1.5s/seed，大头是
+    //! TxnLog fsync）。
 
     use super::*;
     use basalt_record::{encode_batch, Rec, ATTR_TRANSACTIONAL};
@@ -1513,7 +1515,7 @@ mod jepsen_sim_tests {
             return;
         }
         let seeds: u64 = std::env::var("BASALT_TXN_SIM_SEEDS")
-            .ok().and_then(|v| v.parse().ok()).unwrap_or(50);
+            .ok().and_then(|v| v.parse().ok()).unwrap_or(25);
         for seed in 1..=seeds {
             run_seed(seed).await;
             if seed % 100 == 0 {

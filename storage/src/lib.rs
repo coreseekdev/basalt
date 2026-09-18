@@ -13,12 +13,16 @@ pub mod disk;
 pub mod error;
 pub mod index;
 pub mod log;
+pub mod object_store;
 pub mod pool;
 pub mod segment;
 pub mod sim_disk;
+pub mod tiered;
 
 pub use error::{StorageError, Result};
 pub use log::{Log, LogOptions, AppendResult, ReadResult, FsyncSchedule};
+pub use object_store::{CreateOutcome, LocalFsObjectStore, MemoryObjectStore, ObjectStore,
+                       SegmentRecord};
 
 /// RecordBatch v2 魔术（与 record crate 常量一致，避免循环依赖）。
 pub const MAGIC_V2: i8 = 2;

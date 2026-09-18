@@ -257,6 +257,10 @@ pub struct PartitionActor {
     /// flush 失败改发错误——杜绝"ack 而未写文件"（持久化点纪律）。
     deferred_produce: Vec<(oneshot::Sender<ProduceOutcome>, ProduceOutcome)>,
     repl: ReplicaConfig,
+    /// 分层存储（T-M4.3，ADR-21）：BASALT_STORAGE_MODE=tiered 时 Some。
+    /// 注册表权威在对象存储（每段一条 immutable 记录），内存视图是缓存。
+    tier: Option<basalt_storage::tiered::TieredPartition>,
+    tier_store: Option<Box<dyn basalt_storage::ObjectStore>>,
 }
 
 impl PartitionActor {
@@ -273,13 +277,38 @@ impl PartitionActor {
         let (tx, rx) = mpsc::channel(1024);
         // Log::open 是阻塞 IO：专用线程打开后移交 actor task
         let (opened_tx, opened_rx) = std::sync::mpsc::channel();
+        let tiered_mode = std::env::var("BASALT_STORAGE_MODE").as_deref() == Ok("tiered");
+        let open_name = name.clone();
+        let open_index = index;
         std::thread::spawn(move || {
-            let log = Log::open(StdDisk::new(), dir, opts);
-            let _ = opened_tx.send(log);
+            let log = Log::open(StdDisk::new(), dir.clone(), opts);
+            // 分层初始化（同为阻塞 IO，同线程）：启动期孤儿 GC（上传中途
+            // 崩溃的垃圾，此时无在途竞态）+ 注册表恢复（权威在 store）
+            let tier = if tiered_mode {
+                let store = Box::new(basalt_storage::LocalFsObjectStore::new(dir.join("tiered-objectstore")));
+                match basalt_storage::tiered::TieredPartition::gc_orphans_at_startup(store.as_ref(), &open_name, open_index)
+                    .and_then(|n| {
+                        tracing::info!(topic = %open_name, partition = open_index, orphans = n, "tiered startup gc");
+                        basalt_storage::tiered::TieredPartition::load(store.as_ref(), &open_name, open_index)
+                    }) {
+                    Ok(t) => Some((store as Box<dyn basalt_storage::ObjectStore>, t)),
+                    Err(e) => {
+                        tracing::warn!(topic = %open_name, partition = open_index, error = %e, "tiered init failed → local-only fallback");
+                        None
+                    }
+                }
+            } else {
+                None
+            };
+            let _ = opened_tx.send((log, tier));
         });
-        let log = match opened_rx.recv().expect("log open thread") {
-            Ok(l) => l,
-            Err(e) => return Err(std::io::Error::other(e.to_string())),
+        let (log, tier_parts) = match opened_rx.recv().expect("log open thread") {
+            (Ok(l), tier) => (l, tier),
+            (Err(e), _) => return Err(std::io::Error::other(e.to_string())),
+        };
+        let (tier_store, tier) = match tier_parts {
+            Some((s, t)) => (Some(s), Some(t)),
+            None => (None, None),
         };
         tracing::info!(topic = %name, partition = index, "partition actor started");
         let mut actor = PartitionActor {
@@ -306,6 +335,8 @@ impl PartitionActor {
             deferred_markers: Vec::new(),
             deferred_produce: Vec::new(),
             repl,
+            tier,
+            tier_store,
         };
         // 恢复收割（ADR-18 §4.4）：重启后事务视图从日志扫描重建——开事务
         // 锚住 LSO（abort 落地前不泄露）、终态 fence 与 aborted 过滤跨重启有效。
@@ -368,6 +399,7 @@ impl PartitionActor {
                 tracing::error!(error = %e, "batch flush failed: 窗口内 produce 按错误应答");
             }
             self.settle_deferred_produce(flush_result.is_ok());
+            self.maybe_offload();
             self.on_deadline();
             self.serve_pending();
             self.serve_replica_pends();
@@ -486,14 +518,16 @@ impl PartitionActor {
         })
     }
 
-    /// append 成功后记录幂等缓存（最近 5 批）。
+    /// append 成功后记录幂等缓存（最近 5 批）。last_seq 语义 = 批内**末
+    /// 序号**（base + count - 1）——Kafka 序列按记录数推进；此前记成
+    /// base_sequence，多记录批次的第二批必判 gap（45）（账本 53）。
     fn idem_record(&mut self, batches: &Bytes, outcome: &ProduceOutcome) {
         let Some(h) = basalt_record::BatchHeader::parse(batches) else { return };
         if h.producer_id < 0 {
             return;
         }
         let st = self.idem.entry(h.producer_id).or_default();
-        st.last_seq = Some(h.base_sequence);
+        st.last_seq = Some(h.base_sequence + h.record_count - 1);
         st.recent.push_back(IdemBatch {
             base_seq: h.base_sequence,
             base_offset: outcome.base_offset,
@@ -639,7 +673,18 @@ impl PartitionActor {
                                 .deferred_markers
                                 .iter()
                                 .any(|(_, r)| r.as_ref().ok().map(|(_, b)| b.pid == pid).unwrap_or(false));
-                        let fenced = self.last_marker.get(&pid).map(|&(e, _)| e >= ep).unwrap_or(false);
+                        // 僵尸判定（账本 54，语义修订）：fence = epoch 单调——
+                        // 仅更晚 epoch 出现后，旧 epoch 续写为僵尸。同 epoch
+                        // 终态后新事务批合法（librdkafka 一 epoch 多事务实证）：
+                        // txn_register 以新 first_offset 重锚 txn_open，LSO
+                        // 锚照常（TV2 的 init-per-txn 下同 epoch 续写本就
+                        // 不可能出现，放宽不减弱 TV2 面）。中止可见性由
+                        // aborted 区间过滤承担（ADR-18 §4.2）
+                        let fenced = self
+                            .last_marker
+                            .get(&pid)
+                            .map(|&(e, _)| e > ep)
+                            .unwrap_or(false);
                         if fenced || in_flight {
                             let _ = reply.send(ProduceOutcome {
                                 base_offset: -1, last_offset: -1, log_append_time: now_ms(),
@@ -849,6 +894,7 @@ impl PartitionActor {
                 }
                 PartitionCmd::Retention { reply } => {
                     let n = self.log.delete_old_segments();
+                    self.maybe_offload();
                     let _ = reply.send(n);
                 }
                 PartitionCmd::WriteTxnMarker { producer_id, producer_epoch, outcome, reply } => {
@@ -1000,6 +1046,21 @@ impl PartitionActor {
     }
 
     fn read_slice_for(&mut self, offset: i64, max_bytes: usize) -> SliceOutcome {
+        // 分层读穿透（副本拉取同消费路径——follower LEO 落在已回收区间时
+        // 本地 read_ex 会错位读，必须先分流）
+        if offset < self.log.first_local_base() {
+            if let (Some(store), Some(tier)) = (self.tier_store.as_deref(), self.tier.as_ref()) {
+                if tier.covers(offset) {
+                    let data = tier.read_through(store, offset, max_bytes).ok().flatten().unwrap_or_default();
+                    return SliceOutcome {
+                        error: None,
+                        high_watermark: self.log.high_watermark,
+                        next_offset: self.log.next_offset,
+                        data,
+                    };
+                }
+            }
+        }
         let out = if offset < self.log.next_offset {
             self.log.read_ex(offset, max_bytes, &self.pool, ReadCap::LogEnd).ok()
         } else {
@@ -1144,11 +1205,17 @@ impl PartitionActor {
                 return Err(StorageError::InvalidTxnState);
             }
             if me == epoch {
-                return if mo == outcome {
-                    Ok((-1, MarkerBook::noop()))
-                } else {
-                    Err(StorageError::InvalidTxnState)
-                };
+                if mo == outcome {
+                    return Ok((-1, MarkerBook::noop()));
+                }
+                // 同 epoch 异 outcome：新一轮事务的终态（librdkafka 一
+                // epoch 多事务实证）——放行；同 outcome 才是重试幂等 noop。
+                // （aborted 区间由 apply_marker_book 以 txn_open 现值记账；
+                // 无 txn_open 的异 outcome 异常流按拒绝保守处理）
+                let reopened = self.txn_open.get(&pid).is_some_and(|t| t.epoch == epoch);
+                if !reopened {
+                    return Err(StorageError::InvalidTxnState);
+                }
             }
         }
         if let Some(t) = self.txn_open.get(&pid) {
@@ -1292,10 +1359,92 @@ impl PartitionActor {
         }
     }
 
+    /// 分层上传（best-effort，ADR-21 §2 写序）：枚举 sealed 段 → 注册表
+    /// 未有者上传（段对象 create → 段记录 create）→ 本地回收
+    /// （release_sealed 不动 log_start——分层数据仍可读）。失败留待下一
+    /// 触发点重试（produce / retention sweep）；batch_io 窗口内跳过
+    /// （文件尚未 flush，读到的是半截内容）。
+    fn maybe_offload(&mut self) {
+        if self.tier.is_none() {
+            return;
+        }
+        if self.log.batch_io {
+            return;
+        }
+        for base in self.log.sealed_bases() {
+            let (Some(store), Some(tier)) = (self.tier_store.as_deref(), self.tier.as_mut()) else {
+                return;
+            };
+            if tier.has(base) {
+                continue;
+            }
+            let Some((last, _)) = self.log.sealed_extent(base) else { continue };
+            let data = match self.log.read_sealed_bytes(base) {
+                Ok(d) => d,
+                Err(e) => {
+                    tracing::warn!(topic = %self.name, partition = self.index, base, error = %e, "tiered read segment failed");
+                    continue;
+                }
+            };
+            match tier.upload(store, base, last, &data) {
+                Ok(_) => {
+                    if let Err(e) = self.log.release_sealed(base) {
+                        tracing::warn!(topic = %self.name, partition = self.index, base, error = %e, "tiered release failed (will retry)");
+                    } else {
+                        tracing::info!(topic = %self.name, partition = self.index, base, last, "segment offloaded");
+                    }
+                }
+                Err(e) => {
+                    tracing::warn!(topic = %self.name, partition = self.index, base, error = %e, "tiered upload failed (retry next trigger)");
+                    return;
+                }
+            }
+        }
+    }
+
+    /// 分层读穿透：请求起点低于本地首段 base（区间已回收）且分层覆盖时
+    /// 服务；其余一律 None 走本地路径（含 retention 已删的更早区间——
+    /// 原路 OffsetOutOfRange 语义不变）。
+    fn read_through_tiered(
+        &mut self,
+        offset: i64,
+        max_bytes: usize,
+        cap: i64,
+        committed: bool,
+    ) -> Option<FetchOutcome> {
+        let tier = self.tier.as_ref()?;
+        let local_base = self.log.first_local_base();
+        if offset >= local_base {
+            return None;
+        }
+        let tier_min = tier.min_base()?;
+        if offset < tier_min || !tier.covers(offset) || offset >= cap {
+            return None;
+        }
+        let data = tier
+            .read_through(self.tier_store.as_deref()?, offset, max_bytes)
+            .ok()??;
+        let data = self.filter_batches(data, committed);
+        let log_start = self.log.log_start_offset.min(tier_min);
+        Some(FetchOutcome {
+            result: Some(basalt_storage::ReadResult {
+                data,
+                first_offset: offset,
+                high_watermark: self.log.high_watermark,
+                log_start_offset: log_start,
+            }),
+            error: None,
+            last_stable_offset: self.lso,
+        })
+    }
+
     /// 消费读（隔离级感知）：上界 cap_for + 控制批剥离（两档隔离级都剥离，
     /// 应用永不见控制记录）+ read_committed 再剥 aborted 区间并汇总条目。
     fn read_for(&mut self, offset: i64, max_bytes: usize, iso: Isolation) -> FetchOutcome {
         let cap = self.cap_for(iso);
+        if let Some(out) = self.read_through_tiered(offset, max_bytes, cap, iso == Isolation::ReadCommitted) {
+            return out;
+        }
         match self.log.read_ex(offset, max_bytes, &self.pool, ReadCap::At(cap)) {
             Err(e) => FetchOutcome::err(e, self.lso),
             Ok(r) => {
@@ -1947,8 +2096,10 @@ mod txn_tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    /// 终态 fence：同 (pid,epoch) 终态后拒绝新事务批（LSO 永久停滞的
-    /// 可用性洞封口）；epoch 升级重置会话后放行。
+    /// 终态 fence（账本 54 语义修订）：fence = epoch 单调——更晚 epoch
+    /// 出现后旧 epoch 续写 = 僵尸拒绝；同 epoch 终态后新事务批合法
+    /// （librdkafka 一 epoch 多事务实证），txn_register 以新 first_offset
+    /// 重锚 LSO（未决事务不泄露），epoch 升级重置会话后照常放行。
     #[tokio::test]
     async fn terminal_fence_rejects_txn_data_after_marker() {
         let dir = fresh_dir("fence");
@@ -1956,14 +2107,16 @@ mod txn_tests {
         produce(&tx, batch_bytes_txn(500, 0, 0, "m")).await;
         marker(&tx, 500, 0, basalt_record::ControlRecordType::Commit).await.unwrap();
 
-        let o = produce(&tx, batch_bytes_txn(500, 0, 1, "zombie")).await;
-        assert!(matches!(o.error, Some(StorageError::InvalidTxnState)), "终态后同 epoch 事务批必须被拒：{:?}", o.error);
-        let (ltx, lrx) = oneshot::channel();
-        tx.send(PartitionCmd::LocalLeo { reply: ltx }).await.unwrap();
-        assert_eq!(lrx.await.unwrap(), 2, "被拒批不得推进 LEO");
+        // 同 epoch 新一轮事务：合法（重锚 LSO）
+        let o = produce(&tx, batch_bytes_txn(500, 0, 1, "round2")).await;
+        assert!(o.error.is_none() && o.base_offset == 2, "同 epoch 新事务批放行：{:?}", o.error);
+        let f = fetch(&tx, 0, Isolation::ReadCommitted, Duration::from_secs(1)).await;
+        let hs = data_batches(&f);
+        assert_eq!(hs.len(), 1, "round2 批入 LSO 锚：read_committed 不可见");
+        assert_eq!(hs[0].base_offset, 0);
 
         let o2 = produce(&tx, batch_bytes_txn(500, 1, 0, "next")).await;
-        assert!(o2.error.is_none() && o2.base_offset == 2, "新 epoch 会话放行：{:?}", o2.error);
+        assert!(o2.error.is_none() && o2.base_offset == 3, "新 epoch 会话放行：{:?}", o2.error);
 
         drop(tx);
         let _ = std::fs::remove_dir_all(&dir);
@@ -1986,7 +2139,7 @@ mod txn_tests {
         assert!(frx.try_recv().is_err(), "超时前不得应答");
         let f = tokio::time::timeout(Duration::from_secs(2), frx).await.unwrap().unwrap();
         assert!(f.error.is_none());
-        assert!(f.result.as_ref().map(|r| r.data.is_empty()).unwrap_or(true), "超时回包必须按 LSO 封顶，不得泄露开事务数据");
+        assert!(f.result.as_ref().map(|r| r.data.is_empty()).unwrap_or(true), "超时回包按 LSO 封顶，不得泄露开事务数据");
         assert_eq!(f.last_stable_offset, 0);
 
         drop(tx);
@@ -2037,9 +2190,15 @@ mod txn_tests {
         assert_eq!(hs[0].base_offset, 0, "留下的是 commit 会话数据");
         assert_eq!(f.last_stable_offset, 4);
 
-        // 终态 fence 跨重启：harvest last_marker 拒绝同 epoch 僵尸续写
-        let o = produce(&tx2, batch_bytes_txn(500, 0, 1, "zombie")).await;
-        assert!(matches!(o.error, Some(StorageError::InvalidTxnState)), "{:?}", o.error);
+        // 终态 fence 跨重启（账本 54）：同 epoch 续写 = 跨重启新事务轮，
+        // 放行（librdkafka 多事务语义）；旧 epoch 僵尸方向仍拒绝——
+        // 先推进一轮 (500,1) 终态，再以 (500,0) 续写
+        let o = produce(&tx2, batch_bytes_txn(500, 0, 1, "round-across-restart")).await;
+        assert!(o.error.is_none(), "跨重启同 epoch 新事务批放行：{:?}", o.error);
+        produce(&tx2, batch_bytes_txn(500, 1, 0, "later-epoch")).await;
+        marker(&tx2, 500, 1, basalt_record::ControlRecordType::Commit).await.unwrap();
+        let o = produce(&tx2, batch_bytes_txn(500, 0, 2, "zombie")).await;
+        assert!(o.error.is_some(), "更晚 epoch 后旧 epoch 续写必须拒绝：{:?}", o.error);
 
         drop(tx2);
         let _ = std::fs::remove_dir_all(&dir);

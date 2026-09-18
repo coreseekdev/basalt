@@ -17,6 +17,58 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
 const MAX_FRAME: i32 = 100 * 1024 * 1024;
 
+/// 连接级认证与配额状态（T-S1/S5，行动清单）
+pub struct ConnAuth {
+    /// SASL 认证后填入； BASALT_AUTH=none 时恒 "*"
+    pub user: String,
+    /// produce/fetch 字节率配额（bytes/sec；0 = 不限）
+    pub quota_produce_rate: u64,
+    pub quota_fetch_rate: u64,
+    /// token bucket 状态
+    produce_tokens: f64,
+    fetch_tokens: f64,
+    last_replenish: std::time::Instant,
+}
+
+impl ConnAuth {
+    pub fn new() -> Self {
+        let auth_mode = std::env::var("BASALT_AUTH").as_deref() == Ok("scram");
+        ConnAuth {
+            user: if auth_mode { String::new() } else { "*".into() },
+            quota_produce_rate: std::env::var("BASALT_QUOTA_PRODUCER_BYTES")
+                .ok().and_then(|v| v.parse().ok()).unwrap_or(0),
+            quota_fetch_rate: std::env::var("BASALT_QUOTA_FETCH_BYTES")
+                .ok().and_then(|v| v.parse().ok()).unwrap_or(0),
+            produce_tokens: 0.0,
+            fetch_tokens: 0.0,
+            last_replenish: std::time::Instant::now(),
+        }
+    }
+    pub fn auth_enabled(&self) -> bool { self.user != "*" || !self.user.is_empty() }
+    pub fn quota_enabled(&self) -> bool { self.quota_produce_rate > 0 || self.quota_fetch_rate > 0 }
+    /// 消费配额，返回节流毫秒（超出配额时 >0）
+    fn take_quota(&mut self, is_produce: bool, bytes: u64) -> u64 {
+        let (rate, tokens) = if is_produce {
+            (self.quota_produce_rate, &mut self.produce_tokens)
+        } else {
+            (self.quota_fetch_rate, &mut self.fetch_tokens)
+        };
+        if rate == 0 { return 0; }
+        let now = std::time::Instant::now();
+        let elapsed = now.duration_since(self.last_replenish).as_secs_f64();
+        self.last_replenish = now;
+        *tokens = (*tokens + rate * elapsed).min(rate * 2.0); // 突发上限 2×rate
+        if *tokens >= bytes as f64 {
+            *tokens -= bytes as f64;
+            0
+        } else {
+            let deficit = bytes as f64 - *tokens;
+            *tokens = 0.0;
+            ((deficit / rate as f64) * 1000.0) as u64
+        }
+    }
+}
+
 // BufferPool 参数：进程单例共享资源池（内部 Mutex 串行化）——Arc 表达资源
 // 共享而非共享可变所有权，与 Bytes/mpsc 内部引用计数同级豁免（ADR-13）。
 #[allow(clippy::disallowed_types)]
@@ -32,6 +84,7 @@ pub async fn serve_connection(
     // 的 offset commit/heartbeat）。⚠ Kafka 线协议要求同连接响应按请求序返回
     // （correlation id 匹配的前提；Java kafka-clients 严格按序）——处理可以
     // 乱序完成，写出必须按请求序：写任务按 (seq, resp) 重排缓冲
+    let mut auth = ConnAuth::new();
     let (mut rd, mut wr) = sock.into_split();
     let (resp_tx, mut resp_rx) = tokio::sync::mpsc::channel::<(u64, Option<Bytes>)>(256);
 

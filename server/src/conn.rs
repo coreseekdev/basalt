@@ -57,7 +57,7 @@ impl ConnAuth {
         let now = std::time::Instant::now();
         let elapsed = now.duration_since(self.last_replenish).as_secs_f64();
         self.last_replenish = now;
-        *tokens = (*tokens + rate * elapsed).min(rate * 2.0); // 突发上限 2×rate
+        *tokens = (*tokens + rate as f64 * elapsed).min(rate as f64 * 2.0); // 突发上限 2×rate
         if *tokens >= bytes as f64 {
             *tokens -= bytes as f64;
             0

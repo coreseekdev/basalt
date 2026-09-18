@@ -90,6 +90,31 @@ pub async fn consumer_group_heartbeat(req: &basalt_protocol::value::Struct, ctx:
         out
     };
 
+    // ServerAssignor 协商（T-M3.4，ADR-20 §3）：null = 未变；POC 支持
+    // range/uniform，未知值直接拒绝——UNSUPPORTED_ASSIGNOR=112（kerr/
+    // Errors.java 双源核对，非 57；不可重试）。组内定名 first-wins。
+    let assignor: Option<String> = match req.get("ServerAssignor") {
+        Some(Value::Str(name)) if !name.is_empty() => {
+            let name = name.to_string();
+            if name != "range" && name != "uniform" {
+                return s([
+                    throttle_field(),
+                    ("ErrorCode", Value::I16(ErrorCode::UnsupportedAssignor as i16)),
+                    (
+                        "ErrorMessage",
+                        Value::Str(format!("assignor {name} not supported (range/uniform)").into()),
+                    ),
+                    ("MemberId", Value::str(member_id.clone())),
+                    ("MemberEpoch", Value::I32(member_epoch)),
+                    ("HeartbeatIntervalMs", Value::I32(HEARTBEAT_INTERVAL_MS)),
+                    ("Assignment", Value::Null),
+                ]);
+            }
+            Some(name)
+        }
+        _ => None,
+    };
+
     // 订阅 topic 的分区数快照 + 名→TopicId 映射（接线要点②：经 Lookup 携带；
     // TopicMeta 有 name/topic_id/partitions）。Some(vec![]) 恒定——None 是
     // 全量语义，会把全集群 topic 灌进组（退订成员误扩 partition_counts）。
@@ -105,6 +130,7 @@ pub async fn consumer_group_heartbeat(req: &basalt_protocol::value::Struct, ctx:
         member_id,
         member_epoch,
         subscribed,
+        assignor,
         owned,
         counts,
         reply: tx,

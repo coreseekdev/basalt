@@ -109,6 +109,10 @@ pub enum ErrorCode {
     // 69 = GROUP_ID_NOT_FOUND（KIP-848 ConsumerGroupDescribe：组不存在；
     // Errors.java 核对，不可重试——ADR-19 块 b describe 面）
     GroupIdNotFound = 69,
+    // 112 = UNSUPPORTED_ASSIGNOR（KIP-848 ServerAssignor 协商：请求的分配
+    // 器不受支持；kerr/Errors.java 双源核对 112 非 57，不可重试——
+    // ADR-20 §3 uniform/range 协商面）
+    UnsupportedAssignor = 112,
 }
 
 impl From<ErrorCode> for i16 {

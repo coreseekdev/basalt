@@ -749,6 +749,7 @@ mod error_semantics_tests {
         (ErrorCode::EligibleLeadersNotAvailable, "ELIGIBLE_LEADERS_NOT_AVAILABLE", 83, true),
         (ErrorCode::FencedMemberEpoch, "FENCED_MEMBER_EPOCH", 82, false),
         (ErrorCode::GroupIdNotFound, "GROUP_ID_NOT_FOUND", 69, false),
+        (ErrorCode::UnsupportedAssignor, "UNSUPPORTED_ASSIGNOR", 112, false),
     ];
 
     /// 官方数值权威表（Errors.java 转录，独立于我们枚举的第二真相源——
@@ -773,6 +774,7 @@ mod error_semantics_tests {
         ("ELIGIBLE_LEADERS_NOT_AVAILABLE", 83),
         ("FENCED_MEMBER_EPOCH", 82),
         ("GROUP_ID_NOT_FOUND", 69),
+        ("UNSUPPORTED_ASSIGNOR", 112),
     ];
 
     #[test]
@@ -808,6 +810,7 @@ mod error_semantics_tests {
             ("ELIGIBLE_LEADERS_NOT_AVAILABLE", true),
             ("FENCED_MEMBER_EPOCH", false),
             ("GROUP_ID_NOT_FOUND", false),
+            ("UNSUPPORTED_ASSIGNOR", false),
         ];
         for (code, name, _, retriable) in TABLE {
             let official = official_retriable.iter().find(|(n, _)| n == name).unwrap();

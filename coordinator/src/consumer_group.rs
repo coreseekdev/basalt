@@ -13,7 +13,7 @@ pub struct MemberState {
     pub assignment: BTreeMap<String, Vec<i32>>,
 }
 
-#[derive(Debug, Default)]
+#[derive(Debug)]
 pub struct ConsumerGroup {
     /// topic → 分区数（服务端元数据面，块 b 经 meta 接线更新）
     pub partition_counts: HashMap<String, i32>,
@@ -24,6 +24,23 @@ pub struct ConsumerGroup {
     /// 重算次数（Describe 的 Group/AssignmentEpoch 同源——membership 变化
     /// 即重算，无栅栏相位）
     rebalances: u64,
+    /// 组分配器（T-M3.4，ADR-20 §3）：组创建时首个非空 ServerAssignor
+    /// 定名（first-wins）；"range"（per-topic 连续切块，默认）/"uniform"
+    /// （全局份额 + movement-minimizing）
+    assignor: String,
+}
+
+impl Default for ConsumerGroup {
+    fn default() -> Self {
+        Self {
+            partition_counts: HashMap::new(),
+            members: BTreeMap::new(),
+            subsig: 0,
+            next_ordinal: 0,
+            rebalances: 0,
+            assignor: "range".into(),
+        }
+    }
 }
 
 /// ConsumerGroupDescribe 的组快照（块 b）。
@@ -131,13 +148,13 @@ impl ConsumerGroup {
     }
 
     /// DescribeConsumerGroup 快照（ConsumerGroupDescribe v0）。空组成员集
-    /// = Empty（组存在但无成员）；Assignor 固定 range（§3 POC 边界）。
+    /// = Empty（组存在但无成员）；Assignor = 组级分配器名。
     pub fn describe(&self) -> GroupDescribe {
         GroupDescribe {
             state: if self.members.is_empty() { "Empty" } else { "Stable" }.to_string(),
             group_epoch: self.rebalances as i32,
             assignment_epoch: self.rebalances as i32,
-            assignor: "range".to_string(),
+            assignor: self.assignor.clone(),
             members: self
                 .members
                 .values()
@@ -163,33 +180,157 @@ impl ConsumerGroup {
         h
     }
 
-    /// 服务端 Range 分配（java RangeAssignor 对齐）：订阅并集内每个 topic，
-    /// 分区按成员序连续切块（余数给前面的成员）；未订阅的 topic 不分配。
+    /// 重算分派：range（per-topic 连续切块，默认）/ uniform（全局份额 +
+    /// movement-minimizing，T-M3.4）。epoch 推进共用。
     fn rebalance(&mut self) {
         self.rebalances += 1;
         let ids: Vec<String> = self.members.keys().cloned().collect();
+        let targets = if self.assignor == "uniform" {
+            self.uniform_targets(&ids)
+        } else {
+            self.range_targets(&ids)
+        };
         for (id, m) in self.members.iter_mut() {
-            let mut target = BTreeMap::new();
-            let subscribed: std::collections::BTreeSet<&String> = m.subscribed.iter().collect();
-            for topic in &subscribed {
-                let total = *self.partition_counts.get(*topic).unwrap_or(&0) as usize;
-                if total == 0 || ids.is_empty() {
-                    continue;
-                }
-                let idx = ids.iter().position(|x| x == id).unwrap_or(0);
-                let base = total / ids.len();
-                let rem = total % ids.len();
-                let start = idx * base + idx.min(rem);
-                let count = base + if idx < rem { 1 } else { 0 };
-                target.insert((*topic).clone(), (start as i32..(start + count) as i32).collect());
-            }
-            m.assignment = target;
+            m.assignment = targets.get(id).cloned().unwrap_or_default();
             if m.epoch == 0 {
                 m.epoch = 1;
             } else {
                 m.epoch += 1;
             }
         }
+    }
+
+    /// 服务端 Range 分配（java RangeAssignor 对齐）：订阅并集内每个 topic，
+    /// 分区按成员序连续切块（余数给前面的成员）；未订阅的 topic 不分配。
+    fn range_targets(&self, ids: &[String]) -> BTreeMap<String, BTreeMap<String, Vec<i32>>> {
+        let mut out: BTreeMap<String, BTreeMap<String, Vec<i32>>> =
+            ids.iter().map(|id| (id.clone(), BTreeMap::new())).collect();
+        let topics: std::collections::BTreeSet<&String> = self
+            .members
+            .values()
+            .flat_map(|m| m.subscribed.iter())
+            .collect();
+        for topic in topics {
+            let total = *self.partition_counts.get(topic).unwrap_or(&0) as usize;
+            if total == 0 || ids.is_empty() {
+                continue;
+            }
+            let base = total / ids.len();
+            let rem = total % ids.len();
+            for (i, id) in ids.iter().enumerate() {
+                if !self.members[id].subscribed.iter().any(|s| s == topic) {
+                    continue;
+                }
+                let start = i * base + i.min(rem);
+                let count = base + if i < rem { 1 } else { 0 };
+                if count > 0 {
+                    out.get_mut(id).unwrap().insert(
+                        (*topic).clone(),
+                        (start as i32..(start + count) as i32).collect(),
+                    );
+                }
+            }
+        }
+        out
+    }
+
+    /// uniform（movement-minimizing，ADR-20 §3）：全局分区清单 = 订阅
+    /// topic 并集 × 分区（(topic, partition) 字典序）；份额 n_i = total/M
+    /// 前 r 位成员 +1（成员按 id 稳定序）。**保留段**——各成员按序在份额
+    /// 内保留现有仍订阅的分区，保留序按「topic 订阅者数升序」优先（唯一
+    /// 订阅的 topic 先保——防 constrained topic 被泛订阅 topic 挤出而饿死
+    /// 唯一订阅者）；**补派段**——余下分区按序轮派给未满份额的订阅者，
+    /// 无未满订阅者时由任一订阅者兜底（订阅约束优先于份额）。
+    fn uniform_targets(&self, ids: &[String]) -> BTreeMap<String, BTreeMap<String, Vec<i32>>> {
+        let n = ids.len();
+        let mut out: BTreeMap<String, BTreeMap<String, Vec<i32>>> =
+            ids.iter().map(|id| (id.clone(), BTreeMap::new())).collect();
+        if n == 0 {
+            return out;
+        }
+        // 全局分区清单（订阅 topic 并集）
+        let topics: std::collections::BTreeSet<&String> = self
+            .members
+            .values()
+            .flat_map(|m| m.subscribed.iter())
+            .collect();
+        let mut all: Vec<(String, i32)> = Vec::new();
+        for t in &topics {
+            let total = *self.partition_counts.get(*t).unwrap_or(&0);
+            for p in 0..total {
+                all.push(((*t).clone(), p));
+            }
+        }
+        let total = all.len();
+        let fair = total / n;
+        let rem = total % n;
+        let size_of = |i: usize| fair + if i < rem { 1 } else { 0 };
+        let subscriber_count =
+            |t: &String| ids.iter().filter(|id| self.members[*id].subscribed.iter().any(|s| s == t)).count();
+
+        // 保留段：现 assignment 摊平、过滤已退订、按（订阅者数升序，topic，
+        // 分区）排序后截到份额
+        let mut kept: Vec<Vec<(String, i32)>> = ids
+            .iter()
+            .map(|id| {
+                let m = &self.members[id];
+                let sub: std::collections::BTreeSet<&String> = m.subscribed.iter().collect();
+                let mut cur: Vec<(String, i32)> = m
+                    .assignment
+                    .iter()
+                    .flat_map(|(t, ps)| ps.iter().map(move |p| ((*t).clone(), *p)))
+                    .filter(|(t, _)| sub.contains(t))
+                    .collect();
+                cur.sort_by_key(|(t, p)| (subscriber_count(t), t.clone(), *p));
+                let cap = size_of(ids.iter().position(|x| x == id).unwrap_or(0));
+                cur.truncate(cap);
+                cur
+            })
+            .collect();
+
+        // 补派段：未保留分区按（成员序 cyclic）派给未满份额的订阅者；
+        // 全员满份额时由任一订阅者兜底（唯一订阅 topic 不得悬空）
+        let mut taken: std::collections::BTreeSet<(String, i32)> =
+            kept.iter().flatten().cloned().collect();
+        let pool: Vec<(String, i32)> = all.into_iter().filter(|k| !taken.contains(k)).collect();
+        let mut j = 0usize;
+        for kv in pool {
+            let subs: Vec<usize> = (0..n)
+                .filter(|&i| self.members[&ids[i]].subscribed.iter().any(|s| s == &kv.0))
+                .collect();
+            if subs.is_empty() {
+                continue; // 不可达（all 来自当前订阅并集），防御
+            }
+            let mut placed = false;
+            for k in 0..n {
+                let i = (j + k) % n;
+                if subs.contains(&i) && kept[i].len() < size_of(i) {
+                    kept[i].push(kv.clone());
+                    j = i + 1;
+                    placed = true;
+                    break;
+                }
+            }
+            if !placed {
+                for k in 0..n {
+                    let i = (j + k) % n;
+                    if subs.contains(&i) {
+                        kept[i].push(kv.clone());
+                        j = i + 1;
+                        break;
+                    }
+                }
+            }
+        }
+        for (i, id) in ids.iter().enumerate() {
+            let mut by_topic: BTreeMap<String, Vec<i32>> = BTreeMap::new();
+            for (t, p) in &kept[i] {
+                by_topic.entry(t.clone()).or_default().push(*p);
+            }
+            out.insert(id.clone(), by_topic);
+        }
+        taken.clear();
+        out
     }
 }
 
@@ -313,6 +454,70 @@ mod consumer_group_tests {
         assert!(!u.assignment.contains_key("t"), "退订后收回分配");
     }
 
+    /// uniform 分配器（T-M3.4 块 a，ADR-20 §3）movement-minimizing 金样：
+    /// 3 分区 [A 全占] → B 加入 [A 留 2、B 得 1] → C 加入 [A 留 p0、B 的
+    /// p2 不动、C 得 p1——range 在此把 B 挪到 p1，分叉点即金样] → C 离开
+    /// 回归 [A 0,1 / B 2]，零不必要移动。
+    #[test]
+    fn uniform_assignment_minimizes_movement() {
+        let mut cg = ConsumerGroup { assignor: "uniform".into(), ..Default::default() };
+        cg.partition_counts.insert("t".into(), 3);
+        let a = hb(&mut cg, "", 0, vec!["t"], vec![]);
+        assert_eq!(a.assignment[&"t".to_string()], vec![0, 1, 2]);
+        let a_id = a.member_id.clone();
+        let b = hb(&mut cg, "", 0, vec!["t"], vec![]);
+        let b_id = b.member_id.clone();
+        // HeartbeatResult 是应答时刻的快照——断言服务端现状须读 cg.members
+        assert_eq!(cg.members[&a_id].assignment[&"t".to_string()], vec![0, 1], "A 保留段零移动");
+        assert_eq!(cg.members[&b_id].assignment[&"t".to_string()], vec![2]);
+        let c = hb(&mut cg, "", 0, vec!["t"], vec![]);
+        let c_id = c.member_id.clone();
+        let (a1, b1, c1) = (
+            &cg.members[&a_id].assignment,
+            &cg.members[&b_id].assignment,
+            &cg.members[&c_id].assignment,
+        );
+        assert_eq!(a1[&"t".to_string()], vec![0], "A 保留 p0");
+        assert_eq!(b1[&"t".to_string()], vec![2], "B 的 p2 不动（range 会挪——分叉点）");
+        assert_eq!(c1[&"t".to_string()], vec![1], "C 补派 p1");
+        // C 离开：份额回归，A 拿回 p1，B 全程不动
+        hb(&mut cg, &c_id, -1, vec![], vec![]);
+        assert_eq!(cg.members[&a_id].assignment[&"t".to_string()], vec![0, 1]);
+        assert_eq!(cg.members[&b_id].assignment[&"t".to_string()], vec![2]);
+        assert!(!cg.members.contains_key(&c_id));
+    }
+
+    /// uniform 退订收回 + 多 topic 全局份额（vs range 的 per-topic 切块）：
+    /// 保留序按「topic 订阅者数升序」——A 先保唯一可订阅的 t2，t1 全归 B
+    /// （B 的唯一可订阅 topic），订阅约束优先于份额。
+    #[test]
+    fn uniform_unsubscribe_and_multi_topic() {
+        let mut cg = ConsumerGroup { assignor: "uniform".into(), ..Default::default() };
+        cg.partition_counts.insert("t1".into(), 2);
+        cg.partition_counts.insert("t2".into(), 2);
+        let a = hb(&mut cg, "", 0, vec!["t1", "t2"], vec![]);
+        assert_eq!(a.assignment[&"t1".to_string()], vec![0, 1]);
+        assert_eq!(a.assignment[&"t2".to_string()], vec![0, 1]);
+        let a_id = a.member_id.clone();
+        let b = hb(&mut cg, "", 0, vec!["t1"], vec![]);
+        let b_id = b.member_id.clone();
+        // 全局 4 分区 2 成员 → 各 2：A 保 t2（唯一订阅者），B 得 t1
+        let a_now = &cg.members[&a_id].assignment;
+        assert_eq!(a_now.get("t1"), None, "t1 让给唯一订阅 t1 的 B");
+        assert_eq!(a_now[&"t2".to_string()], vec![0, 1], "A 保唯一可订阅的 t2");
+        assert_eq!(cg.members[&b_id].assignment[&"t1".to_string()], vec![0, 1]);
+        // 订阅约束优先于份额——B 不得拿 t2
+        assert_eq!(cg.members[&b_id].assignment.get("t2"), None);
+        // A 退订 t1（已不在手上）→ 双方份额不变，B 零扰动。
+        // 真实客户端语义：B 加入曾令 A 被 fence，退订前先按服务端当前
+        // epoch 重同步（直接用旧快照的心跳会被拒）
+        let a_epoch = cg.members[&a_id].epoch;
+        let u = hb(&mut cg, &a_id, a_epoch, vec!["t2"], vec![]);
+        assert!(!u.assignment.contains_key("t1"));
+        assert_eq!(u.assignment[&"t2".to_string()], vec![0, 1]);
+        assert_eq!(cg.members[&b_id].assignment[&"t1".to_string()], vec![0, 1]);
+    }
+
     /// keepalive（KIP-848：未变字段置 null）：订阅保持、分配保留、epoch
     /// 不 bump——不得把 null 订阅当退订（franz-go topicsMatch 路径每拍都
     /// 发 null，误判会让成员每拍丢分配）。
@@ -345,6 +550,9 @@ pub struct CGHeartbeat {
     pub member_epoch: i32,
     /// None = 订阅未变（KIP-848 keepalive：未变字段置 null）
     pub subscribed: Option<Vec<String>>,
+    /// ServerAssignor（协议面已校验 ∈ {range, uniform}）；None = 未变。
+    /// 组创建时首个非空请求定组分配器（first-wins，ADR-20 §3）
+    pub assignor: Option<String>,
     pub owned: BTreeMap<String, Vec<i32>>,
     /// 订阅 topic 的分区数快照（handler 经 meta 查询后携带）
     pub counts: Vec<(String, i32)>,
@@ -374,7 +582,10 @@ impl ConsumerGroups {
             while let Some(cmd) = rx.recv().await {
                 match cmd {
                     CGCmd::Heartbeat(hb) => {
-                        let cg = groups.entry(hb.group.clone()).or_default();
+                        let cg = groups.entry(hb.group.clone()).or_insert_with(|| ConsumerGroup {
+                            assignor: hb.assignor.clone().unwrap_or_else(|| "range".into()),
+                            ..Default::default()
+                        });
                         for (t, c) in hb.counts {
                             cg.partition_counts.insert(t, c);
                         }

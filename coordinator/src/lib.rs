@@ -44,6 +44,9 @@ pub struct Member {
     pub session_timeout_ms: i32,
     pub rebalance_timeout_ms: i32,
     pub subscription: Vec<u8>,
+    /// 成员支持的协议名序（请求偏好序）——组协议选择面（T-M3.4，ADR-20 §2：
+    /// leader 偏好序 ∩ 全体成员支持集，替代硬编码 range）
+    pub protocol_names: Vec<String>,
     pub assignment: Vec<u8>,
     pub last_heartbeat: Instant,
 }
@@ -279,7 +282,8 @@ impl GroupManager {
 
     fn sweep(&mut self) {
         let now = Instant::now();
-        for g in self.groups.values_mut() {
+        let mut emptied: Vec<String> = Vec::new();
+        for (name, g) in self.groups.iter_mut() {
             let before = g.members.len();
             g.members.retain(|m| {
                 now.duration_since(m.last_heartbeat) < Duration::from_millis(m.session_timeout_ms.max(0) as u64)
@@ -294,7 +298,14 @@ impl GroupManager {
                 g.leader = None;
                 g.protocol = None;
                 g.rebalance_deadline = None;
+                emptied.push(name.clone());
             }
+        }
+        // 组清空时悬挂的 pending join/sync 必须答复（可重试 27）——否则
+        // 客户端等满自己的超时（协作组中途全灭的场景实证）
+        for name in emptied {
+            self.fail_pending_joins(&name, CoordError::RebalanceInProgress);
+            self.fail_pending_syncs(&name, CoordError::RebalanceInProgress);
         }
         // rebalance 截止：踢除未重新入组的成员后完成
         for name in self.groups.keys().cloned().collect::<Vec<_>>() {
@@ -325,10 +336,30 @@ impl GroupManager {
                 if g.members.is_empty() {
                     g.state = GroupState::Empty;
                     g.rebalance_deadline = None;
+                    self.fail_pending_joins(&name, CoordError::RebalanceInProgress);
+                    self.fail_pending_syncs(&name, CoordError::RebalanceInProgress);
                 } else {
                     g.rebalance_deadline = None;
                     self.complete_rebalance(&name);
                 }
+            }
+        }
+    }
+
+    /// 冲刷组的悬挂 pending join（组已无法完成本轮 rebalance 时）：逐个回
+    /// 可重试错误，客户端按退避重入组。
+    fn fail_pending_joins(&mut self, group: &str, error: CoordError) {
+        if let Some(pendings) = self.pending_joins.remove(group) {
+            for p in pendings {
+                let _ = p.reply.send(JoinResult {
+                    error,
+                    generation: -1,
+                    protocol_type: String::new(),
+                    protocol: None,
+                    leader: String::new(),
+                    member_id: p.spec_member,
+                    members: vec![],
+                });
             }
         }
     }
@@ -427,6 +458,7 @@ impl GroupManager {
                 session_timeout_ms: spec.session_timeout_ms,
                 rebalance_timeout_ms: spec.rebalance_timeout_ms,
                 subscription: Vec::new(),
+                protocol_names: spec.protocols.iter().map(|(n, _)| n.clone()).collect(),
                 assignment: Vec::new(),
                 last_heartbeat: Instant::now(),
             });
@@ -435,6 +467,7 @@ impl GroupManager {
         if let Some(m) = g.member_mut(&member_id) {
             m.last_heartbeat = Instant::now();
             m.session_timeout_ms = spec.session_timeout_ms;
+            m.protocol_names = known_protocols.iter().map(|(n, _)| n.clone()).collect();
             if let Some((_name, meta)) = known_protocols.first() {
                 m.subscription = meta.clone();
             }
@@ -473,8 +506,14 @@ impl GroupManager {
         if g.state != GroupState::PreparingRebalance {
             return;
         }
-        let pending = self.pending_joins.get(group).map(|v| v.len()).unwrap_or(0);
-        if pending >= g.members.len() && !g.members.is_empty() {
+        // 只数仍然在组的 pending（session 过期成员的挂起请求不算数——否则
+        // 过期成员会触发「完成」并给已不在组的人发 success）
+        let alive = self
+            .pending_joins
+            .get(group)
+            .map(|v| v.iter().filter(|p| g.member(&p.spec_member).is_some()).count())
+            .unwrap_or(0);
+        if alive >= g.members.len() && !g.members.is_empty() {
             self.complete_rebalance(group);
         }
     }
@@ -484,10 +523,23 @@ impl GroupManager {
         if g.state != GroupState::PreparingRebalance || g.members.is_empty() {
             return;
         }
-        // 选分配策略：leader 订阅协议序里第一个全体支持的
-        let leader_sub = g.member(g.leader.as_deref().unwrap_or("")).map(|m| m.subscription.clone());
-        let _ = leader_sub;
-        g.protocol = Some("range".to_string());
+        // 选分配策略（T-M3.4，ADR-20 §2）：leader 偏好序 ∩ 全体成员支持集
+        // 的首个——cooperative-sticky 等非 range 协议组依赖此处选中正确
+        // 协议名（客户端校验应答协议）。空交集兜底 range（POC 不做
+        // InconsistentGroupProtocol=23 拒绝，注释即边界）。
+        let leader_names = g
+            .member(g.leader.as_deref().unwrap_or(""))
+            .map(|m| m.protocol_names.clone())
+            .unwrap_or_default();
+        let protocol = leader_names
+            .into_iter()
+            .find(|name| {
+                g.members
+                    .iter()
+                    .all(|m| m.protocol_names.iter().any(|n| n == name))
+            })
+            .unwrap_or_else(|| "range".to_string());
+        g.protocol = Some(protocol);
         g.generation += 1;
         g.state = GroupState::CompletingSync;
         g.rebalance_deadline = None;
@@ -508,16 +560,33 @@ impl GroupManager {
             "rebalance completed");
         let pendings = self.pending_joins.remove(group).unwrap_or_default();
         for p in pendings {
-            let is_leader = p.spec_member == leader;
+            // stale pending（成员已被 session 过期踢除）：回可重试 27 而非
+            // success——不在组的人不能拿到新代分配
+            let alive = g.member(&p.spec_member).is_some();
             let _ = p.reply.send(JoinResult {
-                error: CoordError::None,
-                generation,
+                error: if alive { CoordError::None } else { CoordError::RebalanceInProgress },
+                generation: if alive { generation } else { -1 },
                 protocol_type: protocol_type.clone(),
                 protocol: protocol.clone(),
                 leader: leader.clone(),
                 member_id: p.spec_member.clone(),
-                members: if is_leader { members_meta.clone() } else { vec![] },
+                members: if alive && p.spec_member == leader { members_meta.clone() } else { vec![] },
             });
+        }
+    }
+
+    /// 冲刷组的悬挂 pending sync（组已无法完成本轮 rebalance 时）：逐个回
+    /// 可重试错误。
+    fn fail_pending_syncs(&mut self, group: &str, error: CoordError) {
+        if let Some(pendings) = self.pending_syncs.remove(group) {
+            for p in pendings {
+                let _ = p.reply.send(SyncResult {
+                    error,
+                    protocol_type: String::new(),
+                    protocol: None,
+                    assignment: vec![],
+                });
+            }
         }
     }
 

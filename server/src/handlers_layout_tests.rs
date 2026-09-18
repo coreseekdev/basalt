@@ -611,6 +611,21 @@ pub mod handlers_layout_tests {
         ])
     }
 
+    // ServerAssignor 可变（uniform 协商 / 未知值 112 用例）
+    fn hb_req_assignor(group: &str, member: &str, epoch: i32, subs: Value, assignor: &str) -> Value {
+        s([
+            ("GroupId", Value::str(group)),
+            ("MemberId", Value::str(member)),
+            ("MemberEpoch", Value::I32(epoch)),
+            ("InstanceId", Value::Null),
+            ("RackId", Value::Null),
+            ("RebalanceTimeoutMs", Value::I32(10_000)),
+            ("SubscribedTopicNames", subs),
+            ("ServerAssignor", Value::str(assignor)),
+            ("TopicPartitions", Value::Null),
+        ])
+    }
+
     fn assignment_parts(r: &Struct) -> Vec<Value> {
         match fld(r, "Assignment") {
             Value::Null => vec![],
@@ -710,6 +725,35 @@ pub mod handlers_layout_tests {
         let r = cgh(&ctx, kv, hb_req_v1("cg2", "client-uuid-2", 0, Value::Null, Value::str("(?:t.*)"))).await;
         assert_eq!(fld(&r, "ErrorCode").as_i16(), 42, "regex 订阅显式拒收");
 
+        // ---- ServerAssignor 协商（T-M3.4 块 a，ADR-20 §3）----
+        // uniform 组：组创建时首个非空请求定名（first-wins），分配即 uniform；
+        // describe 的 AssignorName 同源
+        let r = cgh(&ctx, 0, hb_req_assignor("cg3", "u-1", 0, Value::Array(vec![Value::str("t1")]), "uniform")).await;
+        assert_eq!(fld(&r, "ErrorCode").as_i16(), 0);
+        let tps = assignment_parts(&r);
+        assert_eq!(tps.len(), 1, "uniform 单成员独占");
+        let parts: Vec<i32> = arr(as_struct(&tps[0]), "Partitions").iter().map(|p| p.as_i32()).collect();
+        assert_eq!(parts, vec![0, 1], "uniform 单成员全占");
+        // 续租不带 assignor（null）→ 组定名不漂移
+        let r = cgh(&ctx, 0, hb_req_assignor("cg3", "u-1", 1, Value::Null, "")).await;
+        assert_eq!(fld(&r, "ErrorCode").as_i16(), 0);
+        // 未知 assignor → UNSUPPORTED_ASSIGNOR(112)，零状态（组未创建）
+        let r = cgh(&ctx, 0, hb_req_assignor("cg9", "x-1", 0, Value::Array(vec![Value::str("t1")]), "bogus")).await;
+        assert_eq!(fld(&r, "ErrorCode").as_i16(), 112, "UNSUPPORTED_ASSIGNOR");
+        let r = cgd(&ctx, 0, s([
+            ("GroupIds", Value::Array(vec![Value::str("cg9")])),
+            ("IncludeAuthorizedOperations", Value::Bool(false)),
+        ])).await;
+        assert_eq!(sfield(&arr(&r, "Groups")[0], "ErrorCode").as_i16(), 69, "拒绝发生在建组前——组不存在");
+        // describe 的 AssignorName 与组分配器同源（uniform 组）
+        let r = cgd(&ctx, 0, s([
+            ("GroupIds", Value::Array(vec![Value::str("cg3")])),
+            ("IncludeAuthorizedOperations", Value::Bool(false)),
+        ])).await;
+        let gs = arr(&r, "Groups");
+        let g = as_struct(&gs[0]);
+        assert_eq!(fld(g, "AssignorName").as_str(), "uniform", "describe 与组分配器同源");
+
         // ---- ConsumerGroupDescribe (69) ----
         let kd = basalt_protocol::api::key::CONSUMER_GROUP_DESCRIBE;
         let r = cgd(&ctx, 0, s([
@@ -747,6 +791,107 @@ pub mod handlers_layout_tests {
         assert_eq!(sfield(&gs[0], "GroupId").as_str(), "ghost");
         assert_eq!(sfield(&gs[0], "ErrorCode").as_i16(), 69, "GROUP_ID_NOT_FOUND");
         assert!(arr(as_struct(&gs[0]), "Members").is_empty());
+    }
+
+    #[tokio::test]
+    async fn probe_cooperative_protocol_selection() {
+        let ctx = make_ctx(&[]).await;
+        // cooperative-sticky 组（KIP-429，T-M3.4 块 b）：组协议 = leader 偏好
+        // 序 ∩ 全体成员支持集——此前硬编码 "range"，协作客户端校验应答协议
+        // 名即败
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        ctx.group_tx
+            .send(GroupCmd::JoinGroup(JoinSpec {
+                group: "coop".into(),
+                member_id: "".into(),
+                protocol_type: "consumer".into(),
+                session_timeout_ms: 10_000,
+                rebalance_timeout_ms: 10_000,
+                protocols: vec![("cooperative-sticky".into(), b"SUB".to_vec())],
+                client_host: "localhost".into(),
+            }, tx))
+            .await
+            .unwrap();
+        let j = rx.await.unwrap();
+        assert_eq!(j.error.code(), 0);
+        assert_eq!(j.protocol.as_deref(), Some("cooperative-sticky"), "组协议按 leader 偏好选中");
+
+        // 第二成员偏好序 (range, cooperative-sticky) 加入 → 组进入新一轮
+        // rebalance；A 重入组（协作流的真实形态）完成本轮——两个 join 都
+        // 发出后再等待（A 不重入则 B 挂到 deadline 被可重试 27 冲刷）
+        let (tx2, rx2) = tokio::sync::oneshot::channel();
+        ctx.group_tx
+            .send(GroupCmd::JoinGroup(JoinSpec {
+                group: "coop".into(),
+                member_id: "".into(),
+                protocol_type: "consumer".into(),
+                session_timeout_ms: 10_000,
+                rebalance_timeout_ms: 10_000,
+                protocols: vec![("range".into(), b"S".to_vec()), ("cooperative-sticky".into(), b"S".to_vec())],
+                client_host: "localhost".into(),
+            }, tx2))
+            .await
+            .unwrap();
+        let (tx3, rx3) = tokio::sync::oneshot::channel();
+        ctx.group_tx
+            .send(GroupCmd::JoinGroup(JoinSpec {
+                group: "coop".into(),
+                member_id: j.member_id.clone(),
+                protocol_type: "consumer".into(),
+                session_timeout_ms: 10_000,
+                rebalance_timeout_ms: 10_000,
+                protocols: vec![("cooperative-sticky".into(), b"SUB".to_vec())],
+                client_host: "localhost".into(),
+            }, tx3))
+            .await
+            .unwrap();
+        let j2 = rx2.await.unwrap();
+        assert_eq!(j2.error.code(), 0);
+        assert_eq!(j2.protocol.as_deref(), Some("cooperative-sticky"), "leader 偏好优先，组协议不漂移");
+        let j3 = rx3.await.unwrap();
+        assert_eq!(j3.error.code(), 0, "A 重入组完成 rebalance");
+        assert_eq!(j3.leader, j.member_id, "leader 保持不变");
+        assert!(j3.generation > j.generation, "generation 推进");
+        assert_eq!(j2.protocol.as_deref(), Some("cooperative-sticky"), "leader 偏好优先，组协议不漂移");
+
+        // DescribeGroups 的 ProtocolData 与组协议同源
+        let r = dg(&ctx, 0, vec![Value::str("coop")]).await;
+        assert_eq!(sfield(&arr(&r, "Groups")[0], "ProtocolData").as_str(), "cooperative-sticky");
+
+        // 账本 52 回归：rebalance 中途组清空（无人重入组）时 pending join
+        // 必须被可重试 27 冲刷，而非悬挂到客户端超时。b 的 session 3s 短于
+        // rebalance 截止 10s：t3s session 过期被踢（pending 仍在），t10s
+        // 截止踢除余员 → 组空 → 冲刷回 27（确定性路径）
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        ctx.group_tx
+            .send(GroupCmd::JoinGroup(JoinSpec {
+                group: "coop2".into(),
+                member_id: "".into(),
+                protocol_type: "consumer".into(),
+                session_timeout_ms: 10_000,
+                rebalance_timeout_ms: 10_000,
+                protocols: vec![("range".into(), b"S".to_vec())],
+                client_host: "localhost".into(),
+            }, tx))
+            .await
+            .unwrap();
+        let j0 = rx.await.unwrap();
+        assert_eq!(j0.error.code(), 0);
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        ctx.group_tx
+            .send(GroupCmd::JoinGroup(JoinSpec {
+                group: "coop2".into(),
+                member_id: "".into(),
+                protocol_type: "consumer".into(),
+                session_timeout_ms: 3_000,
+                rebalance_timeout_ms: 10_000,
+                protocols: vec![("range".into(), b"S".to_vec())],
+                client_host: "localhost".into(),
+            }, tx))
+            .await
+            .unwrap();
+        let jb = rx.await.unwrap();
+        assert_eq!(jb.error.code(), 27, "组清空路径 pending join 必须被可重试 27 冲刷（账本 52）");
     }
 
     // ---- 事务 API（ADR-18 块 c）：真实协调器全链 + 字节级布局 ----

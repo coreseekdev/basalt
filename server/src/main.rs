@@ -19,6 +19,7 @@ mod meta;
 mod share_group;
 mod partition;
 mod group_state_store;
+mod group_sync;
 mod handlers_share;
 mod handlers_txn;
 mod tls;
@@ -240,26 +241,55 @@ async fn async_main(cfg: Config) {
     }
 
     let (meta_tx, routes_rx) = meta::MetaService::spawn(cfg.clone(), controller_addr, controller_tx.clone(), pool.clone());
-    let group_tx = basalt_coordinator::GroupManager::spawn(std::path::Path::new(&cfg.data_dir));
+    let group_tx = basalt_coordinator::GroupManager::spawn();
 
-    // 内部 topic 自动创建（方案 B 块 b1）：组状态持久化面
+    // 内部 topic 自动创建 + 组状态绑定（方案 B 块 b1/b2）：ensure → 等本地
+    // 分区 actor 路由 → 重放 → BindState（原子安装状态 + 下沉通道）。
+    // 绑定完成前 commit/promote 一律回 CoordinatorNotAvailable（客户端
+    // 重试）；绑定在客户端监听建立前完成，窗口内无真实流量。
     {
         let itx = meta_tx.clone();
+        let routes_rx_g = routes_rx.clone();
+        let group_tx_g = group_tx.clone();
+        let rf = cfg.default_rf;
         tokio::spawn(async move {
             for _ in 0..20 {
-                if CTX.get().is_some() { break; }
+                if CTX.get().is_some() {
+                    break;
+                }
                 tokio::time::sleep(std::time::Duration::from_millis(200)).await;
             }
             let (txr, rxr) = tokio::sync::oneshot::channel();
             let _ = itx.send(meta::MetaCmd::EnsureTopic {
                 name: "__basalt_group_state".to_string(),
                 partitions: 1,
-                rf: 1,
+                rf,
                 tiered: false,
                 reply: txr,
-            }).await;
+            })
+            .await;
             let _ = rxr.await;
-            tracing::info!("internal group state topic ensured");
+            // 分区 actor 由 apply_cluster 异步 spawn——轮询等待路由出现
+            let mut part_tx = None;
+            for _ in 0..100 {
+                if let Some(r) = routes_rx_g.borrow().find("__basalt_group_state", 0) {
+                    part_tx = Some(r.tx.clone());
+                    break;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+            }
+            let Some(part_tx) = part_tx else {
+                tracing::error!("internal group state route missing; group commits will be rejected until restart");
+                return;
+            };
+            let sink = group_sync::spawn(part_tx.clone());
+            let install = group_sync::replay(part_tx).await;
+            let (breply, brx) = tokio::sync::oneshot::channel();
+            let _ = group_tx_g
+                .send(basalt_coordinator::GroupCmd::BindState { out: sink, install, reply: breply })
+                .await;
+            let _ = brx.await;
+            tracing::info!("internal group state topic ensured and bound");
         });
     }
 

@@ -10,12 +10,10 @@ use std::collections::HashMap;
 use std::time::{Duration, Instant};
 
 pub mod consumer_group;
-pub mod log;
 
 // KIP-848 新消费组协议面（T-M3.3 块 b）——server 侧 handler 直接引用
 pub use consumer_group::{CGCmd, CGHeartbeat, ConsumerGroups, GroupDescribe, MemberDescribe};
 
-use log::OffsetLog;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum GroupState {
@@ -125,7 +123,24 @@ pub enum GroupCmd {
     ListGroups { reply: tokio::sync::oneshot::Sender<Vec<GroupSummary>> },
     /// 管理面：查询单组详情（DescribeGroups）。组不存在回 None。
     DescribeGroup { group: String, reply: tokio::sync::oneshot::Sender<Option<GroupDetail>> },
+    /// 方案 B 块 b2：绑定内部 topic 状态通道 + 安装重放状态。绑定前
+    /// commit/promote 一律回 CoordinatorNotAvailable（客户端重试）——
+    /// 绑定点在客户端监听建立之前，窗口内无真实流量。
+    BindState {
+        out: StateSinkTx,
+        install: HashMap<(String, String, i32), CommittedOffset>,
+        reply: tokio::sync::oneshot::Sender<()>,
+    },
 }
+
+/// 组状态下沉通道（server 侧 GroupStateSync 实现：内部 topic produce 路径）。
+/// 消息 = (group, 批量提交, 持久化完成应答)——应答 Ok 即已落内部 topic
+/// （acks=all 语义，B2 权威存储；本地 OffsetLog 已移除）。
+pub type StateSinkTx = tokio::sync::mpsc::Sender<(
+    String,
+    Vec<CommittedOffset>,
+    tokio::sync::oneshot::Sender<Result<(), String>>,
+)>;
 
 /// ListGroups 条目。
 #[derive(Debug, Clone)]
@@ -210,7 +225,9 @@ struct PendingSync {
 pub struct GroupManager {
     groups: HashMap<String, Group>,
     offsets: HashMap<(String, String, i32), CommittedOffset>,
-    offset_log: OffsetLog,
+    /// 方案 B：组状态权威存储 = __basalt_group_state（produce 路径）。
+    /// None = 未绑定（见 BindState）。
+    state_out: Option<StateSinkTx>,
     rx: tokio::sync::mpsc::Receiver<GroupCmd>,
     pending_joins: HashMap<String, Vec<PendingJoin>>, // group → 等待 join 完成的请求
     pending_syncs: HashMap<String, Vec<PendingSync>>,
@@ -218,13 +235,12 @@ pub struct GroupManager {
 }
 
 impl GroupManager {
-    pub fn spawn(data_dir: &std::path::Path) -> tokio::sync::mpsc::Sender<GroupCmd> {
+    pub fn spawn() -> tokio::sync::mpsc::Sender<GroupCmd> {
         let (tx, rx) = tokio::sync::mpsc::channel(512);
-        let offset_log = OffsetLog::open(&data_dir.join("__consumer_offsets.log"));
         let mgr = GroupManager {
             groups: HashMap::new(),
-            offsets: offset_log.replay(),
-            offset_log,
+            offsets: HashMap::new(),
+            state_out: None,
             rx,
             pending_joins: HashMap::new(),
             pending_syncs: HashMap::new(),
@@ -238,14 +254,49 @@ impl GroupManager {
     }
 
     async fn run(mut self) {
+        // commit/promote 需要等待内部 topic 持久化应答，不能在 drain 的
+        // try_recv 循环里同步处理——暂存队列，主循环按序 await
+        let mut deferred: std::collections::VecDeque<GroupCmd> = Default::default();
         loop {
+            if let Some(cmd) = deferred.pop_front() {
+                self.handle_persisting(cmd).await;
+                self.drain_into(&mut deferred);
+                continue;
+            }
             let deadline = self.next_deadline();
             match tokio::time::timeout(deadline, self.rx.recv()).await {
-                Ok(Some(cmd)) => self.handle(cmd),
+                Ok(Some(cmd)) => self.handle_persisting(cmd).await,
                 Ok(None) => break,
                 Err(_) => self.sweep(),
             }
-            self.drain();
+            self.drain_into(&mut deferred);
+        }
+    }
+
+    /// 持久化敏感命令的统一入口（B2）：commit/promote 先落内部 topic
+    /// （await 应答）再更新内存视图并应答；失败回 CoordinatorNotAvailable
+    /// （可重试 15——客户端按退避重投，内存视图不更新 = 未提交）。
+    async fn handle_persisting(&mut self, cmd: GroupCmd) {
+        match cmd {
+            GroupCmd::CommitOffsets { group, generation, member_id, offsets, reply } => {
+                let v = self.validate_commit(&group, generation, &member_id);
+                if v != CoordError::None {
+                    let _ = reply.send(v);
+                    return;
+                }
+                let e = match self.persist(&group, &offsets).await {
+                    Ok(()) => CoordError::None,
+                    Err(()) => CoordError::GroupCoordinatorNotAvailable,
+                };
+                let _ = reply.send(e);
+            }
+            GroupCmd::PromoteTxnOffsets { group, offsets, reply } => {
+                if self.persist(&group, &offsets).await.is_ok() {
+                    self.promote(&group, &offsets);
+                }
+                let _ = reply.send(());
+            }
+            other => self.handle(other),
         }
     }
 
@@ -274,9 +325,14 @@ impl GroupManager {
         min
     }
 
-    fn drain(&mut self) {
+    fn drain_into(&mut self, deferred: &mut std::collections::VecDeque<GroupCmd>) {
         while let Ok(cmd) = self.rx.try_recv() {
-            self.handle(cmd);
+            match cmd {
+                c @ (GroupCmd::CommitOffsets { .. } | GroupCmd::PromoteTxnOffsets { .. }) => {
+                    deferred.push_back(c);
+                }
+                other => self.handle(other),
+            }
         }
     }
 
@@ -376,12 +432,18 @@ impl GroupManager {
                 let e = self.leave(&group, &member_id);
                 let _ = reply.send(e);
             }
-            GroupCmd::CommitOffsets { group, generation, member_id, offsets, reply } => {
-                let e = self.commit(&group, generation, &member_id, offsets);
-                let _ = reply.send(e);
+            GroupCmd::BindState { out, install, reply } => {
+                self.offsets.extend(install);
+                self.state_out = Some(out);
+                tracing::info!(installed = self.offsets.len(), "group state bound to internal topic");
+                let _ = reply.send(());
             }
-            GroupCmd::PromoteTxnOffsets { group, offsets, reply } => {
-                self.promote(&group, offsets);
+            // commit/promote 走 handle_persisting（run 循环拦截）；此分支
+            // 兜底防御性不可达
+            GroupCmd::CommitOffsets { reply, .. } => {
+                let _ = reply.send(CoordError::GroupCoordinatorNotAvailable);
+            }
+            GroupCmd::PromoteTxnOffsets { reply, .. } => {
                 let _ = reply.send(());
             }
             GroupCmd::FetchOffsets { group, topics, reply } => {
@@ -674,17 +736,16 @@ impl GroupManager {
         CoordError::None
     }
 
-    /// 事务提升：与 commit 同一持久化点（OffsetLog + 内存 map），但以
+    /// 事务提升：与 commit 同一持久化点（B2 起为内部 topic），但以
     /// 协调器 TxnLog 的 epoch fence 为准——不做成员/generation 校验。
-    fn promote(&mut self, group: &str, offsets: Vec<CommittedOffset>) {
-        for o in &offsets {
-            self.offset_log.append(group, o);
-            self.offsets.insert((group.to_string(), o.topic.clone(), o.partition), o.clone());
-        }
+    /// 持久化由 run 循环的 persist 路径先行完成，此处只应用内存视图。
+    fn promote(&mut self, group: &str, offsets: &[CommittedOffset]) {
+        self.apply_commits(group, offsets);
         tracing::info!(group=%group, promoted=offsets.len(), "txn offsets promoted");
     }
 
-    fn commit(&mut self, group: &str, generation: i32, member_id: &str, offsets: Vec<CommittedOffset>) -> CoordError {
+    /// commit 的持久化前置校验（失败不落存储）。
+    fn validate_commit(&self, group: &str, generation: i32, member_id: &str) -> CoordError {
         // POC：仅校验成员存在；generation 校验放宽（stable 组必须匹配）
         if let Some(g) = self.groups.get(group) {
             if g.member(member_id).is_none() {
@@ -694,11 +755,34 @@ impl GroupManager {
                 return CoordError::IllegalGeneration;
             }
         }
-        for o in &offsets {
-            self.offset_log.append(group, &o);
+        CoordError::None
+    }
+
+    /// 提交持久化（B2）：内部 topic append（acks=all 语义）——应答 Ok 即
+    /// 已持久化。通道关闭/存储拒绝 = Err（调用方回 CoordinatorNotAvailable，
+    /// 客户端重试；内存视图不更新 = 未提交）。
+    async fn persist(&mut self, group: &str, offsets: &[CommittedOffset]) -> Result<(), ()> {
+        let Some(sink) = self.state_out.clone() else { return Err(()) };
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        sink.send((group.to_string(), offsets.to_vec(), tx))
+            .await
+            .map_err(|_| ())?;
+        match rx.await.map_err(|_| ())? {
+            Ok(()) => {
+                self.apply_commits(group, offsets);
+                Ok(())
+            }
+            Err(e) => {
+                tracing::warn!(group=%group, error=%e, "group state sink rejected commit");
+                Err(())
+            }
+        }
+    }
+
+    fn apply_commits(&mut self, group: &str, offsets: &[CommittedOffset]) {
+        for o in offsets {
             self.offsets.insert((group.to_string(), o.topic.clone(), o.partition), o.clone());
         }
         tracing::info!(group=%group, accepted=offsets.len(), total=self.offsets.len(), "offsets committed");
-        CoordError::None
     }
 }

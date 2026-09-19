@@ -330,6 +330,78 @@ pub fn encode_batch(
 
 // ---------- zigzag varint（记录内部用） ----------
 
+/// 解码未压缩批的记录区（内部消费面：组状态重放等）。produce 路径不解
+/// 记录体；压缩批返回 None（内部 topic 恒未压缩）。buf = 完整批。
+pub fn decode_records(buf: &[u8]) -> Option<Vec<Rec>> {
+    let h = BatchHeader::parse(buf)?;
+    // from_bits(0) = Some(Compression::None)：未压缩也是 Some——只拒真压缩批
+    if !matches!(h.compression(), None | Some(Compression::None)) {
+        return None;
+    }
+    if h.is_control() {
+        return None;
+    }
+    let count = h.record_count.max(0) as usize;
+    let end = h.total_len().min(buf.len());
+    let mut pos = RECORD_BATCH_HEADER_LEN;
+    let mut out = Vec::with_capacity(count);
+    for _ in 0..count {
+        if pos >= end {
+            return None;
+        }
+        let _len = read_zigzag(buf, &mut pos)?;
+        let _attrs = *buf.get(pos)?;
+        pos += 1;
+        let ts = read_zigzag(buf, &mut pos)?;
+        let _off_delta = read_zigzag(buf, &mut pos)?;
+        let klen = read_zigzag(buf, &mut pos)?;
+        let key = if klen < 0 {
+            None
+        } else {
+            let k = klen as usize;
+            if pos + k > end {
+                return None;
+            }
+            let b = Bytes::copy_from_slice(&buf[pos..pos + k]);
+            pos += k;
+            Some(b)
+        };
+        let vlen = read_zigzag(buf, &mut pos)?;
+        let value = if vlen < 0 {
+            None
+        } else {
+            let v = vlen as usize;
+            if pos + v > end {
+                return None;
+            }
+            let b = Bytes::copy_from_slice(&buf[pos..pos + v]);
+            pos += v;
+            Some(b)
+        };
+        let hcount = read_zigzag(buf, &mut pos)?.max(0) as usize;
+        let mut headers = Vec::with_capacity(hcount);
+        for _ in 0..hcount {
+            let hklen = read_zigzag(buf, &mut pos)?;
+            if hklen < 0 {
+                return None;
+            }
+            let hk = Bytes::copy_from_slice(&buf[pos..pos + hklen as usize]);
+            pos += hklen as usize;
+            let hvlen = read_zigzag(buf, &mut pos)?;
+            let hv = if hvlen < 0 {
+                None
+            } else {
+                let b = Bytes::copy_from_slice(&buf[pos..pos + hvlen as usize]);
+                pos += hvlen as usize;
+                Some(b)
+            };
+            headers.push((hk, hv));
+        }
+        out.push(Rec { timestamp_delta: ts, key, value, headers });
+    }
+    Some(out)
+}
+
 pub fn put_zigzag(buf: &mut BytesMut, v: i64) {
     let z = ((v << 1) ^ (v >> 63)) as u64;
     let mut shift = 0;
@@ -410,6 +482,29 @@ pub fn compress(codec: Compression, data: &[u8]) -> Option<Vec<u8>> {
 
 #[cfg(test)]
 mod tests {
+    //! 编解码 round-trip 与畸形输入面。
+
+    use super::*;
+    use bytes::BufMut as _;
+
+    #[test]
+    fn decode_records_round_trip() {
+        let recs = vec![
+            Rec { timestamp_delta: 0, key: Some(Bytes::from_static(b"grp")),
+                  value: Some(Bytes::from_static(b"payload-1")), headers: vec![] },
+            Rec { timestamp_delta: 5, key: None,
+                  value: Some(Bytes::from_static(b"p2")), headers: vec![
+                      (Bytes::from_static(b"h"), Some(Bytes::from_static(b"v")))] },
+        ];
+        let mut out = BytesMut::new();
+        encode_batch(42, 0, 1000, 0, -1, -1, -1, &recs, &mut out);
+        let got = decode_records(&out.freeze()).expect("decode");
+        assert_eq!(got.len(), 2);
+        assert_eq!(got[0].key.as_deref(), Some(b"grp".as_ref()));
+        assert_eq!(got[0].value.as_deref(), Some(b"payload-1".as_ref()));
+        assert_eq!(got[1].timestamp_delta, 5);
+        assert_eq!(got[1].headers.len(), 1);
+    }
     use super::*;
 
     fn sample_records() -> Vec<Rec> {

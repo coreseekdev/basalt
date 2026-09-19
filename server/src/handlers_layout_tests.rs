@@ -33,7 +33,7 @@ pub mod handlers_layout_tests {
     /// 构造带路由 + 真实 MetaService（应答 Lookup）+ 真实 GroupManager 的 Ctx。
     async fn make_ctx(topics: &[(&str, i32)]) -> Ctx {
         let dir = tmpdir("groups");
-        let group_tx = basalt_coordinator::GroupManager::spawn(&dir);
+        let group_tx = basalt_coordinator::GroupManager::spawn();
         let cg_tx = basalt_coordinator::ConsumerGroups::spawn();
         let cfg = crate::config::Config {
             node_id: 0,

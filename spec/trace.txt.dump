@@ -1,0 +1,1168 @@
+State 1:
+/\ coordAlive = TRUE
+/\ pending = {}
+/\ durableLen = 0
+/\ coordState = [g1 |-> 0]
+/\ log = <<>>
+/\ acked = {}
+
+State 2:
+/\ coordAlive = TRUE
+/\ pending = {[g |-> "g1", o |-> 1]}
+/\ durableLen = 0
+/\ coordState = [g1 |-> 0]
+/\ log = <<>>
+/\ acked = {}
+
+State 3:
+/\ coordAlive = TRUE
+/\ pending = {[g |-> "g1", o |-> 2]}
+/\ durableLen = 0
+/\ coordState = [g1 |-> 0]
+/\ log = <<>>
+/\ acked = {}
+
+State 4:
+/\ coordAlive = FALSE
+/\ pending = {}
+/\ durableLen = 0
+/\ coordState = [g1 |-> 0]
+/\ log = <<>>
+/\ acked = {}
+
+State 5:
+/\ coordAlive = TRUE
+/\ pending = {[g |-> "g1", o |-> 1], [g |-> "g1", o |-> 2]}
+/\ durableLen = 0
+/\ coordState = [g1 |-> 0]
+/\ log = <<>>
+/\ acked = {}
+
+State 6:
+/\ coordAlive = TRUE
+/\ pending = {}
+/\ durableLen = 0
+/\ coordState = [g1 |-> 1]
+/\ log = <<[g |-> "g1", o |-> 1]>>
+/\ acked = {}
+
+State 7:
+/\ coordAlive = FALSE
+/\ pending = {[g |-> "g1", o |-> 1]}
+/\ durableLen = 0
+/\ coordState = [g1 |-> 0]
+/\ log = <<>>
+/\ acked = {}
+
+State 8:
+/\ coordAlive = TRUE
+/\ pending = {}
+/\ durableLen = 0
+/\ coordState = [g1 |-> 2]
+/\ log = <<[g |-> "g1", o |-> 2]>>
+/\ acked = {}
+
+State 9:
+/\ coordAlive = FALSE
+/\ pending = {[g |-> "g1", o |-> 2]}
+/\ durableLen = 0
+/\ coordState = [g1 |-> 0]
+/\ log = <<>>
+/\ acked = {}
+
+State 10:
+/\ coordAlive = TRUE
+/\ pending = {[g |-> "g1", o |-> 2]}
+/\ durableLen = 0
+/\ coordState = [g1 |-> 1]
+/\ log = <<[g |-> "g1", o |-> 1]>>
+/\ acked = {}
+
+State 11:
+/\ coordAlive = TRUE
+/\ pending = {[g |-> "g1", o |-> 1]}
+/\ durableLen = 0
+/\ coordState = [g1 |-> 2]
+/\ log = <<[g |-> "g1", o |-> 2]>>
+/\ acked = {}
+
+State 12:
+/\ coordAlive = FALSE
+/\ pending = {[g |-> "g1", o |-> 1], [g |-> "g1", o |-> 2]}
+/\ durableLen = 0
+/\ coordState = [g1 |-> 0]
+/\ log = <<>>
+/\ acked = {}
+
+State 13:
+/\ coordAlive = TRUE
+/\ pending = {[g |-> "g1", o |-> 1]}
+/\ durableLen = 0
+/\ coordState = [g1 |-> 1]
+/\ log = <<[g |-> "g1", o |-> 1]>>
+/\ acked = {}
+
+State 14:
+/\ coordAlive = TRUE
+/\ pending = {}
+/\ durableLen = 1
+/\ coordState = [g1 |-> 1]
+/\ log = <<[g |-> "g1", o |-> 1]>>
+/\ acked = {}
+
+State 15:
+/\ coordAlive = FALSE
+/\ pending = {}
+/\ durableLen = 0
+/\ coordState = [g1 |-> 1]
+/\ log = <<[g |-> "g1", o |-> 1]>>
+/\ acked = {}
+
+State 16:
+/\ coordAlive = TRUE
+/\ pending = {[g |-> "g1", o |-> 2]}
+/\ durableLen = 0
+/\ coordState = [g1 |-> 2]
+/\ log = <<[g |-> "g1", o |-> 2]>>
+/\ acked = {}
+
+State 17:
+/\ coordAlive = TRUE
+/\ pending = {}
+/\ durableLen = 1
+/\ coordState = [g1 |-> 2]
+/\ log = <<[g |-> "g1", o |-> 2]>>
+/\ acked = {}
+
+State 18:
+/\ coordAlive = FALSE
+/\ pending = {}
+/\ durableLen = 0
+/\ coordState = [g1 |-> 2]
+/\ log = <<[g |-> "g1", o |-> 2]>>
+/\ acked = {}
+
+State 19:
+/\ coordAlive = TRUE
+/\ pending = {[g |-> "g1", o |-> 1], [g |-> "g1", o |-> 2]}
+/\ durableLen = 0
+/\ coordState = [g1 |-> 1]
+/\ log = <<[g |-> "g1", o |-> 1]>>
+/\ acked = {}
+
+State 20:
+/\ coordAlive = TRUE
+/\ pending = {}
+/\ durableLen = 0
+/\ coordState = [g1 |-> 2]
+/\ log = <<[g |-> "g1", o |-> 1], [g |-> "g1", o |-> 2]>>
+/\ acked = {}
+
+State 21:
+/\ coordAlive = TRUE
+/\ pending = {[g |-> "g1", o |-> 2]}
+/\ durableLen = 1
+/\ coordState = [g1 |-> 1]
+/\ log = <<[g |-> "g1", o |-> 1]>>
+/\ acked = {}
+
+State 22:
+/\ coordAlive = FALSE
+/\ pending = {[g |-> "g1", o |-> 2]}
+/\ durableLen = 0
+/\ coordState = [g1 |-> 1]
+/\ log = <<[g |-> "g1", o |-> 1]>>
+/\ acked = {}
+
+State 23:
+/\ coordAlive = TRUE
+/\ pending = {[g |-> "g1", o |-> 1], [g |-> "g1", o |-> 2]}
+/\ durableLen = 0
+/\ coordState = [g1 |-> 2]
+/\ log = <<[g |-> "g1", o |-> 2]>>
+/\ acked = {}
+
+State 24:
+/\ coordAlive = TRUE
+/\ pending = {}
+/\ durableLen = 0
+/\ coordState = [g1 |-> 2]
+/\ log = <<[g |-> "g1", o |-> 2], [g |-> "g1", o |-> 1]>>
+/\ acked = {}
+
+State 25:
+/\ coordAlive = TRUE
+/\ pending = {[g |-> "g1", o |-> 1]}
+/\ durableLen = 1
+/\ coordState = [g1 |-> 2]
+/\ log = <<[g |-> "g1", o |-> 2]>>
+/\ acked = {}
+
+State 26:
+/\ coordAlive = FALSE
+/\ pending = {[g |-> "g1", o |-> 1]}
+/\ durableLen = 0
+/\ coordState = [g1 |-> 2]
+/\ log = <<[g |-> "g1", o |-> 2]>>
+/\ acked = {}
+
+State 27:
+/\ coordAlive = TRUE
+/\ pending = {}
+/\ durableLen = 0
+/\ coordState = [g1 |-> 1]
+/\ log = <<[g |-> "g1", o |-> 1], [g |-> "g1", o |-> 1]>>
+/\ acked = {}
+
+State 28:
+/\ coordAlive = TRUE
+/\ pending = {[g |-> "g1", o |-> 1]}
+/\ durableLen = 1
+/\ coordState = [g1 |-> 1]
+/\ log = <<[g |-> "g1", o |-> 1]>>
+/\ acked = {}
+
+State 29:
+/\ coordAlive = FALSE
+/\ pending = {[g |-> "g1", o |-> 1]}
+/\ durableLen = 0
+/\ coordState = [g1 |-> 1]
+/\ log = <<[g |-> "g1", o |-> 1]>>
+/\ acked = {}
+
+State 30:
+/\ coordAlive = TRUE
+/\ pending = {}
+/\ durableLen = 1
+/\ coordState = [g1 |-> 1]
+/\ log = <<[g |-> "g1", o |-> 1]>>
+/\ acked = {[g |-> "g1", o |-> 1]}
+
+State 31:
+/\ coordAlive = FALSE
+/\ pending = {}
+/\ durableLen = 1
+/\ coordState = [g1 |-> 1]
+/\ log = <<[g |-> "g1", o |-> 1]>>
+/\ acked = {}
+
+State 32:
+/\ coordAlive = TRUE
+/\ pending = {}
+/\ durableLen = 0
+/\ coordState = [g1 |-> 0]
+/\ log = <<[g |-> "g1", o |-> 1]>>
+/\ acked = {}
+
+State 33:
+/\ coordAlive = TRUE
+/\ pending = {}
+/\ durableLen = 0
+/\ coordState = [g1 |-> 2]
+/\ log = <<[g |-> "g1", o |-> 2], [g |-> "g1", o |-> 2]>>
+/\ acked = {}
+
+State 34:
+/\ coordAlive = TRUE
+/\ pending = {[g |-> "g1", o |-> 2]}
+/\ durableLen = 1
+/\ coordState = [g1 |-> 2]
+/\ log = <<[g |-> "g1", o |-> 2]>>
+/\ acked = {}
+
+State 35:
+/\ coordAlive = FALSE
+/\ pending = {[g |-> "g1", o |-> 2]}
+/\ durableLen = 0
+/\ coordState = [g1 |-> 2]
+/\ log = <<[g |-> "g1", o |-> 2]>>
+/\ acked = {}
+
+State 36:
+/\ coordAlive = TRUE
+/\ pending = {}
+/\ durableLen = 1
+/\ coordState = [g1 |-> 2]
+/\ log = <<[g |-> "g1", o |-> 2]>>
+/\ acked = {[g |-> "g1", o |-> 2]}
+
+State 37:
+/\ coordAlive = FALSE
+/\ pending = {}
+/\ durableLen = 1
+/\ coordState = [g1 |-> 2]
+/\ log = <<[g |-> "g1", o |-> 2]>>
+/\ acked = {}
+
+State 38:
+/\ coordAlive = TRUE
+/\ pending = {}
+/\ durableLen = 0
+/\ coordState = [g1 |-> 0]
+/\ log = <<[g |-> "g1", o |-> 2]>>
+/\ acked = {}
+
+State 39:
+/\ coordAlive = TRUE
+/\ pending = {[g |-> "g1", o |-> 2]}
+/\ durableLen = 0
+/\ coordState = [g1 |-> 1]
+/\ log = <<[g |-> "g1", o |-> 1], [g |-> "g1", o |-> 1]>>
+/\ acked = {}
+
+State 40:
+/\ coordAlive = TRUE
+/\ pending = {[g |-> "g1", o |-> 1]}
+/\ durableLen = 0
+/\ coordState = [g1 |-> 2]
+/\ log = <<[g |-> "g1", o |-> 1], [g |-> "g1", o |-> 2]>>
+/\ acked = {}
+
+State 41:
+/\ coordAlive = TRUE
+/\ pending = {[g |-> "g1", o |-> 1], [g |-> "g1", o |-> 2]}
+/\ durableLen = 1
+/\ coordState = [g1 |-> 1]
+/\ log = <<[g |-> "g1", o |-> 1]>>
+/\ acked = {}
+
+State 42:
+/\ coordAlive = FALSE
+/\ pending = {[g |-> "g1", o |-> 1], [g |-> "g1", o |-> 2]}
+/\ durableLen = 0
+/\ coordState = [g1 |-> 1]
+/\ log = <<[g |-> "g1", o |-> 1]>>
+/\ acked = {}
+
+State 43:
+/\ coordAlive = TRUE
+/\ pending = {[g |-> "g1", o |-> 2]}
+/\ durableLen = 0
+/\ coordState = [g1 |-> 2]
+/\ log = <<[g |-> "g1", o |-> 1], [g |-> "g1", o |-> 2]>>
+/\ acked = {}
+
+State 44:
+/\ coordAlive = TRUE
+/\ pending = {}
+/\ durableLen = 1
+/\ coordState = [g1 |-> 2]
+/\ log = <<[g |-> "g1", o |-> 1], [g |-> "g1", o |-> 2]>>
+/\ acked = {}
+
+State 45:
+/\ coordAlive = TRUE
+/\ pending = {}
+/\ durableLen = 2
+/\ coordState = [g1 |-> 2]
+/\ log = <<[g |-> "g1", o |-> 1], [g |-> "g1", o |-> 2]>>
+/\ acked = {}
+
+State 46:
+/\ coordAlive = FALSE
+/\ pending = {}
+/\ durableLen = 0
+/\ coordState = [g1 |-> 2]
+/\ log = <<[g |-> "g1", o |-> 1], [g |-> "g1", o |-> 2]>>
+/\ acked = {}
+
+State 47:
+/\ coordAlive = TRUE
+/\ pending = {[g |-> "g1", o |-> 2]}
+/\ durableLen = 1
+/\ coordState = [g1 |-> 1]
+/\ log = <<[g |-> "g1", o |-> 1]>>
+/\ acked = {[g |-> "g1", o |-> 1]}
+
+State 48:
+/\ coordAlive = FALSE
+/\ pending = {[g |-> "g1", o |-> 2]}
+/\ durableLen = 1
+/\ coordState = [g1 |-> 1]
+/\ log = <<[g |-> "g1", o |-> 1]>>
+/\ acked = {}
+
+State 49:
+/\ coordAlive = TRUE
+/\ pending = {[g |-> "g1", o |-> 2]}
+/\ durableLen = 0
+/\ coordState = [g1 |-> 0]
+/\ log = <<[g |-> "g1", o |-> 1]>>
+/\ acked = {}
+
+State 50:
+/\ coordAlive = TRUE
+/\ pending = {[g |-> "g1", o |-> 2]}
+/\ durableLen = 0
+/\ coordState = [g1 |-> 2]
+/\ log = <<[g |-> "g1", o |-> 2], [g |-> "g1", o |-> 1]>>
+/\ acked = {}
+
+State 51:
+/\ coordAlive = TRUE
+/\ pending = {[g |-> "g1", o |-> 1]}
+/\ durableLen = 0
+/\ coordState = [g1 |-> 2]
+/\ log = <<[g |-> "g1", o |-> 2], [g |-> "g1", o |-> 2]>>
+/\ acked = {}
+
+State 52:
+/\ coordAlive = TRUE
+/\ pending = {[g |-> "g1", o |-> 1], [g |-> "g1", o |-> 2]}
+/\ durableLen = 1
+/\ coordState = [g1 |-> 2]
+/\ log = <<[g |-> "g1", o |-> 2]>>
+/\ acked = {}
+
+State 53:
+/\ coordAlive = FALSE
+/\ pending = {[g |-> "g1", o |-> 1], [g |-> "g1", o |-> 2]}
+/\ durableLen = 0
+/\ coordState = [g1 |-> 2]
+/\ log = <<[g |-> "g1", o |-> 2]>>
+/\ acked = {}
+
+State 54:
+/\ coordAlive = TRUE
+/\ pending = {[g |-> "g1", o |-> 1]}
+/\ durableLen = 0
+/\ coordState = [g1 |-> 2]
+/\ log = <<[g |-> "g1", o |-> 2], [g |-> "g1", o |-> 1]>>
+/\ acked = {}
+
+State 55:
+/\ coordAlive = TRUE
+/\ pending = {}
+/\ durableLen = 1
+/\ coordState = [g1 |-> 2]
+/\ log = <<[g |-> "g1", o |-> 2], [g |-> "g1", o |-> 1]>>
+/\ acked = {}
+
+State 56:
+/\ coordAlive = TRUE
+/\ pending = {}
+/\ durableLen = 2
+/\ coordState = [g1 |-> 2]
+/\ log = <<[g |-> "g1", o |-> 2], [g |-> "g1", o |-> 1]>>
+/\ acked = {}
+
+State 57:
+/\ coordAlive = FALSE
+/\ pending = {}
+/\ durableLen = 0
+/\ coordState = [g1 |-> 2]
+/\ log = <<[g |-> "g1", o |-> 2], [g |-> "g1", o |-> 1]>>
+/\ acked = {}
+
+State 58:
+/\ coordAlive = TRUE
+/\ pending = {[g |-> "g1", o |-> 1]}
+/\ durableLen = 1
+/\ coordState = [g1 |-> 2]
+/\ log = <<[g |-> "g1", o |-> 2]>>
+/\ acked = {[g |-> "g1", o |-> 2]}
+
+State 59:
+/\ coordAlive = FALSE
+/\ pending = {[g |-> "g1", o |-> 1]}
+/\ durableLen = 1
+/\ coordState = [g1 |-> 2]
+/\ log = <<[g |-> "g1", o |-> 2]>>
+/\ acked = {}
+
+State 60:
+/\ coordAlive = TRUE
+/\ pending = {[g |-> "g1", o |-> 1]}
+/\ durableLen = 0
+/\ coordState = [g1 |-> 0]
+/\ log = <<[g |-> "g1", o |-> 2]>>
+/\ acked = {}
+
+State 61:
+/\ coordAlive = TRUE
+/\ pending = {[g |-> "g1", o |-> 1]}
+/\ durableLen = 0
+/\ coordState = [g1 |-> 1]
+/\ log = <<[g |-> "g1", o |-> 1], [g |-> "g1", o |-> 1]>>
+/\ acked = {}
+
+State 62:
+/\ coordAlive = TRUE
+/\ pending = {}
+/\ durableLen = 1
+/\ coordState = [g1 |-> 1]
+/\ log = <<[g |-> "g1", o |-> 1], [g |-> "g1", o |-> 1]>>
+/\ acked = {}
+
+State 63:
+/\ coordAlive = TRUE
+/\ pending = {}
+/\ durableLen = 2
+/\ coordState = [g1 |-> 1]
+/\ log = <<[g |-> "g1", o |-> 1], [g |-> "g1", o |-> 1]>>
+/\ acked = {}
+
+State 64:
+/\ coordAlive = FALSE
+/\ pending = {}
+/\ durableLen = 0
+/\ coordState = [g1 |-> 1]
+/\ log = <<[g |-> "g1", o |-> 1], [g |-> "g1", o |-> 1]>>
+/\ acked = {}
+
+State 65:
+/\ coordAlive = TRUE
+/\ pending = {[g |-> "g1", o |-> 1]}
+/\ durableLen = 1
+/\ coordState = [g1 |-> 1]
+/\ log = <<[g |-> "g1", o |-> 1]>>
+/\ acked = {[g |-> "g1", o |-> 1]}
+
+State 66:
+/\ coordAlive = FALSE
+/\ pending = {[g |-> "g1", o |-> 1]}
+/\ durableLen = 1
+/\ coordState = [g1 |-> 1]
+/\ log = <<[g |-> "g1", o |-> 1]>>
+/\ acked = {}
+
+State 67:
+/\ coordAlive = TRUE
+/\ pending = {[g |-> "g1", o |-> 1]}
+/\ durableLen = 0
+/\ coordState = [g1 |-> 0]
+/\ log = <<[g |-> "g1", o |-> 1]>>
+/\ acked = {}
+
+State 68:
+/\ coordAlive = FALSE
+/\ pending = {}
+/\ durableLen = 1
+/\ coordState = [g1 |-> 1]
+/\ log = <<[g |-> "g1", o |-> 1]>>
+/\ acked = {[g |-> "g1", o |-> 1]}
+
+State 69:
+/\ coordAlive = TRUE
+/\ pending = {}
+/\ durableLen = 1
+/\ coordState = [g1 |-> 0]
+/\ log = <<[g |-> "g1", o |-> 1]>>
+/\ acked = {}
+
+State 70:
+/\ coordAlive = FALSE
+/\ pending = {}
+/\ durableLen = 0
+/\ coordState = [g1 |-> 0]
+/\ log = <<[g |-> "g1", o |-> 1]>>
+/\ acked = {}
+
+State 71:
+/\ coordAlive = TRUE
+/\ pending = {[g |-> "g1", o |-> 2]}
+/\ durableLen = 0
+/\ coordState = [g1 |-> 2]
+/\ log = <<[g |-> "g1", o |-> 2], [g |-> "g1", o |-> 2]>>
+/\ acked = {}
+
+State 72:
+/\ coordAlive = TRUE
+/\ pending = {}
+/\ durableLen = 1
+/\ coordState = [g1 |-> 2]
+/\ log = <<[g |-> "g1", o |-> 2], [g |-> "g1", o |-> 2]>>
+/\ acked = {}
+
+State 73:
+/\ coordAlive = TRUE
+/\ pending = {}
+/\ durableLen = 2
+/\ coordState = [g1 |-> 2]
+/\ log = <<[g |-> "g1", o |-> 2], [g |-> "g1", o |-> 2]>>
+/\ acked = {}
+
+State 74:
+/\ coordAlive = FALSE
+/\ pending = {}
+/\ durableLen = 0
+/\ coordState = [g1 |-> 2]
+/\ log = <<[g |-> "g1", o |-> 2], [g |-> "g1", o |-> 2]>>
+/\ acked = {}
+
+State 75:
+/\ coordAlive = TRUE
+/\ pending = {[g |-> "g1", o |-> 2]}
+/\ durableLen = 1
+/\ coordState = [g1 |-> 2]
+/\ log = <<[g |-> "g1", o |-> 2]>>
+/\ acked = {[g |-> "g1", o |-> 2]}
+
+State 76:
+/\ coordAlive = FALSE
+/\ pending = {[g |-> "g1", o |-> 2]}
+/\ durableLen = 1
+/\ coordState = [g1 |-> 2]
+/\ log = <<[g |-> "g1", o |-> 2]>>
+/\ acked = {}
+
+State 77:
+/\ coordAlive = TRUE
+/\ pending = {[g |-> "g1", o |-> 2]}
+/\ durableLen = 0
+/\ coordState = [g1 |-> 0]
+/\ log = <<[g |-> "g1", o |-> 2]>>
+/\ acked = {}
+
+State 78:
+/\ coordAlive = FALSE
+/\ pending = {}
+/\ durableLen = 1
+/\ coordState = [g1 |-> 2]
+/\ log = <<[g |-> "g1", o |-> 2]>>
+/\ acked = {[g |-> "g1", o |-> 2]}
+
+State 79:
+/\ coordAlive = TRUE
+/\ pending = {}
+/\ durableLen = 1
+/\ coordState = [g1 |-> 0]
+/\ log = <<[g |-> "g1", o |-> 2]>>
+/\ acked = {}
+
+State 80:
+/\ coordAlive = FALSE
+/\ pending = {}
+/\ durableLen = 0
+/\ coordState = [g1 |-> 0]
+/\ log = <<[g |-> "g1", o |-> 2]>>
+/\ acked = {}
+
+State 81:
+/\ coordAlive = TRUE
+/\ pending = {[g |-> "g1", o |-> 1], [g |-> "g1", o |-> 2]}
+/\ durableLen = 0
+/\ coordState = [g1 |-> 1]
+/\ log = <<[g |-> "g1", o |-> 1], [g |-> "g1", o |-> 1]>>
+/\ acked = {}
+
+State 82:
+/\ coordAlive = TRUE
+/\ pending = {}
+/\ durableLen = 0
+/\ coordState = [g1 |-> 2]
+/\ log = <<[g |-> "g1", o |-> 1], [g |-> "g1", o |-> 1], [g |-> "g1", o |-> 2]>>
+/\ acked = {}
+
+State 83:
+/\ coordAlive = TRUE
+/\ pending = {[g |-> "g1", o |-> 2]}
+/\ durableLen = 1
+/\ coordState = [g1 |-> 1]
+/\ log = <<[g |-> "g1", o |-> 1], [g |-> "g1", o |-> 1]>>
+/\ acked = {}
+
+State 84:
+/\ coordAlive = TRUE
+/\ pending = {[g |-> "g1", o |-> 2]}
+/\ durableLen = 2
+/\ coordState = [g1 |-> 1]
+/\ log = <<[g |-> "g1", o |-> 1], [g |-> "g1", o |-> 1]>>
+/\ acked = {}
+
+State 85:
+/\ coordAlive = FALSE
+/\ pending = {[g |-> "g1", o |-> 2]}
+/\ durableLen = 0
+/\ coordState = [g1 |-> 1]
+/\ log = <<[g |-> "g1", o |-> 1], [g |-> "g1", o |-> 1]>>
+/\ acked = {}
+
+State 86:
+/\ coordAlive = TRUE
+/\ pending = {[g |-> "g1", o |-> 1], [g |-> "g1", o |-> 2]}
+/\ durableLen = 0
+/\ coordState = [g1 |-> 2]
+/\ log = <<[g |-> "g1", o |-> 1], [g |-> "g1", o |-> 2]>>
+/\ acked = {}
+
+State 87:
+/\ coordAlive = TRUE
+/\ pending = {}
+/\ durableLen = 0
+/\ coordState = [g1 |-> 2]
+/\ log = <<[g |-> "g1", o |-> 1], [g |-> "g1", o |-> 2], [g |-> "g1", o |-> 1]>>
+/\ acked = {}
+
+State 88:
+/\ coordAlive = TRUE
+/\ pending = {[g |-> "g1", o |-> 1]}
+/\ durableLen = 1
+/\ coordState = [g1 |-> 2]
+/\ log = <<[g |-> "g1", o |-> 1], [g |-> "g1", o |-> 2]>>
+/\ acked = {}
+
+State 89:
+/\ coordAlive = TRUE
+/\ pending = {[g |-> "g1", o |-> 1]}
+/\ durableLen = 2
+/\ coordState = [g1 |-> 2]
+/\ log = <<[g |-> "g1", o |-> 1], [g |-> "g1", o |-> 2]>>
+/\ acked = {}
+
+State 90:
+/\ coordAlive = FALSE
+/\ pending = {[g |-> "g1", o |-> 1]}
+/\ durableLen = 0
+/\ coordState = [g1 |-> 2]
+/\ log = <<[g |-> "g1", o |-> 1], [g |-> "g1", o |-> 2]>>
+/\ acked = {}
+
+State 91:
+/\ coordAlive = TRUE
+/\ pending = {[g |-> "g1", o |-> 1], [g |-> "g1", o |-> 2]}
+/\ durableLen = 1
+/\ coordState = [g1 |-> 1]
+/\ log = <<[g |-> "g1", o |-> 1]>>
+/\ acked = {[g |-> "g1", o |-> 1]}
+
+State 92:
+/\ coordAlive = FALSE
+/\ pending = {[g |-> "g1", o |-> 1], [g |-> "g1", o |-> 2]}
+/\ durableLen = 1
+/\ coordState = [g1 |-> 1]
+/\ log = <<[g |-> "g1", o |-> 1]>>
+/\ acked = {}
+
+State 93:
+/\ coordAlive = TRUE
+/\ pending = {[g |-> "g1", o |-> 1], [g |-> "g1", o |-> 2]}
+/\ durableLen = 0
+/\ coordState = [g1 |-> 0]
+/\ log = <<[g |-> "g1", o |-> 1]>>
+/\ acked = {}
+
+State 94:
+/\ coordAlive = TRUE
+/\ pending = {}
+/\ durableLen = 0
+/\ coordState = [g1 |-> 2]
+/\ log = <<[g |-> "g1", o |-> 1], [g |-> "g1", o |-> 2], [g |-> "g1", o |-> 2]>>
+/\ acked = {}
+
+State 95:
+/\ coordAlive = TRUE
+/\ pending = {[g |-> "g1", o |-> 2]}
+/\ durableLen = 1
+/\ coordState = [g1 |-> 2]
+/\ log = <<[g |-> "g1", o |-> 1], [g |-> "g1", o |-> 2]>>
+/\ acked = {}
+
+State 96:
+/\ coordAlive = TRUE
+/\ pending = {[g |-> "g1", o |-> 2]}
+/\ durableLen = 2
+/\ coordState = [g1 |-> 2]
+/\ log = <<[g |-> "g1", o |-> 1], [g |-> "g1", o |-> 2]>>
+/\ acked = {}
+
+State 97:
+/\ coordAlive = FALSE
+/\ pending = {[g |-> "g1", o |-> 2]}
+/\ durableLen = 0
+/\ coordState = [g1 |-> 2]
+/\ log = <<[g |-> "g1", o |-> 1], [g |-> "g1", o |-> 2]>>
+/\ acked = {}
+
+State 98:
+/\ coordAlive = TRUE
+/\ pending = {}
+/\ durableLen = 1
+/\ coordState = [g1 |-> 2]
+/\ log = <<[g |-> "g1", o |-> 1], [g |-> "g1", o |-> 2]>>
+/\ acked = {[g |-> "g1", o |-> 1]}
+
+State 99:
+/\ coordAlive = FALSE
+/\ pending = {}
+/\ durableLen = 1
+/\ coordState = [g1 |-> 2]
+/\ log = <<[g |-> "g1", o |-> 1], [g |-> "g1", o |-> 2]>>
+/\ acked = {}
+
+State 100:
+/\ coordAlive = TRUE
+/\ pending = {}
+/\ durableLen = 2
+/\ coordState = [g1 |-> 2]
+/\ log = <<[g |-> "g1", o |-> 1], [g |-> "g1", o |-> 2]>>
+/\ acked = {[g |-> "g1", o |-> 1]}
+
+State 101:
+/\ coordAlive = TRUE
+/\ pending = {}
+/\ durableLen = 2
+/\ coordState = [g1 |-> 2]
+/\ log = <<[g |-> "g1", o |-> 1], [g |-> "g1", o |-> 2]>>
+/\ acked = {[g |-> "g1", o |-> 2]}
+
+State 102:
+/\ coordAlive = FALSE
+/\ pending = {}
+/\ durableLen = 2
+/\ coordState = [g1 |-> 2]
+/\ log = <<[g |-> "g1", o |-> 1], [g |-> "g1", o |-> 2]>>
+/\ acked = {}
+
+State 103:
+/\ coordAlive = TRUE
+/\ pending = {}
+/\ durableLen = 0
+/\ coordState = [g1 |-> 0]
+/\ log = <<[g |-> "g1", o |-> 1], [g |-> "g1", o |-> 2]>>
+/\ acked = {}
+
+State 104:
+/\ coordAlive = FALSE
+/\ pending = {[g |-> "g1", o |-> 2]}
+/\ durableLen = 1
+/\ coordState = [g1 |-> 1]
+/\ log = <<[g |-> "g1", o |-> 1]>>
+/\ acked = {[g |-> "g1", o |-> 1]}
+
+State 105:
+/\ coordAlive = TRUE
+/\ pending = {[g |-> "g1", o |-> 2]}
+/\ durableLen = 1
+/\ coordState = [g1 |-> 0]
+/\ log = <<[g |-> "g1", o |-> 1]>>
+/\ acked = {}
+
+State 106:
+/\ coordAlive = FALSE
+/\ pending = {[g |-> "g1", o |-> 2]}
+/\ durableLen = 0
+/\ coordState = [g1 |-> 0]
+/\ log = <<[g |-> "g1", o |-> 1]>>
+/\ acked = {}
+
+State 107:
+/\ coordAlive = TRUE
+/\ pending = {[g |-> "g1", o |-> 1], [g |-> "g1", o |-> 2]}
+/\ durableLen = 0
+/\ coordState = [g1 |-> 2]
+/\ log = <<[g |-> "g1", o |-> 2], [g |-> "g1", o |-> 1]>>
+/\ acked = {}
+
+State 108:
+/\ coordAlive = TRUE
+/\ pending = {}
+/\ durableLen = 0
+/\ coordState = [g1 |-> 2]
+/\ log = <<[g |-> "g1", o |-> 2], [g |-> "g1", o |-> 1], [g |-> "g1", o |-> 2]>>
+/\ acked = {}
+
+State 109:
+/\ coordAlive = TRUE
+/\ pending = {[g |-> "g1", o |-> 2]}
+/\ durableLen = 1
+/\ coordState = [g1 |-> 2]
+/\ log = <<[g |-> "g1", o |-> 2], [g |-> "g1", o |-> 1]>>
+/\ acked = {}
+
+State 110:
+/\ coordAlive = TRUE
+/\ pending = {[g |-> "g1", o |-> 2]}
+/\ durableLen = 2
+/\ coordState = [g1 |-> 2]
+/\ log = <<[g |-> "g1", o |-> 2], [g |-> "g1", o |-> 1]>>
+/\ acked = {}
+
+State 111:
+/\ coordAlive = FALSE
+/\ pending = {[g |-> "g1", o |-> 2]}
+/\ durableLen = 0
+/\ coordState = [g1 |-> 2]
+/\ log = <<[g |-> "g1", o |-> 2], [g |-> "g1", o |-> 1]>>
+/\ acked = {}
+
+State 112:
+/\ coordAlive = TRUE
+/\ pending = {[g |-> "g1", o |-> 1], [g |-> "g1", o |-> 2]}
+/\ durableLen = 0
+/\ coordState = [g1 |-> 2]
+/\ log = <<[g |-> "g1", o |-> 2], [g |-> "g1", o |-> 2]>>
+/\ acked = {}
+
+State 113:
+/\ coordAlive = TRUE
+/\ pending = {}
+/\ durableLen = 0
+/\ coordState = [g1 |-> 2]
+/\ log = <<[g |-> "g1", o |-> 2], [g |-> "g1", o |-> 2], [g |-> "g1", o |-> 1]>>
+/\ acked = {}
+
+State 114:
+/\ coordAlive = TRUE
+/\ pending = {[g |-> "g1", o |-> 1]}
+/\ durableLen = 1
+/\ coordState = [g1 |-> 2]
+/\ log = <<[g |-> "g1", o |-> 2], [g |-> "g1", o |-> 2]>>
+/\ acked = {}
+
+State 115:
+/\ coordAlive = TRUE
+/\ pending = {[g |-> "g1", o |-> 1]}
+/\ durableLen = 2
+/\ coordState = [g1 |-> 2]
+/\ log = <<[g |-> "g1", o |-> 2], [g |-> "g1", o |-> 2]>>
+/\ acked = {}
+
+State 116:
+/\ coordAlive = FALSE
+/\ pending = {[g |-> "g1", o |-> 1]}
+/\ durableLen = 0
+/\ coordState = [g1 |-> 2]
+/\ log = <<[g |-> "g1", o |-> 2], [g |-> "g1", o |-> 2]>>
+/\ acked = {}
+
+State 117:
+/\ coordAlive = TRUE
+/\ pending = {[g |-> "g1", o |-> 1], [g |-> "g1", o |-> 2]}
+/\ durableLen = 1
+/\ coordState = [g1 |-> 2]
+/\ log = <<[g |-> "g1", o |-> 2]>>
+/\ acked = {[g |-> "g1", o |-> 2]}
+
+State 118:
+/\ coordAlive = FALSE
+/\ pending = {[g |-> "g1", o |-> 1], [g |-> "g1", o |-> 2]}
+/\ durableLen = 1
+/\ coordState = [g1 |-> 2]
+/\ log = <<[g |-> "g1", o |-> 2]>>
+/\ acked = {}
+
+State 119:
+/\ coordAlive = TRUE
+/\ pending = {[g |-> "g1", o |-> 1], [g |-> "g1", o |-> 2]}
+/\ durableLen = 0
+/\ coordState = [g1 |-> 0]
+/\ log = <<[g |-> "g1", o |-> 2]>>
+/\ acked = {}
+
+State 120:
+/\ coordAlive = TRUE
+/\ pending = {}
+/\ durableLen = 0
+/\ coordState = [g1 |-> 2]
+/\ log = <<[g |-> "g1", o |-> 2], [g |-> "g1", o |-> 1], [g |-> "g1", o |-> 1]>>
+/\ acked = {}
+
+State 121:
+/\ coordAlive = TRUE
+/\ pending = {[g |-> "g1", o |-> 1]}
+/\ durableLen = 1
+/\ coordState = [g1 |-> 2]
+/\ log = <<[g |-> "g1", o |-> 2], [g |-> "g1", o |-> 1]>>
+/\ acked = {}
+
+State 122:
+/\ coordAlive = TRUE
+/\ pending = {[g |-> "g1", o |-> 1]}
+/\ durableLen = 2
+/\ coordState = [g1 |-> 2]
+/\ log = <<[g |-> "g1", o |-> 2], [g |-> "g1", o |-> 1]>>
+/\ acked = {}
+
+State 123:
+/\ coordAlive = FALSE
+/\ pending = {[g |-> "g1", o |-> 1]}
+/\ durableLen = 0
+/\ coordState = [g1 |-> 2]
+/\ log = <<[g |-> "g1", o |-> 2], [g |-> "g1", o |-> 1]>>
+/\ acked = {}
+
+State 124:
+/\ coordAlive = TRUE
+/\ pending = {}
+/\ durableLen = 1
+/\ coordState = [g1 |-> 2]
+/\ log = <<[g |-> "g1", o |-> 2], [g |-> "g1", o |-> 1]>>
+/\ acked = {[g |-> "g1", o |-> 2]}
+
+State 125:
+/\ coordAlive = FALSE
+/\ pending = {}
+/\ durableLen = 1
+/\ coordState = [g1 |-> 2]
+/\ log = <<[g |-> "g1", o |-> 2], [g |-> "g1", o |-> 1]>>
+/\ acked = {}
+
+State 126:
+/\ coordAlive = TRUE
+/\ pending = {}
+/\ durableLen = 2
+/\ coordState = [g1 |-> 2]
+/\ log = <<[g |-> "g1", o |-> 2], [g |-> "g1", o |-> 1]>>
+/\ acked = {[g |-> "g1", o |-> 1]}
+
+State 127:
+/\ coordAlive = TRUE
+/\ pending = {}
+/\ durableLen = 2
+/\ coordState = [g1 |-> 2]
+/\ log = <<[g |-> "g1", o |-> 2], [g |-> "g1", o |-> 1]>>
+/\ acked = {[g |-> "g1", o |-> 2]}
+
+State 128:
+/\ coordAlive = FALSE
+/\ pending = {}
+/\ durableLen = 2
+/\ coordState = [g1 |-> 2]
+/\ log = <<[g |-> "g1", o |-> 2], [g |-> "g1", o |-> 1]>>
+/\ acked = {}
+
+State 129:
+/\ coordAlive = TRUE
+/\ pending = {}
+/\ durableLen = 0
+/\ coordState = [g1 |-> 0]
+/\ log = <<[g |-> "g1", o |-> 2], [g |-> "g1", o |-> 1]>>
+/\ acked = {}
+
+State 130:
+/\ coordAlive = FALSE
+/\ pending = {[g |-> "g1", o |-> 1]}
+/\ durableLen = 1
+/\ coordState = [g1 |-> 2]
+/\ log = <<[g |-> "g1", o |-> 2]>>
+/\ acked = {[g |-> "g1", o |-> 2]}
+
+State 131:
+/\ coordAlive = TRUE
+/\ pending = {}
+/\ durableLen = 0
+/\ coordState = [g1 |-> 1]
+/\ log = <<[g |-> "g1", o |-> 2], [g |-> "g1", o |-> 1]>>
+/\ acked = {}
+
+State 132:
+/\ coordAlive = TRUE
+/\ pending = {[g |-> "g1", o |-> 1]}
+/\ durableLen = 1
+/\ coordState = [g1 |-> 0]
+/\ log = <<[g |-> "g1", o |-> 2]>>
+/\ acked = {}
+
+State 133:
+/\ coordAlive = FALSE
+/\ pending = {[g |-> "g1", o |-> 1]}
+/\ durableLen = 0
+/\ coordState = [g1 |-> 0]
+/\ log = <<[g |-> "g1", o |-> 2]>>
+/\ acked = {}
+
+State 134:
+/\ coordAlive = TRUE
+/\ pending = {}
+/\ durableLen = 0
+/\ coordState = [g1 |-> 1]
+/\ log = <<[g |-> "g1", o |-> 1], [g |-> "g1", o |-> 1], [g |-> "g1", o |-> 1]>>
+/\ acked = {}
+
+State 135:
+/\ coordAlive = TRUE
+/\ pending = {[g |-> "g1", o |-> 1]}
+/\ durableLen = 1
+/\ coordState = [g1 |-> 1]
+/\ log = <<[g |-> "g1", o |-> 1], [g |-> "g1", o |-> 1]>>
+/\ acked = {}
+
+State 136:
+/\ coordAlive = TRUE
+/\ pending = {[g |-> "g1", o |-> 1]}
+/\ durableLen = 2
+/\ coordState = [g1 |-> 1]
+/\ log = <<[g |-> "g1", o |-> 1], [g |-> "g1", o |-> 1]>>
+/\ acked = {}
+
+State 137:
+/\ coordAlive = FALSE
+/\ pending = {[g |-> "g1", o |-> 1]}
+/\ durableLen = 0
+/\ coordState = [g1 |-> 1]
+/\ log = <<[g |-> "g1", o |-> 1], [g |-> "g1", o |-> 1]>>
+/\ acked = {}
+
+State 138:
+/\ coordAlive = TRUE
+/\ pending = {}
+/\ durableLen = 1
+/\ coordState = [g1 |-> 1]
+/\ log = <<[g |-> "g1", o |-> 1], [g |-> "g1", o |-> 1]>>
+/\ acked = {[g |-> "g1", o |-> 1]}
+
+State 139:
+/\ coordAlive = FALSE
+/\ pending = {}
+/\ durableLen = 1
+/\ coordState = [g1 |-> 1]
+/\ log = <<[g |-> "g1", o |-> 1], [g |-> "g1", o |-> 1]>>
+/\ acked = {}
+
+State 140:
+/\ coordAlive = TRUE
+/\ pending = {}
+/\ durableLen = 2
+/\ coordState = [g1 |-> 1]
+/\ log = <<[g |-> "g1", o |-> 1], [g |-> "g1", o |-> 1]>>
+/\ acked = {[g |-> "g1", o |-> 1]}
+
+State 141:
+/\ coordAlive = FALSE
+/\ pending = {}
+/\ durableLen = 2
+/\ coordState = [g1 |-> 1]
+/\ log = <<[g |-> "g1", o |-> 1], [g |-> "g1", o |-> 1]>>
+/\ acked = {}
+
+State 142:
+/\ coordAlive = TRUE
+/\ pending = {}
+/\ durableLen = 0
+/\ coordState = [g1 |-> 0]
+/\ log = <<[g |-> "g1", o |-> 1], [g |-> "g1", o |-> 1]>>
+/\ acked = {}
+
+State 143:
+/\ coordAlive = FALSE
+/\ pending = {[g |-> "g1", o |-> 1]}
+/\ durableLen = 1
+/\ coordState = [g1 |-> 1]
+/\ log = <<[g |-> "g1", o |-> 1]>>
+/\ acked = {[g |-> "g1", o |-> 1]}
+
+State 144:
+/\ coordAlive = TRUE
+/\ pending = {[g |-> "g1", o |-> 1]}
+/\ durableLen = 1
+/\ coordState = [g1 |-> 0]
+/\ log = <<[g |-> "g1", o |-> 1]>>
+/\ acked = {}
+
+State 145:
+/\ coordAlive = FALSE
+/\ pending = {[g |-> "g1", o |-> 1]}
+/\ durableLen = 0
+/\ coordState = [g1 |-> 0]
+/\ log = <<[g |-> "g1", o |-> 1]>>
+/\ acked = {}
+
+State 146:
+/\ coordAlive = TRUE
+/\ pending = {}
+/\ durableLen = 1
+/\ coordState = [g1 |-> 0]
+/\ log = <<[g |-> "g1", o |-> 1]>>
+/\ acked = {[g |-> "g1", o |-> 1]}
+

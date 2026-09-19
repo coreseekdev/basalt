@@ -57,3 +57,4 @@ dp-liveness:         ; $(TLC) -deadlock -config dp-liveness.cfg BasaltDataPlaneL
 
 .PHONY: consumer-group consumer-group-demo consumer-group-liveness
 .PHONY: cg-liveness-l0 cg-liveness-l2 cg-liveness-l3
+group-state-ha:      ; $(TLC) -config group-state-ha.cfg GroupStateHA.tla

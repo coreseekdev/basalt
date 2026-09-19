@@ -548,9 +548,18 @@ impl PartitionActor {
             self.maybe_offload();
             self.on_deadline();
             self.serve_pending();
+            self.update_gauges();
             self.serve_replica_pends();
         }
         tracing::info!(topic = %self.name, partition = self.index, "partition actor stopped");
+    }
+
+    /// 分区 gauge 更新（可观测 L1：每轮 process 后刷新 HW/LSO/log_start）
+    fn update_gauges(&self) {
+        let hw = self.log.high_watermark;
+        let lso = self.lso;
+        let start = self.log.log_start_offset;
+        crate::partition::update_partition_gauge(&self.name, self.index, hw, lso, start);
     }
 
     fn on_deadline(&mut self) {
@@ -1768,13 +1777,21 @@ pub struct Metrics {
     pub bytes_produced: AtomicU64,
     #[allow(dead_code)]
     pub messages_consumed: AtomicU64,
-    #[allow(dead_code)]
     pub bytes_consumed: AtomicU64,
     pub produce_errors: AtomicU64,
     pub fetch_requests: AtomicU64,
     pub produce_requests: AtomicU64,
-    #[allow(dead_code)]
     pub compressed_batches: AtomicU64,
+}
+
+/// 分区维度 gauge（L1 可观测：topic/partition → hw/lso/log_start）
+pub static PARTITION_GAUGES: std::sync::Mutex<std::collections::BTreeMap<String, (i64, i64, i64)>> = std::sync::Mutex::new(std::collections::BTreeMap::new());
+
+/// 分区 actor 在 process 循环尾部更新（低成本：单写 + try_lock）
+pub fn update_partition_gauge(name: &str, index: i32, hw: i64, lso: i64, start: i64) {
+    if let Ok(mut map) = PARTITION_GAUGES.lock() {
+        map.insert(format!("{}/{}", name, index), (hw, lso, start));
+    }
 }
 
 static METRICS: std::sync::OnceLock<Metrics> = std::sync::OnceLock::new();

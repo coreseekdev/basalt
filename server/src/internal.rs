@@ -63,16 +63,58 @@ impl InternalClient {
     async fn call(&self, msg_type: u8, payload: &[u8]) -> std::io::Result<Bytes> {
         let sock = tokio::net::TcpStream::connect(&self.addr).await?;
         let mut sock = sock;
-        // 连接级令牌（P0-1）：服务端 BASALT_INTERNAL_TOKEN 设置时自动发 auth
+        // 连接级令牌（B1 v2）：HMAC 质询-应答——令牌不上线。
+        // 服务端配置了令牌时必须完成握手；未配置时跳过。
         if let Ok(token) = std::env::var("BASALT_INTERNAL_TOKEN") {
             if !token.is_empty() {
-                let mut auth_frame = BytesMut::with_capacity(token.len() + 5);
-                auth_frame.put_u32((token.len() + 1) as u32);
+                let mut auth_frame = BytesMut::with_capacity(1 + 5);
+                auth_frame.put_u32(2u32);
                 auth_frame.put_u8(MSG_AUTH);
-                auth_frame.extend_from_slice(token.as_bytes());
+                auth_frame.put_u8(AUTH_V2_REQUEST);
                 sock.write_all(&auth_frame).await?;
+                // 读挑战帧 [len][MSG_AUTH][0x00][challenge 32B]
+                let mut len_buf = [0u8; 4];
+                sock.read_exact(&mut len_buf).await?;
+                let clen = u32::from_be_bytes(len_buf) as usize;
+                if clen != 2 + AUTH_CHALLENGE_LEN {
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::InvalidData,
+                        "bad challenge frame",
+                    ));
+                }
+                let mut cmsg = vec![0u8; clen];
+                sock.read_exact(&mut cmsg).await?;
+                if cmsg[0] != MSG_AUTH || cmsg[1] != 0x00 {
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::PermissionDenied,
+                        "internal auth rejected by peer",
+                    ));
+                }
+                let mac = hmac_internal_token(&token, &cmsg[2..]);
+                let mut verify = BytesMut::with_capacity(2 + 32 + 5);
+                verify.put_u32((2 + AUTH_CHALLENGE_LEN) as u32);
+                verify.put_u8(MSG_AUTH);
+                verify.put_u8(AUTH_V2_VERIFY);
+                verify.extend_from_slice(&mac);
+                sock.write_all(&verify).await?;
+                // 最终 ack（1 帧 + 2B 内容）
                 let mut ack = [0u8; 4];
                 sock.read_exact(&mut ack).await?;
+                let alen = u32::from_be_bytes(ack) as usize;
+                if alen == 0 || alen > 64 {
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::PermissionDenied,
+                        "internal auth failed",
+                    ));
+                }
+                let mut abody = vec![0u8; alen];
+                sock.read_exact(&mut abody).await?;
+                if abody.first() != Some(&MSG_AUTH) || abody.get(1) != Some(&0x00) {
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::PermissionDenied,
+                        "internal auth failed",
+                    ));
+                }
             }
         }
         let mut frame = BytesMut::with_capacity(payload.len() + 5);
@@ -822,12 +864,101 @@ pub async fn serve(listener: tokio::net::TcpListener, ctx: InternalCtx) {
 
 pub const MSG_AUTH: u8 = 0;
 
-/// 令牌校验（P0-1 补充）：BASALT_INTERNAL_TOKEN 设置后，连接首帧须为
-/// MSG_AUTH + 正确 token；否则关闭。未设 → 全放行（向后兼容单机开发）。
-fn check_internal_token(token: &str) -> bool {
-    match std::env::var("BASALT_INTERNAL_TOKEN") {
-        Ok(expected) if !expected.is_empty() => token == expected,
-        _ => true,
+/// v2 质询-应答握手（B1）：MSG_AUTH payload[0] 作标记。
+/// 0x02 = 请求质询；0x03 = HMAC-SHA256(token, challenge) 应答。
+/// 旧明文握手 payload 首字节是 token 的 ASCII，不会撞 0x02。
+const AUTH_V2_REQUEST: u8 = 0x02;
+const AUTH_V2_VERIFY: u8 = 0x03;
+const AUTH_CHALLENGE_LEN: usize = 32;
+
+/// B1：内部口 HMAC（令牌只作对称密钥不上线；挑战一次性，安全性由
+/// HMAC(token, challenge) 承担）。
+fn hmac_internal_token(secret: &str, challenge: &[u8]) -> [u8; 32] {
+    use hmac::Mac;
+    type HmacSha256 = hmac::Hmac<sha2::Sha256>;
+    let mut mac = HmacSha256::new_from_slice(secret.as_bytes())
+        .unwrap_or_else(|_| HmacSha256::new_from_slice(b"basalt-internal-fallback").unwrap());
+    mac.update(challenge);
+    mac.finalize().into_bytes().into()
+}
+
+/// v2 服务端侧：发挑战 → 验 HMAC。验收失败一律 PermissionDenied 断连
+/// （fail-closed；旧明文握手同拒——令牌配置后明文即违规）。
+async fn handshake_internal_v2(
+    sock: &mut tokio::net::TcpStream,
+    node: i32,
+    expected: &str,
+) -> std::io::Result<()> {
+    let mut challenge = [0u8; AUTH_CHALLENGE_LEN];
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_nanos() as u64)
+        .unwrap_or(0);
+    let mut state = nanos ^ 0x9E37_79B9_7F4A_7C15;
+    for b in challenge.iter_mut() {
+        state = state.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+        *b = (state >> 33) as u8;
+    }
+    // S→C: [MSG_AUTH][0x00][challenge 32B]（framed）
+    let mut reply = Vec::with_capacity(2 + AUTH_CHALLENGE_LEN);
+    reply.push(MSG_AUTH);
+    reply.push(0x00);
+    reply.extend_from_slice(&challenge);
+    let flen = (reply.len() as u32).to_be_bytes();
+    sock.write_all(&flen).await?;
+    sock.write_all(&reply).await?;
+
+    // C→S: [MSG_AUTH][0x03][mac 32B]
+    let mut len_buf = [0u8; 4];
+    tokio::time::timeout(std::time::Duration::from_secs(5), sock.read_exact(&mut len_buf)).await
+        .map_err(|_| std::io::Error::other("auth verify timeout"))??;
+    let len = u32::from_be_bytes(len_buf) as usize;
+    if len != 2 + AUTH_CHALLENGE_LEN {
+        return Err(std::io::Error::new(std::io::ErrorKind::InvalidData, "bad verify frame"));
+    }
+    let mut msg = vec![0u8; len];
+    tokio::time::timeout(std::time::Duration::from_secs(5), sock.read_exact(&mut msg)).await
+        .map_err(|_| std::io::Error::other("auth verify read timeout"))??;
+    if msg[0] != MSG_AUTH || msg[1] != AUTH_V2_VERIFY {
+        return Err(std::io::Error::new(std::io::ErrorKind::PermissionDenied, "bad verify marker"));
+    }
+    let expected_mac = hmac_internal_token(expected, &challenge);
+    if msg[2..] != expected_mac {
+        tracing::warn!(node, "internal HMAC auth failed");
+        return Err(std::io::Error::new(std::io::ErrorKind::PermissionDenied, "internal auth failed"));
+    }
+    // 成功 ack：framed [len=2][MSG_AUTH][0x00]
+    let ack = (2u32).to_be_bytes();
+    sock.write_all(&ack).await?;
+    let ok = [MSG_AUTH, 0x00];
+    sock.write_all(&ok).await?;
+    Ok(())
+}
+
+#[cfg(test)]
+mod hmac_auth_tests {
+    //! B1：HMAC 质询-应答面（确定性 + 错误密钥判别）。
+
+    use super::*;
+
+    #[test]
+    fn hmac_deterministic_and_secret_bound() {
+        let c = [7u8; 32];
+        let a = hmac_internal_token("secret-1", &c);
+        let b = hmac_internal_token("secret-1", &c);
+        let c2 = hmac_internal_token("secret-2", &c);
+        let c3 = hmac_internal_token("secret-1", &[8u8; 32]);
+        assert_eq!(a, b, "同密钥同挑战必须确定");
+        assert_ne!(a, c2, "不同密钥必须不同");
+        assert_ne!(a, c3, "不同挑战必须不同");
+    }
+
+    #[test]
+    fn legacy_plaintext_payload_cannot_collide_with_v2_marker() {
+        // 任意 ASCII token 的首字节不可能等于 0x02
+        for t in ["x", "token-1", "0", "\u{7f}"] {
+            assert_ne!(t.as_bytes()[0], AUTH_V2_REQUEST);
+        }
     }
 }
 
@@ -835,7 +966,7 @@ async fn handle_internal_conn(
     mut sock: tokio::net::TcpStream,
     ctx: InternalCtx,
 ) -> std::io::Result<()> {
-    // 连接级令牌校验（首帧前一次性握手）
+    // 连接级令牌校验（B1 v2 质询-应答；明文握手 fail-closed 拒绝）
     if let Ok(expected) = std::env::var("BASALT_INTERNAL_TOKEN") {
         if !expected.is_empty() {
             let mut len_buf = [0u8; 4];
@@ -845,13 +976,17 @@ async fn handle_internal_conn(
             let mut msg = vec![0u8; len];
             tokio::time::timeout(std::time::Duration::from_secs(5), sock.read_exact(&mut msg)).await
                 .map_err(|_| std::io::Error::other("auth read timeout"))??;
-            if msg[0] != MSG_AUTH || &msg[1..] != expected.as_bytes() {
-                tracing::warn!(node = ctx.node_id, "internal connection auth failed");
+            if msg[0] != MSG_AUTH {
                 return Err(std::io::Error::new(std::io::ErrorKind::PermissionDenied, "internal auth failed"));
             }
-            // 回 ACK 帧
-            let ack = (1u32).to_be_bytes();
-            sock.write_all(&ack).await?;
+            let payload = &msg[1..];
+            if payload == [AUTH_V2_REQUEST] {
+                handshake_internal_v2(&mut sock, ctx.node_id, &expected).await?;
+            } else {
+                // 明文 token 上线 = 违规（B1 fail-closed）
+                tracing::warn!(node = ctx.node_id, "plaintext internal auth rejected (use v2 HMAC handshake)");
+                return Err(std::io::Error::new(std::io::ErrorKind::PermissionDenied, "plaintext internal auth rejected"));
+            }
         }
     }
     loop {

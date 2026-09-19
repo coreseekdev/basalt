@@ -179,6 +179,22 @@ impl ConnState {
 /// 认证/配额状态为连接内共享（Arc<Mutex<ConnState>>，请求任务并发访问）；
 /// 认证失败/未认证越权请求经 close watch 通知读侧断连（响应先行写出）。
 // BufferPool 进程单例共享资源池（内部 Mutex 串行化）：Arc 表达资源共享而非
+/// A4：连接生命周期指标守卫——构造即计入活跃 gauge，Drop 时递减并
+/// 从每连接字节表移除（连接 churn 不留陈旧条目）。
+struct ConnGuard {
+    peer: std::net::SocketAddr,
+}
+impl Drop for ConnGuard {
+    fn drop(&mut self) {
+        crate::partition::metrics()
+            .connections_active
+            .fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
+        if let Ok(mut map) = crate::partition::CONN_BYTES.lock() {
+            map.remove(&self.peer.to_string());
+        }
+    }
+}
+
 // 共享可变所有权，与 Bytes/mpsc 内部引用计数同级豁免（ADR-13）。
 #[allow(clippy::disallowed_types)]
 pub async fn serve_connection<S>(
@@ -192,6 +208,9 @@ pub async fn serve_connection<S>(
     S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send + 'static,
 {
     crate::partition::metrics().connections_total.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    crate::partition::metrics().connections_active.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    // A4 活跃 gauge + 每连接字节表的配对清理：无论哪条退出路径，Drop 兜底
+    let _conn_guard = ConnGuard { peer };
     let conn = std::sync::Arc::new(tokio::sync::Mutex::new(ConnState::new()));
     if conn.lock().await.quota_enabled() {
         tracing::debug!(peer = %peer, "connection quotas active");
@@ -206,6 +225,7 @@ pub async fn serve_connection<S>(
 
     // 写任务：唯一写者 + 请求序重排；写完后归还读缓冲到池（perf #2）
     let writer_pool = pool.clone();
+    let writer_peer = peer;
     let writer = tokio::spawn(async move {
         let mut pending: std::collections::BTreeMap<u64, Option<Bytes>> = Default::default();
         let mut write_seq: u64 = 1;   // 请求序号从 1 起（读侧先增再派发）
@@ -217,6 +237,8 @@ pub async fn serve_connection<S>(
                 if wr.write_all(&resp).await.is_err() {
                     return;
                 }
+                // A4 每连接吞吐（出向：响应体 + 4 字节长度前缀）
+                crate::partition::conn_bytes_add(&writer_peer, 0, resp.len() as u64 + 4);
                 // 归还唯一所有的读缓冲（Bytes 唯一 → BytesMut → 池）
                 if let Ok(bm) = Bytes::try_into_mut(resp) {
                     use basalt_storage::pool::BufferPool;
@@ -246,6 +268,8 @@ pub async fn serve_connection<S>(
             Ok(b) => b,
             Err(_) => break,
         };
+        // A4 每连接吞吐（入向：帧长 + 4 字节长度前缀）
+        crate::partition::conn_bytes_add(&peer, len as u64 + 4, 0);
         // 认证门禁（T-S1）：未认证连接只放行 ApiVersions/SaslHandshake/
         // SaslAuthenticate——先偷看 api_key，越权请求直接断连（Kafka 同语义：
         // SASL 端口上的明文请求不回错误、直接关闭）

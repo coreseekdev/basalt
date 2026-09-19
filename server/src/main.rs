@@ -414,6 +414,7 @@ async fn async_main(cfg: Config) {
                 let produces = m.produce_requests.load(std::sync::atomic::Ordering::Relaxed);
                 let compressed = m.compressed_batches.load(std::sync::atomic::Ordering::Relaxed);
                 let connections = m.connections_total.load(std::sync::atomic::Ordering::Relaxed);
+                let connections_active = m.connections_active.load(std::sync::atomic::Ordering::Relaxed);
                 let authz = m.authz_rejections_total.load(std::sync::atomic::Ordering::Relaxed);
                 let gauge_lines = if let Ok(map) = crate::partition::PARTITION_GAUGES.lock() {
                     let mut lines = String::from("# TYPE basalt_partition_hw gauge\n# TYPE basalt_partition_lso gauge\n# TYPE basalt_partition_log_start gauge\n");
@@ -426,9 +427,20 @@ async fn async_main(cfg: Config) {
                 } else {
                     String::new()
                 };
+                // A4 连接级指标：活跃 gauge + 每连接字节累计（吞吐率由抓取端算差值）
+                let conn_lines = if let Ok(map) = crate::partition::CONN_BYTES.lock() {
+                    let mut lines = String::from("# TYPE basalt_connection_bytes_in_total counter\n# TYPE basalt_connection_bytes_out_total counter\n");
+                    for (peer, (inb, outb)) in map.iter() {
+                        lines.push_str(&format!("basalt_connection_bytes_in_total{{peer=\"{}\"}} {}\n", peer, inb));
+                        lines.push_str(&format!("basalt_connection_bytes_out_total{{peer=\"{}\"}} {}\n", peer, outb));
+                    }
+                    lines
+                } else {
+                    String::new()
+                };
                 let body = format!(
-                    "{}# TYPE basalt_messages_produced_total counter\nbasalt_messages_produced_total {produced}\n# TYPE basalt_bytes_produced_total counter\nbasalt_bytes_produced_total {bytes_p}\n# TYPE basalt_messages_consumed_total counter\nbasalt_messages_consumed_total {consumed}\n# TYPE basalt_produce_errors_total counter\nbasalt_produce_errors_total {errors}\n# TYPE basalt_fetch_requests_total counter\nbasalt_fetch_requests_total {fetches}\n# TYPE basalt_produce_requests_total counter\nbasalt_produce_requests_total {produces}\n# TYPE basalt_compressed_batches_total counter\nbasalt_compressed_batches_total {compressed}\n# TYPE basalt_connections_total counter\nbasalt_connections_total {connections}\n# TYPE basalt_authz_rejections_total counter\nbasalt_authz_rejections_total {authz}\n",
-                    gauge_lines
+                    "{}{}# TYPE basalt_messages_produced_total counter\nbasalt_messages_produced_total {produced}\n# TYPE basalt_bytes_produced_total counter\nbasalt_bytes_produced_total {bytes_p}\n# TYPE basalt_messages_consumed_total counter\nbasalt_messages_consumed_total {consumed}\n# TYPE basalt_produce_errors_total counter\nbasalt_produce_errors_total {errors}\n# TYPE basalt_fetch_requests_total counter\nbasalt_fetch_requests_total {fetches}\n# TYPE basalt_produce_requests_total counter\nbasalt_produce_requests_total {produces}\n# TYPE basalt_compressed_batches_total counter\nbasalt_compressed_batches_total {compressed}\n# TYPE basalt_connections_total counter\nbasalt_connections_total {connections}\n# TYPE basalt_connections_active gauge\nbasalt_connections_active {connections_active}\n# TYPE basalt_authz_rejections_total counter\nbasalt_authz_rejections_total {authz}\n",
+                    gauge_lines, conn_lines
                 );
                 let resp = format!(
                     "HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",

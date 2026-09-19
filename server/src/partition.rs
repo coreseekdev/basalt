@@ -1850,8 +1850,26 @@ pub struct Metrics {
     pub produce_requests: AtomicU64,
     pub compressed_batches: AtomicU64,
     pub connections_total: AtomicU64,
+    /// 活跃连接数（A4，非累计）：serve_connection 进出配对
+    pub connections_active: std::sync::atomic::AtomicI64,
     pub auth_failures_total: AtomicU64,
     pub authz_rejections_total: AtomicU64,
+}
+
+/// 每连接字节累计（A4）：peer → (入, 出)。连接关闭即移除——活跃观测面，
+/// 非历史账本；吞吐率由抓取端按两次采样差值计算。
+pub static CONN_BYTES: std::sync::Mutex<std::collections::BTreeMap<String, (u64, u64)>> =
+    std::sync::Mutex::new(std::collections::BTreeMap::new());
+
+pub fn conn_bytes_add(peer: &std::net::SocketAddr, inbound: u64, outbound: u64) {
+    if inbound == 0 && outbound == 0 {
+        return;
+    }
+    if let Ok(mut map) = CONN_BYTES.lock() {
+        let e = map.entry(peer.to_string()).or_insert((0, 0));
+        e.0 = e.0.saturating_add(inbound);
+        e.1 = e.1.saturating_add(outbound);
+    }
 }
 
 /// 分区维度 gauge（L1 可观测：topic/partition → hw/lso/log_start）

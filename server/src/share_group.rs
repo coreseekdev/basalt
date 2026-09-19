@@ -357,8 +357,24 @@ fn apply_ack(p: &mut SharePartition, member: &str, first: i64, last: i64, ty: i8
             p.acquired.retain(|a| {
                 !(a.member == member && a.first >= first && a.last <= last)
             });
+            // 归档优先（块 e TLA+ 边界实证，账本 67）：accept 区间剔除已
+            // 归档 offset——Reject 永久性：同锁超集 accept 不得复活已归档
+            // 记录，也不得让游标跳过它们（区间可能分裂为多段，逐段并入）。
+            // 注意 [first, last] 为闭区间（与旧 push(first, last+1) 等价）
+            let mut o = first;
+            while o <= last {
+                if is_archived(p, o) {
+                    o += 1;
+                    continue;
+                }
+                let mut run_end = o + 1;
+                while run_end <= last && !is_archived(p, run_end) {
+                    run_end += 1;
+                }
+                p.accepted.push((o, run_end));
+                o = run_end;
+            }
             // 合并 accepted 区间 + 游标沿连续段推进（区间含头不含尾）
-            p.accepted.push((first, last + 1));
             p.accepted.sort_unstable();
             let mut merged: Vec<(i64, i64)> = Vec::new();
             for (f, l) in &p.accepted {
@@ -390,11 +406,34 @@ fn apply_ack(p: &mut SharePartition, member: &str, first: i64, last: i64, ty: i8
             p.acquired.retain(|a| {
                 !(a.member == member && a.first >= first && a.last <= last)
             });
-            p.archived.push((first, last));
+            // 首个终态 ack 定局（账本 67 对称面）：reject 剔除已 accepted
+            // offset——accepted 记录不得再被归档（accepted ∩ archived = ∅）
+            let mut o = first;
+            while o <= last {
+                if is_accepted(p, o) {
+                    o += 1;
+                    continue;
+                }
+                let mut run_end = o + 1;
+                while run_end <= last && !is_accepted(p, run_end) {
+                    run_end += 1;
+                }
+                // archived 区间为含端存储（与旧 push(first, last) 同型）
+                p.archived.push((o, run_end - 1));
+                o = run_end;
+            }
             true
         }
         _ => false,
     }
+}
+
+fn is_archived(p: &SharePartition, o: i64) -> bool {
+    p.archived.iter().any(|(f, l)| *f <= o && o < *l)
+}
+
+fn is_accepted(p: &SharePartition, o: i64) -> bool {
+    p.accepted.iter().any(|(f, l)| *f <= o && o < *l)
 }
 
 /// 会话关闭（ShareSessionEpoch=-1 / FINAL_EPOCH ack）：释放该 member 全部在途
@@ -409,6 +448,28 @@ pub fn release_member(group: &str, member: &str) {
 #[cfg(test)]
 mod share_tests {
     use super::*;
+
+    #[test]
+    fn accept_reject_terminal_precedence() {
+        // 账本 67（块 e TLA+ 边界实证）：accept 与 reject 双向终态优先——
+        // accepted ∩ archived = ∅；游标不得跳过归档记录
+        // ① 超集 accept 后部分 reject：先 accept 定局，accepted 不得归档
+        let mut p = SharePartition::default();
+        assert!(apply_ack(&mut p, "m", 0, 4, ACK_ACCEPT));
+        assert!(apply_ack(&mut p, "m", 0, 2, ACK_REJECT));
+        assert!(is_accepted(&p, 0) && is_accepted(&p, 1));
+        assert!(!is_archived(&p, 0) && !is_archived(&p, 1));
+        assert_eq!(p.cursor, 5, "accepted 半开区间 [0,5) → 游标 5");
+        // ② 部分 reject 后超集 accept：先 reject 定局，游标停在归档记录前
+        let mut q = SharePartition::default();
+        assert!(apply_ack(&mut q, "m", 0, 1, ACK_REJECT));
+        assert!(apply_ack(&mut q, "m", 0, 4, ACK_ACCEPT));
+        assert!(is_archived(&q, 0), "先 reject 定局");
+        assert!(!is_accepted(&q, 0), "archived 不得复活");
+        assert!(is_accepted(&q, 1) && is_accepted(&q, 2) && is_accepted(&q, 3));
+        assert_eq!(q.cursor, 0, "游标不得越过归档记录 0（serve 端按归档过滤跳过）");
+    }
+
 
     #[test]
     fn heartbeat_join_fence_and_stable() {

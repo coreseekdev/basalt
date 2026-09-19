@@ -47,11 +47,18 @@ consumer-group-848:               ; $(TLC) -config consumer-group-848.cfg Consum
 consumer-group-848-nohbfence:     ; $(TLC) -config consumer-group-848-nohbfence.cfg ConsumerGroup848.tla
 consumer-group-848-nocommitfence: ; $(TLC) -config consumer-group-848-nocommitfence.cfg ConsumerGroup848.tla
 
+# share group ack 状态机（KIP-932 块 e，B5）：名义全空间绿；
+# phantom 突变（允许未交付区间 Accept）必须被 InvCursorDelivered 抓——
+# 游标跳过未交付记录 = 消费者丢数据面（share-ack.tla 头注释三方一致）
+share-ack:         ; $(TLC) -config share-ack.cfg ShareAck.tla
+share-ack-phantom: ; $(TLC) -config share-ack-phantom.cfg ShareAck.tla
+
 # 数据面活性（P2-2 闭合）：稳定变体期望绿；churn 变体期望红（负结果已入账）
 dp-liveness-stable: ; $(TLC) -deadlock -config dp-liveness-stable.cfg BasaltDataPlaneLiveness.tla
 dp-liveness:         ; $(TLC) -deadlock -config dp-liveness.cfg BasaltDataPlaneLiveness.tla
 
 .PHONY: dp-liveness-stable dp-liveness
+.PHONY: share-ack share-ack-phantom
 .PHONY: consumer-group-848 consumer-group-848-nohbfence consumer-group-848-nocommitfence
 .PHONY: replication-commit replication-commit-norecon replication-commit-liveness replication-commit-recovery
 

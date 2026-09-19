@@ -127,6 +127,14 @@ Basalt：Rust 版 Kafka 兼容消息流平台
 
 ---
 
+## P0 速赢落地（2026-09-19 续）
+
+- **内部口安全**：默认绑定 127.0.0.1（BASALT_INTERNAL_BIND 可覆盖）；非 localhost 时 warn。
+- **BASALT_FSYNC**：os（默认）/ always（防断电）/ on_roll——三档持久化可选。
+- **磁盘满只读降级**：produce ENOSPC → read_only 标志 → 拒绝新写入，fetch 照常；空间释放后自动恢复。
+- **慢日志**：produce/fetch >500ms 输出 warn。
+- **消费指标**：messages/bytes_consumed 假值修复（按批头解析真实递增）。
+
 ## 评审与评估（2026-09-19）
 
 - **生产就绪评估 ✅**：[docs/assessment/production-readiness-20260919.md](docs/assessment/production-readiness-20260919.md)——P0 缺口五项（内部口无鉴权/断电窗口/组协调 HA/观测缺口/磁盘满）、解耦结论（主路径不存在，风险集中在连接内混用与管理面三单 actor）、可观测框架 L1-L5 分层设计。

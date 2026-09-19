@@ -440,6 +440,16 @@ impl MetaService {
         }
     }
 
+    /// fsync 档（P0-2）：BASALT_FSYNC=os（默认，page cache）/ always
+    /// （防断电）/ on_roll（折中）
+    pub fn fsync_schedule() -> FsyncSchedule {
+        match std::env::var("BASALT_FSYNC").as_deref() {
+            Ok("always") | Ok("SyncEach") => FsyncSchedule::SyncEach,
+            Ok("on_roll") | Ok("OnRoll") => FsyncSchedule::OnRoll,
+            _ => FsyncSchedule::Os,
+        }
+    }
+
     async fn apply_cluster(&mut self, state: Box<ClusterState>) {
         self.cluster = *state;
         // 为本地副本确保 actor；角色更新
@@ -455,7 +465,7 @@ impl MetaService {
                     .join(format!("p{}", a.partition));
                 let opts = LogOptions {
                     segment_max_bytes: self.cfg.segment_max_bytes,
-                    fsync: FsyncSchedule::Os,
+                    fsync: Self::fsync_schedule(),
                     retention_ms: 7 * 24 * 3600 * 1000,
                     retention_max_bytes: 0,
                 };

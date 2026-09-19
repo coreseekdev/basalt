@@ -14,6 +14,7 @@ use basalt_protocol::frame;
 use basalt_protocol::registry::Registry;
 use basalt_protocol::value::{s, Struct, Value};
 use bytes::{Buf, Bytes, BytesMut};
+use std::time::Duration;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
 const MAX_FRAME: i32 = 100 * 1024 * 1024;
@@ -401,6 +402,7 @@ async fn dispatch(
     ctx: &Ctx,
     conn: &tokio::sync::Mutex<ConnState>,
 ) -> Result<DispatchOutcome, DispatchError> {
+    let t0_dispatch = std::time::Instant::now();
     let reg = Registry::global();
     // 预读 api_key/version 以定头版本（先偷看前 4 字节，读头时再正式解析）
     if frame_bytes.len() < 8 {
@@ -527,6 +529,14 @@ async fn dispatch(
     // 按请求批字节）。节流以延迟响应实现（v0 语义；效果等同配额约束速率）
     if api_key == key::FETCH {
         ConnState::throttled(conn, false, total as u64).await;
+    }
+    // 慢日志：produce/fetch 处理耗时 > 500ms（不含长轮询 pending——
+    // 由 actor pending 机制消化，不走此处）
+    if matches!(api_key, key::PRODUCE | key::FETCH) {
+        let elapsed = t0_dispatch.elapsed();
+        if elapsed > Duration::from_millis(500) {
+            tracing::warn!(api = api_key, elapsed_ms = elapsed.as_millis() as u64, resp_bytes = total, "slow request");
+        }
     }
     Ok(DispatchOutcome {
         resp: if acks_none { None } else { Some(out.freeze()) },
@@ -681,7 +691,13 @@ async fn handle_produce(
     let _ = version;
     // produce 字节率配额（S5）：按请求批字节节流（token bucket）
     ConnState::throttled(conn, true, batch_bytes).await;
+    let t0 = std::time::Instant::now();
+    let n_targets = targets.len();
     let v = handlers::produce(version, acks, targets, ctx).await;
+    let elapsed = t0.elapsed();
+    if elapsed > Duration::from_millis(500) {
+        tracing::warn!(elapsed_ms = elapsed.as_millis() as u64, targets = n_targets, bytes = batch_bytes, "slow produce");
+    }
     Ok((v, acks == 0))
 }
 

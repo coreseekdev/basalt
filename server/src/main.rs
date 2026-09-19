@@ -300,7 +300,15 @@ async fn async_main(cfg: Config) {
     let txn_tx_internal = txn_tx.clone();
 
     // 内部服务
-    let internal_listener = tokio::net::TcpListener::bind(format!("0.0.0.0:{internal_port}"))
+    // 内部口绑定（P0-1）：默认 localhost（单节点/本机进程间），多节点经
+    // BASALT_INTERNAL_BIND 显式放开；生产部署配防火墙隔离此端口
+    let internal_bind = std::env::var("BASALT_INTERNAL_BIND")
+        .unwrap_or_else(|_| "127.0.0.1".to_string());
+    if internal_bind != "127.0.0.1" {
+        tracing::warn!(bind = %internal_bind, port = internal_port,
+            "internal RPC on non-localhost: ensure network isolation (firewall/VPC)");
+    }
+    let internal_listener = tokio::net::TcpListener::bind(format!("{internal_bind}:{internal_port}"))
         .await
         .expect("bind internal");
     let controller_tx_internal = controller_tx.clone();

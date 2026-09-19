@@ -266,6 +266,9 @@ pub struct PartitionActor {
     /// 异步上传通道（v1.1：上传移出 produce 关键路径）+ 在途集合
     offload_tx: Option<mpsc::Sender<OffloadJob>>,
     offload_inflight: std::collections::BTreeSet<i64>,
+    /// 磁盘满只读降级（P0-3）：write ENOSPC 后置位；produce 拒绝，
+    /// fetch 照常；下次 append 成功自动清除
+    read_only: std::sync::atomic::AtomicBool,
     /// 分层对象侧 retention（T-M4.3 v2）：BASALT_RETENTION_MS（0=关闭）
     retention_ms: u64,
     /// sweep 周期（BASALT_RETENTION_SWEEP_MS）+ 下次触发时刻
@@ -478,6 +481,7 @@ impl PartitionActor {
             retention_ms,
             retention_sweep_ms,
             next_retention_sweep: Some(Instant::now() + Duration::from_millis(retention_sweep_ms.max(100))),
+            read_only: std::sync::atomic::AtomicBool::new(false),
         };
         // 恢复收割（ADR-18 §4.4）：重启后事务视图从日志扫描重建——开事务
         // 锚住 LSO（abort 落地前不泄露）、终态 fence 与 aborted 过滤跨重启有效。
@@ -845,8 +849,19 @@ impl PartitionActor {
                     let now = now_ms();
                     let m = crate::partition::metrics();
                     m.produce_requests.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    // 磁盘满只读闸（P0-3）：ENOSPC 后 produce 拒绝
+                    if self.read_only.load(std::sync::atomic::Ordering::Relaxed) {
+                        tracing::warn!(topic = %self.name, partition = self.index, "read-only mode: rejecting produce (disk was full)");
+                        let _ = reply.send(ProduceOutcome {
+                            base_offset: -1, last_offset: -1, log_append_time: now,
+                            error: Some(StorageError::Other("disk full, partition read-only".into())),
+                        });
+                        continue;
+                    }
                     let outcome = match self.log.append(&batches, policy, now) {
                         Ok(r) => {
+                            // append 成功 → 清只读（空间已释放）
+                            self.read_only.store(false, std::sync::atomic::Ordering::Relaxed);
                             m.messages_produced.fetch_add((r.last_offset - r.base_offset + 1) as u64, std::sync::atomic::Ordering::Relaxed);
                             m.bytes_produced.fetch_add(batches.len() as u64, std::sync::atomic::Ordering::Relaxed);
                             ProduceOutcome {
@@ -858,6 +873,13 @@ impl PartitionActor {
                         }
                         Err(e) => {
                             m.produce_errors.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                            // ENOSPC 检测（P0-3）：errno 28 → 只读降级
+                            if matches!(&e, StorageError::Io(io) if io.kind() == std::io::ErrorKind::StorageFull
+                                || io.raw_os_error() == Some(28))
+                            {
+                                tracing::error!(topic=%self.name, partition=self.index, "ENOSPC: entering read-only mode");
+                                self.read_only.store(true, std::sync::atomic::Ordering::Relaxed);
+                            }
                             tracing::warn!(topic=%self.name, partition=self.index, error=%e, "produce append failed");
                             ProduceOutcome { base_offset: -1, last_offset: -1, log_append_time: now, error: Some(e) }
                         }

@@ -405,7 +405,9 @@ pub async fn create_topics(req: &basalt_protocol::value::Struct, ctx: &Ctx) -> V
                 continue;
             }
             let num_partitions = ts.get("NumPartitions").map(|v| v.as_i32()).unwrap_or(1);
-            let rf = ts.get("ReplicationFactor").map(|v| v.as_i32()).unwrap_or(1);
+            // ReplicationFactor 线上是 int16——as_i32 窄匹配静默返 0（账本 66，
+            // 同 ㊿ as_i8 家族；rf=0 → 无副本分区 → failover 无候选人）
+            let rf = ts.get("ReplicationFactor").map(|v| v.as_i16() as i32).unwrap_or(1);
             // per-topic 分层存储（T-M4.3 v2）：configs 键 basalt.storage.mode=tiered
             let tiered = match ts.get("Configs") {
                 Some(Value::Array(cfgs)) => cfgs.iter().any(|c| {

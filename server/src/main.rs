@@ -243,14 +243,16 @@ async fn async_main(cfg: Config) {
     let (meta_tx, routes_rx) = meta::MetaService::spawn(cfg.clone(), controller_addr, controller_tx.clone(), pool.clone());
     let group_tx = basalt_coordinator::GroupManager::spawn();
 
-    // 内部 topic 自动创建 + 组状态绑定（方案 B 块 b1/b2）：ensure → 等本地
-    // 分区 actor 路由 → 重放 → BindState（原子安装状态 + 下沉通道）。
-    // 绑定完成前 commit/promote 一律回 CoordinatorNotAvailable（客户端
-    // 重试）；绑定在客户端监听建立前完成，窗口内无真实流量。
+    // 内部 topic 自动创建 + 组状态绑定监督（方案 B 块 b1/b2/b3）：
+    // ensure（幂等）→ 监督循环：本节点是内部分区 leader 时重放 + BindState；
+    // epoch 变化（failover 升主）即重放重绑——组协调器随分区 leader 迁移，
+    // 新 leader 从副本数据重放组状态（B3）。非 leader 节点不绑定（commit
+    // 一律回 CoordinatorNotAvailable，客户端经 FindCoordinator 重定向）。
     {
         let itx = meta_tx.clone();
         let routes_rx_g = routes_rx.clone();
         let group_tx_g = group_tx.clone();
+        let self_node = cfg.node_id;
         let rf = cfg.default_rf;
         tokio::spawn(async move {
             for _ in 0..20 {
@@ -269,27 +271,27 @@ async fn async_main(cfg: Config) {
             })
             .await;
             let _ = rxr.await;
-            // 分区 actor 由 apply_cluster 异步 spawn——轮询等待路由出现
-            let mut part_tx = None;
-            for _ in 0..100 {
-                if let Some(r) = routes_rx_g.borrow().find("__basalt_group_state", 0) {
-                    part_tx = Some(r.tx.clone());
-                    break;
+            let mut bound_epoch: Option<i32> = None;
+            loop {
+                tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+                let route = {
+                    let table = routes_rx_g.borrow();
+                    table.find("__basalt_group_state", 0).cloned()
+                };
+                let Some(route) = route else { continue };
+                if route.leader != self_node || bound_epoch == Some(route.epoch) {
+                    continue;
                 }
-                tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+                let sink = group_sync::spawn(route.tx.clone());
+                let install = group_sync::replay(route.tx.clone()).await;
+                let (breply, brx) = tokio::sync::oneshot::channel();
+                let _ = group_tx_g
+                    .send(basalt_coordinator::GroupCmd::BindState { out: sink, install, reply: breply })
+                    .await;
+                let _ = brx.await;
+                tracing::info!(epoch = route.epoch, "internal group state bound (leader)");
+                bound_epoch = Some(route.epoch);
             }
-            let Some(part_tx) = part_tx else {
-                tracing::error!("internal group state route missing; group commits will be rejected until restart");
-                return;
-            };
-            let sink = group_sync::spawn(part_tx.clone());
-            let install = group_sync::replay(part_tx).await;
-            let (breply, brx) = tokio::sync::oneshot::channel();
-            let _ = group_tx_g
-                .send(basalt_coordinator::GroupCmd::BindState { out: sink, install, reply: breply })
-                .await;
-            let _ = brx.await;
-            tracing::info!("internal group state topic ensured and bound");
         });
     }
 

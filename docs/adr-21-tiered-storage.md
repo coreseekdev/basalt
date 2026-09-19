@@ -65,7 +65,11 @@ tokio::spawn 改 OS 线程——阻塞 IO 专用线程纪律同 Log::open）；�
 
 ## 3. 已知边界（v1）
 
-- cloud-direct（S3）适配器未接：契约面已按 Arroyo 四原语收窄，换入即用；
+- cloud-direct（S3）适配器 **✅ 实机硬化完成（2026-09-19）**：自研 durad
+  （SigV4 兼容 S3 API）双模式实测——信任模式 run_tiered_s3.sh 全链（上传
+  38 对象/本地回收/读穿透 400/400/重启恢复/四原语抽查：create CAS
+  ETag+412、list 前缀、range 读、delete 404）+ SigV4 鉴权模式（boto3 建
+  桶，basalt arrow-rs 签名读写 400/400 零告警）。path-style 寻址；
 - per-topic 存储模式 **✅ v2 已落地（2026-09-18）**：CreateTopics configs
   `basalt.storage.mode=tiered` → EnsureTopic → ClusterRecord/ReplicaAssignment
   （serde default + WAL 长度守卫 + 快照尾字节）→ actor spawn 参数化

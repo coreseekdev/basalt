@@ -157,6 +157,9 @@ async fn async_main(cfg: Config) {
     // ACL 骨架（T-M4.1 尾）：装载持久化 ACL + 数据目录注册（变更即落盘）
     acl::set_data_dir(&cfg.data_dir);
     acl::load_from_dir(std::path::Path::new(&cfg.data_dir));
+    // share groups（T-M3.6 块 c）：装载持久化交付状态（cursor/archived/counts）
+    share_group::set_data_dir(&cfg.data_dir);
+    share_group::load_from_dir(&cfg.data_dir);
 
     // 内部端口：client port + 1
     let internal_port = cfg.port + 1;

@@ -98,6 +98,7 @@ pub async fn share_fetch(req: &basalt_protocol::value::Struct, ctx: &crate::hand
     let member_id = req.get("MemberId").map(|v| v.as_str().to_string()).unwrap_or_default();
     let session_epoch = req.get("ShareSessionEpoch").map(|v| v.as_i32()).unwrap_or(0);
     let max_bytes_total = req.get("MaxBytes").map(|v| v.as_i32()).unwrap_or(i32::MAX).max(0) as usize;
+    let max_wait_ms = req.get("MaxWaitMs").map(|v| v.as_i32()).unwrap_or(500).clamp(0, 60_000);
 
     // member 校验（FINAL_EPOCH 关会话除外）
     if session_epoch != -1 {
@@ -131,7 +132,19 @@ pub async fn share_fetch(req: &basalt_protocol::value::Struct, ctx: &crate::hand
                 }
             }
         }
-        let Some(serve_set) = crate::share_group::session_register(&group, &member_id, session_epoch, &req_topics) else {
+        let mut forgotten_removals: Vec<(u128, i32)> = Vec::new();
+        if let Some(Value::Array(ft)) = req.get("ForgottenTopicsData") {
+            for t in ft {
+                let Value::Struct(ts) = t else { continue };
+                let topic_id = ts.get("TopicId").map(|v| v.as_uuid()).unwrap_or(0);
+                if let Some(Value::Array(parts)) = ts.get("Partitions") {
+                    for p in parts {
+                        forgotten_removals.push((topic_id, p.as_i32()));
+                    }
+                }
+            }
+        }
+        let Some(serve_set) = crate::share_group::session_register(&group, &member_id, session_epoch, &req_topics, &forgotten_removals) else {
             return s([
                 ("ThrottleTimeMs", Value::I32(0)),
                 ("ErrorCode", Value::I16(25)), // UNKNOWN_MEMBER_ID
@@ -145,18 +158,6 @@ pub async fn share_fetch(req: &basalt_protocol::value::Struct, ctx: &crate::hand
         // session_register 的增量并入面里不处理——遗忘经 ForgottenTopicsData
         // 需删除注册项，spike 面暂由全量 fetch（epoch 0）重建覆盖）
         let mut by_topic: BTreeMap<u128, Vec<Value>> = BTreeMap::new();
-        let mut forgotten_removals: Vec<(u128, i32)> = Vec::new();
-        if let Some(Value::Array(ft)) = req.get("ForgottenTopicsData") {
-            for t in ft {
-                let Value::Struct(ts) = t else { continue };
-                let topic_id = ts.get("TopicId").map(|v| v.as_uuid()).unwrap_or(0);
-                if let Some(Value::Array(parts)) = ts.get("Partitions") {
-                    for p in parts {
-                        forgotten_removals.push((topic_id, p.as_i32()));
-                    }
-                }
-            }
-        }
         for (tid, index, pmax) in serve_set {
             if forgotten_removals.contains(&(tid, index)) {
                 continue;
@@ -164,7 +165,7 @@ pub async fn share_fetch(req: &basalt_protocol::value::Struct, ctx: &crate::hand
             let topic_name = ctx.routes().name_for(tid).unwrap_or_default();
             let entry = serve_share_partition(
                 ctx, &group, &member_id, tid, &topic_name, index,
-                (pmax as usize).min(max_bytes_total.max(1)),
+                (pmax as usize).min(max_bytes_total.max(1)), max_wait_ms,
             ).await;
             by_topic.entry(tid).or_default().push(entry);
         }
@@ -197,6 +198,7 @@ async fn serve_share_partition(
     topic_name: &str,
     index: i32,
     max_bytes: usize,
+    max_wait_ms: i32,
 ) -> Value {
     if topic_name.is_empty() {
         return s([
@@ -221,7 +223,7 @@ async fn serve_share_partition(
             Some(r) => (r.tx.clone(), r.leader, r.epoch),
         }
     };
-    let deadline = std::time::Instant::now();
+    let deadline = std::time::Instant::now() + std::time::Duration::from_millis(max_wait_ms.max(0) as u64);
     let (txr, rx) = tokio::sync::oneshot::channel();
     if tx
         .send(crate::partition::PartitionCmd::Fetch {

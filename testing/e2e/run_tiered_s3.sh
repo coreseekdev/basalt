@@ -8,12 +8,14 @@
 set -u
 PORT="${TIERED_S3_PORT:-9092}"  # tiered_storage.py 硬编码 9092
 S3_EP="${BASALT_S3_ENDPOINT:-http://127.0.0.1:19000}"
-BUCKET="${BASALT_S3_BUCKET:-basalt-tiered}"
+BUCKET="basalt-tiered-run$(date +%s)"
 DATA=$(mktemp -d /tmp/basalt-ts3-XXXX)
 LOG=$(mktemp /tmp/basalt-ts3-log-XXXX)
 
 OLD=$(ss -tlnp 2>/dev/null | grep ":$PORT " | grep -oP 'pid=\K[0-9]+' | head -1)
 [ -n "$OLD" ] && kill -9 "$OLD" 2>/dev/null && sleep 0.5
+
+curl -s -m 5 -X PUT "$S3_EP/$BUCKET" -o /dev/null -w "bucket create: %{http_code}\n"
 
 start_server() {
   BASALT_DATA_DIR="$DATA" BASALT_PORT="$PORT" BASALT_NUM_PARTITIONS=2 BASALT_METRICS_PORT=0 \
@@ -40,6 +42,7 @@ sleep 1
 
 # [1] 对象落在 durad（S3 List 前缀 = 段对象 key 前缀）
 OBJ_COUNT=$(curl -s -m 5 "$S3_EP/$BUCKET?list-type=2&prefix=ts-e2e" | grep -o "<Key>" | wc -l)
+echo "upload errors in log: $(grep -c 'tiered upload failed' "$LOG" || true)"
 echo "s3 objects under ts-e2e: $OBJ_COUNT"
 [ "$OBJ_COUNT" -ge 12 ] || { echo "FAIL: S3 对象过少（$OBJ_COUNT < 12）"; exit 1; }
 echo "[1] objects uploaded to S3 endpoint ✔"

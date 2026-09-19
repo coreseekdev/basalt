@@ -58,6 +58,91 @@ struct ShareGroup {
 
 static GROUPS: std::sync::Mutex<Option<HashMap<String, ShareGroup>>> = std::sync::Mutex::new(None);
 
+// ---- 持久化（块 c，评估纪要 §3.2）：data_dir/share-state/{group-file}.json
+// 记 cursor/archived/delivery_counts（accepted 由 cursor 蕴含）；acquired
+// 为瞬态（重启 = 全员锁过期，回到可交付）。acknowledge 变更即落盘；
+// acquire 不落盘（重启丢失至多一次计数增量，§3.2 决策）。
+
+#[derive(serde::Serialize, serde::Deserialize)]
+struct PersistPartition {
+    topic_id: u128,
+    partition: i32,
+    cursor: i64,
+    archived: Vec<(i64, i64)>,
+    counts: HashMap<i64, i16>,
+}
+
+#[derive(serde::Serialize, serde::Deserialize)]
+struct PersistGroup {
+    group: String,
+    partitions: Vec<PersistPartition>,
+}
+
+static STATE_DIR: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+
+pub fn set_data_dir(dir: &str) {
+    let _ = STATE_DIR.set(dir.to_string());
+}
+
+/// 启动装载：扫描 share-state/*.json 重建 cursor/archived/counts
+pub fn load_from_dir(dir: &str) {
+    let _ = STATE_DIR.set(dir.to_string());
+    let sdir = std::path::Path::new(dir).join("share-state");
+    let Ok(entries) = std::fs::read_dir(&sdir) else { return };
+    let mut restored: Vec<PersistGroup> = Vec::new();
+    for e in entries.flatten() {
+        if let Ok(text) = std::fs::read_to_string(e.path()) {
+            if let Ok(pg) = serde_json::from_str::<PersistGroup>(&text) {
+                restored.push(pg);
+            }
+        }
+    }
+    if restored.is_empty() {
+        return;
+    }
+    let mut g = groups();
+    for pg in &restored {
+        let sg = group_mut(&mut g, &pg.group);
+        for pp in &pg.partitions {
+            let p = sg.parts.entry((pp.topic_id, pp.partition)).or_default();
+            p.cursor = pp.cursor;
+            p.archived = pp.archived.clone();
+            for (f, c) in pp.counts.clone() {
+                p.delivery_counts.insert(f, c);
+            }
+        }
+    }
+    tracing::info!(groups = restored.len(), "share state loaded");
+}
+
+fn persist_group(group: &str, sg: &ShareGroup) {
+    let Some(dir) = STATE_DIR.get() else { return };
+    let sdir = std::path::Path::new(dir).join("share-state");
+    if std::fs::create_dir_all(&sdir).is_err() {
+        return;
+    }
+    // 文件名安全化：组名非 [A-Za-z0-9._-] 字符以 hex 替换
+    let safe: String = group
+        .chars()
+        .map(|c| if c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-') { c.to_string() } else { format!("%{:02X}", c as u32) })
+        .collect();
+    let partitions: Vec<PersistPartition> = sg
+        .parts
+        .iter()
+        .map(|((tid, p), st)| PersistPartition {
+            topic_id: *tid,
+            partition: *p,
+            cursor: st.cursor,
+            archived: st.archived.clone(),
+            counts: st.delivery_counts.clone(),
+        })
+        .collect();
+    let pg = PersistGroup { group: group.to_string(), partitions };
+    if let Ok(json) = serde_json::to_string_pretty(&pg) {
+        let _ = std::fs::write(sdir.join(format!("{safe}.json")), json);
+    }
+}
+
 /// fetch 会话（KIP-932 沿用 KIP-227 增量语义）：epoch 0 全量注册，≥1 增量
 /// ——请求只带变化分区，服务端须以**会话注册集**为服务面（franz-go 首轮
 /// 之后发 n_topics=0 的增量 fetch，spike 首跑实证）。
@@ -75,6 +160,7 @@ pub fn session_register(
     member: &str,
     epoch: i32,
     topics: &[(u128, i32, i32)],
+    forgotten: &[(u128, i32)],
 ) -> Option<Vec<(u128, i32, i32)>> {
     let mut g = groups();
     let sg = group_mut(&mut g, group);
@@ -89,6 +175,8 @@ pub fn session_register(
                 None => e.parts.push(*t),
             }
         }
+        // 遗忘删除（KIP-227 ForgottenTopicsData）
+        e.parts.retain(|(tid, pp, _)| !forgotten.contains(&(*tid, *pp)));
     }
     e.epoch = epoch;
     Some(e.parts.clone())
@@ -302,7 +390,37 @@ pub fn acknowledge(
             _ => {}
         }
     }
+    if applied > 0 {
+        if let Some(dir) = STATE_DIR.get() {
+            persist_group_snapshot(group, sg);
+        }
+    }
     applied
+}
+
+/// 快照落盘（acknowledge 变更后调用）
+fn persist_group_snapshot(group: &str, sg: &ShareGroup) {
+    let partitions: Vec<PersistPartition> = sg
+        .parts
+        .iter()
+        .map(|((tid, p), st)| PersistPartition {
+            topic_id: *tid,
+            partition: *p,
+            cursor: st.cursor,
+            archived: st.archived.clone(),
+            counts: st.delivery_counts.clone(),
+        })
+        .collect();
+    let pg = PersistGroup { group: group.to_string(), partitions };
+    if let Ok(json) = serde_json::to_string_pretty(&pg) {
+        let safe: String = group
+            .chars()
+            .map(|c| if c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-') { c.to_string() } else { format!("%{:02X}", c as u32) })
+            .collect();
+        let sdir = std::path::Path::new(STATE_DIR.get().map(|s| s.as_str()).unwrap_or(".")).join("share-state");
+        let _ = std::fs::create_dir_all(&sdir);
+        let _ = std::fs::write(sdir.join(format!("{safe}.json")), json);
+    }
 }
 
 /// 会话关闭（ShareSessionEpoch=-1 / FINAL_EPOCH ack）：释放该 member 全部在途

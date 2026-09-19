@@ -119,6 +119,17 @@ broker 拉通一轮 heartbeat/fetch/ack——验证协议面认知（尤其 Shar
 session epoch 与增量语义），再决定 b/c 细节。若 spike 揭示 schema 外的隐含
 约束（如 ack 顺序要求），回到本纪要修订。
 
+## 4.6 v1 转正面（2026-09-19 同日，块 c + 长轮询 + 遗忘删除 ✅）
+
+- **块 c 状态持久化**：data_dir/share-state/{group}.json——cursor/archived/
+  delivery_counts 持久化，acknowledge 变更即落盘；acquired 瞬态（重启=
+  全员锁过期回可交付，符合锁语义）；load_from_dir 启动重建。e2e [5]：
+  重启后 accepted 的 40 条不重投。
+- **长轮询**：ShareFetch 的 MaxWaitMs 复用分区 actor pending 机制
+  （游标 >= HW 时挂起，append 唤醒/超时空回）——消除空分配/无新数据时
+  客户端热旋（spike 期实测 35k 空请求/数秒 的形态）。
+- **遗忘分区注册删除**：ForgottenTopicsData 进 session_register 增量面。
+
 ## 4.5 spike 结论（2026-09-19，GO ✅）
 
 块 a+ b 核心已落地（share_group.rs 状态机 + 76/78/79 三 handler + 内存

@@ -56,8 +56,28 @@ func pollAck(cl *kgo.Client, want int, timeout time.Duration, status kgo.AckStat
 
 func main() {
 	broker := "localhost:9092"
-	if len(os.Args) > 1 {
-		broker = "localhost:" + os.Args[1]
+	mode := "full"
+	if len(os.Args) > 2 {
+		mode = os.Args[2]
+	}
+	// verify-persist 模式：重启后校验已 accepted 的记录不被重投
+	if mode == "verify-persist" {
+		cl, err := kgo.NewClient(
+			kgo.SeedBrokers(broker),
+			kgo.ShareGroup("share-spike"),
+			kgo.ConsumeTopics("share-e2e"),
+		)
+		if err != nil {
+			fail("share consumer: %v", err)
+		}
+		defer cl.Close()
+		n := pollAck(cl, 1, 8*time.Second, kgo.AckAccept).n
+		if n != 0 {
+			fail("重启后重投 %d 条——share 状态持久化失效", n)
+		}
+		fmt.Println("[5] restart: persisted cursor holds, no redelivery ✔")
+		fmt.Println("PASS ✔ (share 状态持久化)")
+		return
 	}
 	topic := "share-e2e"
 	ctx := context.Background()

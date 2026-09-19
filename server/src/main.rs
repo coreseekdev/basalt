@@ -237,6 +237,28 @@ async fn async_main(cfg: Config) {
 
     let (meta_tx, routes_rx) = meta::MetaService::spawn(cfg.clone(), controller_addr, controller_tx.clone(), pool.clone());
     let group_tx = basalt_coordinator::GroupManager::spawn(std::path::Path::new(&cfg.data_dir));
+
+    // 内部 topic 自动创建（方案 B 块 b1）：组状态持久化面
+    {
+        let itx = meta_tx.clone();
+        tokio::spawn(async move {
+            for _ in 0..20 {
+                if CTX.get().is_some() { break; }
+                tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+            }
+            let (txr, rxr) = tokio::sync::oneshot::channel();
+            let _ = itx.send(meta::MetaCmd::EnsureTopic {
+                name: "__basalt_group_state".to_string(),
+                partitions: 1,
+                rf: 1,
+                tiered: false,
+                reply: txr,
+            }).await;
+            let _ = rxr.await;
+            tracing::info!("internal group state topic ensured");
+        });
+    }
+
     // KIP-848 consumer 组 actor（每节点一个；FindCoordinator 组路径回自身——
     // 与 classic 同拓扑，ADR-19 §4）
     let cg_tx = basalt_coordinator::ConsumerGroups::spawn();

@@ -1466,7 +1466,7 @@ mod failover_tests {
                 node_id: i, host: "h".into(), port: 9000 + i as u16,
             }));
         }
-        ctrl.apply_and_persist(&ClusterRecord::CreateTopic { name: "t".into(), partitions: 1, rf: 3, tiered: false });
+        ctrl.apply_and_persist(&ClusterRecord::CreateTopic { name: "t".into(), partitions: 1, rf: 3, tiered: false, retention: Default::default() });
         // p0 的 leader 迁到 node1，随后 node1 死亡（无心跳）
         ctrl.apply_and_persist(&ClusterRecord::LeaderChange { topic: "t".into(), partition: 0, leader: 1, epoch: 1 });
         let now = Instant::now();

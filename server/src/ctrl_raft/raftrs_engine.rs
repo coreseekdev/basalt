@@ -731,7 +731,7 @@ mod restore_tests {
         // CreateTopic 使 LeaderChange 的 assignment 内容断言真实化
         for i in 0..2 {
             let rec = if i == 0 {
-                ClusterRecord::CreateTopic { name: "t".into(), partitions: 2, rf: 3, tiered: false }
+                ClusterRecord::CreateTopic { name: "t".into(), partitions: 2, rf: 3, tiered: false, retention: Default::default() }
             } else {
                 ClusterRecord::LeaderChange { topic: "t".into(), partition: 0, leader: 1, epoch: 1 }
             };
@@ -835,7 +835,7 @@ mod restore_tests {
         // 建题 + 2 条变更（写进 WAL；快照文件可能尚未落盘）
         for i in 0..2 {
             let rec = if i == 0 {
-                ClusterRecord::CreateTopic { name: "t".into(), partitions: 2, rf: 3, tiered: false }
+                ClusterRecord::CreateTopic { name: "t".into(), partitions: 2, rf: 3, tiered: false, retention: Default::default() }
             } else {
                 ClusterRecord::LeaderChange { topic: "t".into(), partition: 0, leader: 1, epoch: 1 }
             };

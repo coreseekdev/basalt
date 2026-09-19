@@ -7,6 +7,8 @@
 package main
 
 import (
+	"strconv"
+	"strings"
 	"context"
 	"fmt"
 	"os"
@@ -59,6 +61,27 @@ func main() {
 	mode := "full"
 	if len(os.Args) > 2 {
 		mode = os.Args[2]
+	}
+	// B4/多节点 failover 模式：failover-setup <broker> <group> <topic> <n>
+	// / failover-verify <broker> <group> <topic> <cut> <total>
+	// ——跨节点 share 组：setup 在 A 节点 poll+accept，verify 在 B 节点
+	// 校验游标随协调器迁移恢复（accepted 不重投、后缀全量）
+	if mode == "failover-setup" || mode == "failover-verify" {
+		if len(os.Args) < 6 {
+			fail("usage: share <broker> %s <group> <topic> <n|cut,total>", mode)
+		}
+		group, topic := os.Args[3], os.Args[4]
+		nums := strings.Split(os.Args[5], ",")
+		numsInt := make([]int, len(nums))
+		for i, v := range nums {
+			numsInt[i], _ = strconv.Atoi(v)
+		}
+		if mode == "failover-setup" {
+			failoverSetup(broker, group, topic, numsInt[0])
+			return
+		}
+		failoverVerify(broker, group, topic, numsInt[0], numsInt[1])
+		return
 	}
 	// verify-persist 模式：重启后校验已 accepted 的记录不被重投
 	if mode == "verify-persist" {
@@ -238,4 +261,69 @@ func pollMulti(cl *kgo.Client, want int, timeout time.Duration, fn func(*kgo.Rec
 		cl.FlushAcks(ctx)
 	}
 	return res
+}
+
+// failoverSetup：produce n 条 → share consumer poll n 条全 AckAccept。
+func failoverSetup(broker, group, topic string, n int) {
+	ctx := context.Background()
+	ac, err := kgo.NewClient(kgo.SeedBrokers(broker))
+	if err != nil {
+		fail("admin client: %v", err)
+	}
+	adm := kadm.NewClient(ac)
+	_, _ = adm.CreateTopic(ctx, 1, 3, nil, topic)
+	time.Sleep(800 * time.Millisecond)
+	ac.Close()
+
+	p, err := kgo.NewClient(kgo.SeedBrokers(broker))
+	if err != nil {
+		fail("producer: %v", err)
+	}
+	for i := 0; i < n; i++ {
+		p.Produce(ctx, &kgo.Record{Topic: topic, Value: []byte(fmt.Sprintf("fo-%03d", i))},
+			func(_ *kgo.Record, err error) {
+				if err != nil {
+					fail("produce %d: %v", i, err)
+				}
+			})
+	}
+	if err := p.Flush(ctx); err != nil {
+		fail("flush: %v", err)
+	}
+	p.Close()
+
+	cl, err := kgo.NewClient(
+		kgo.SeedBrokers(broker),
+		kgo.ShareGroup(group),
+		kgo.ConsumeTopics(topic),
+	)
+	if err != nil {
+		fail("share consumer: %v", err)
+	}
+	defer cl.Close()
+	got := pollAck(cl, n, 30*time.Second, kgo.AckAccept)
+	if got.n != n {
+		fail("setup poll 到 %d/%d", got.n, n)
+	}
+	fmt.Printf("[setup] poll + AckAccept %d ✔\n", got.n)
+}
+
+// failoverVerify：同组新成员（另一 broker）——校验 accepted 前缀不重投、
+// 后缀 [cut, total) 全量可读（游标经重放随协调器迁移恢复）。
+func failoverVerify(broker, group, topic string, cut, total int) {
+	cl, err := kgo.NewClient(
+		kgo.SeedBrokers(broker),
+		kgo.ShareGroup(group),
+		kgo.ConsumeTopics(topic),
+	)
+	if err != nil {
+		fail("share consumer: %v", err)
+	}
+	defer cl.Close()
+	got := pollAck(cl, total-cut, 60*time.Second, kgo.AckAccept)
+	if got.n != total-cut {
+		fail("verify poll 到 %d（应 %d）——游标恢复/续读异常", got.n, total-cut)
+	}
+	fmt.Printf("[verify] 续读 %d..%d 共 %d，accepted 前缀无重投 ✔\n", cut, total, got.n)
+	fmt.Println("PASS ✔ (share failover)")
 }

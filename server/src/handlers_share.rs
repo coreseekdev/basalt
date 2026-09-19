@@ -114,6 +114,7 @@ pub async fn share_fetch(req: &basalt_protocol::value::Struct, ctx: &crate::hand
         }
     }
 
+    tracing::debug!(group = %group, %member_id, session_epoch, "share_fetch: enter");
     let mut responses: Vec<Value> = Vec::new();
     if session_epoch != -1 {
         // 会话结算：服务集 = 会话注册分区（增量请求仅带变化分区）
@@ -145,6 +146,7 @@ pub async fn share_fetch(req: &basalt_protocol::value::Struct, ctx: &crate::hand
             }
         }
         let Some(serve_set) = crate::share_group::session_register(&group, &member_id, session_epoch, &req_topics, &forgotten_removals) else {
+            tracing::warn!(group = %group, %member_id, "share fetch for unknown member (member lives on group coordinator node; multi-node share ops require per-partition share state — B5/块 b3-e)");
             return s([
                 ("ThrottleTimeMs", Value::I32(0)),
                 ("ErrorCode", Value::I16(25)), // UNKNOWN_MEMBER_ID
@@ -177,6 +179,7 @@ pub async fn share_fetch(req: &basalt_protocol::value::Struct, ctx: &crate::hand
             by_topic.entry(tid).or_default().push(entry);
         }
         for (tid, parts) in by_topic {
+            tracing::info!(group = %group, %member_id, responses = parts.len(), "share_fetch: served");
             responses.push(s([
                 ("TopicId", Value::Uuid(tid)),
                 ("Partitions", Value::Array(parts)),

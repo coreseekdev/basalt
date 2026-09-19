@@ -79,6 +79,8 @@ pub mod handlers_layout_tests {
                     leader: 0,
                     epoch: 1,
                     tiered: false,
+                retention: Default::default(),
+
                 });
             }
         }
@@ -376,6 +378,8 @@ pub mod handlers_layout_tests {
             state.brokers.insert(0, basalt_metadata::cluster::BrokerInfo { node_id: 0, host: "localhost".into(), port: 9092 });
             state.assignments.push(basalt_metadata::cluster::ReplicaAssignment {
                 topic: "t1".into(), partition: 0, replicas: vec![0], leader: 0, epoch: 1, tiered: false,
+            retention: Default::default(),
+
             });
             let _ = ctx.meta_tx.send(MetaCmd::ApplyCluster(Box::new(state))).await;
             std::thread::sleep(std::time::Duration::from_millis(20));

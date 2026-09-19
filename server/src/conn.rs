@@ -520,12 +520,19 @@ async fn dispatch(
         key::LIST_TRANSACTIONS => (handlers_txn::list_transactions(&req, ctx).await, false, false),
         key::OFFSET_FOR_LEADER_EPOCH => (handlers::offset_for_leader_epoch(&req, ctx).await, false, false),
         key::CONSUMER_GROUP_HEARTBEAT => (handlers_consumer::consumer_group_heartbeat(&req, ctx).await, false, false),
-        key::SHARE_GROUP_HEARTBEAT => (handlers_share::share_group_heartbeat(&req, ctx).await, false, false),
+        key::SHARE_GROUP_HEARTBEAT => {
+            tracing::debug!(target = "share_dispatch", "ShareGroupHeartbeat");
+            (handlers_share::share_group_heartbeat(&req, ctx).await, false, false)
+        }
         key::SHARE_FETCH => {
+            tracing::debug!(target = "share_dispatch", "ShareFetch");
             let v = handlers_share::share_fetch(&req, ctx).await;
             (v, false, false)
         }
-        key::SHARE_ACKNOWLEDGE => (handlers_share::share_acknowledge(&req, ctx).await, false, false),
+        key::SHARE_ACKNOWLEDGE => {
+            tracing::debug!(target = "share_dispatch", "ShareAcknowledge");
+            (handlers_share::share_acknowledge(&req, ctx).await, false, false)
+        }
         key::CONSUMER_GROUP_DESCRIBE => (handlers_consumer::consumer_group_describe(&req, ctx).await, false, false),
         key::DESCRIBE_GROUPS => (handlers_groups::describe_groups(&req, ctx).await, false, false),
         key::LIST_GROUPS => (handlers_groups::list_groups(&req, ctx).await, false, false),

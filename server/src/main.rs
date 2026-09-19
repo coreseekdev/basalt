@@ -18,6 +18,7 @@ mod internal;
 mod meta;
 mod share_group;
 mod partition;
+mod group_state_store;
 mod handlers_share;
 mod handlers_txn;
 mod tls;

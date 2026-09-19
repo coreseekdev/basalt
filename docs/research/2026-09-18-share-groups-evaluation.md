@@ -119,7 +119,7 @@ broker 拉通一轮 heartbeat/fetch/ack——验证协议面认知（尤其 Shar
 session epoch 与增量语义），再决定 b/c 细节。若 spike 揭示 schema 外的隐含
 约束（如 ack 顺序要求），回到本纪要修订。
 
-## 4.6 v1 转正面（2026-09-19 同日，块 c + 长轮询 + 遗忘删除 ✅）
+## 4.6 v1 转正面（2026-09-19 同日，块 c + 长轮询 + 遗忘删除 + 多成员 rebalance + REJECT 过滤 ✅）
 
 - **块 c 状态持久化**：data_dir/share-state/{group}.json——cursor/archived/
   delivery_counts 持久化，acknowledge 变更即落盘；acquired 瞬态（重启=

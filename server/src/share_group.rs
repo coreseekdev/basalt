@@ -48,12 +48,16 @@ struct SharePartition {
 
 #[derive(Default)]
 struct ShareGroup {
-    /// member_id → (epoch, assignment: topic_id → partitions)
-    members: HashMap<String, (i32, BTreeMap<u128, Vec<i32>>)>,
+    /// member_id → (epoch, last_seen_assign_epoch)
+    members: HashMap<String, (i32, u64)>,
     /// member_id → fetch 会话（KIP-227 增量注册集）
     sessions: HashMap<String, ShareSession>,
     /// (topic_id, partition) → 交付状态
     parts: HashMap<(u128, i32), SharePartition>,
+    /// 分配代次：成员集变化即 bump——下次心跳全员重下发分配
+    assignment_epoch: u64,
+    /// 最近一次确定性轮转分配（member_id → 分配面）
+    rotation: HashMap<String, BTreeMap<u128, Vec<i32>>>,
 }
 
 static GROUPS: std::sync::Mutex<Option<HashMap<String, ShareGroup>>> = std::sync::Mutex::new(None);
@@ -202,59 +206,62 @@ pub fn heartbeat(
     group: &str,
     member_id: &str,
     epoch: i32,
-    subscribed: &[(u128, Vec<i32>)], // (topic_id, partitions)——handler 由订阅名解析
+    subscribed: &[(u128, Vec<i32>)],
 ) -> Result<(i32, Option<BTreeMap<u128, Vec<i32>>>), (i16, String)> {
     let mut g = groups();
     let sg = group_mut(&mut g, group);
-    // 过滤空订阅
     let subscribed: BTreeMap<u128, Vec<i32>> = subscribed
         .iter()
         .filter(|(_, ps)| !ps.is_empty())
         .map(|(t, ps)| (*t, ps.clone()))
         .collect();
-    match sg.members.get(member_id) {
-        None => {
-            if epoch != 0 {
-                // 未知 member 且带 epoch：member 状态已失（重启/踢除）
-                return Err((25, "Unknown member id".into())); // UNKNOWN_MEMBER_ID
-            }
-            // 均衡分配：轮转把各 topic 分区分给现有 member（spike：新 member
-            // 加入即全量重分配，简单且语义正确）
-            let member_ids: Vec<String> = {
-                let mut ids: Vec<String> = sg.members.keys().cloned().collect();
-                ids.push(member_id.to_string());
-                ids.sort();
-                ids
-            };
-            let idx = member_ids.iter().position(|m| m == member_id).unwrap_or(0);
+    let known = sg.members.contains_key(member_id);
+    if !known && epoch != 0 {
+        return Err((25, "Unknown member id".into()));
+    }
+    if known {
+        let stored = sg.members.get(member_id).map(|(e, _)| *e).unwrap_or(0);
+        if epoch < stored {
+            return Err((82, "Fenced member epoch".into()));
+        }
+    }
+    if !known {
+        // 新加入：注册 + bump 分配代次 + 确定性轮转重算全员分配
+        sg.members.insert(member_id.to_string(), (1, 0));
+        sg.assignment_epoch += 1;
+        let member_ids: Vec<String> = {
+            let mut ids: Vec<String> = sg.members.keys().cloned().collect();
+            ids.sort();
+            ids
+        };
+        sg.rotation.clear();
+        let n = member_ids.len();
+        for (pos, mid) in member_ids.iter().enumerate() {
             let mut assignment: BTreeMap<u128, Vec<i32>> = BTreeMap::new();
             for (tid, ps) in &subscribed {
                 let mine: Vec<i32> = ps
                     .iter()
                     .copied()
                     .enumerate()
-                    .filter(|(i, _)| (i + idx) % member_ids.len() == 0)
+                    .filter(|(i, _)| i % n == pos)
                     .map(|(_, p)| p)
                     .collect();
                 if !mine.is_empty() {
                     assignment.insert(*tid, mine);
                 }
             }
-            sg.members.insert(member_id.to_string(), (1, assignment.clone()));
-            Ok((1, Some(assignment)))
+            sg.rotation.insert(mid.clone(), assignment);
         }
-        Some((stored_epoch, cur_assignment)) => {
-            if epoch < *stored_epoch {
-                return Err((82, "Fenced member epoch".into())); // FENCED_MEMBER_EPOCH
-            }
-            // 同 epoch 心跳：稳定，无新分配
-            let assignment = if subscribed.is_empty() {
-                None
-            } else {
-                Some(cur_assignment.clone())
-            };
-            Ok((*stored_epoch, assignment))
-        }
+    }
+    let cur_epoch = sg.members.get(member_id).map(|(e, _)| *e).unwrap_or(1);
+    let last_seen = sg.members.get(member_id).map(|(_, s)| *s).unwrap_or(0);
+    if last_seen < sg.assignment_epoch {
+        // 分配代次有更新 → 下发并标记已见
+        sg.members.get_mut(member_id).map(|(_, s)| *s = sg.assignment_epoch);
+        let assign = sg.rotation.get(member_id).cloned();
+        Ok((cur_epoch, assign))
+    } else {
+        Ok((cur_epoch, None))
     }
 }
 
@@ -291,6 +298,26 @@ pub fn deliverable_from(group: &str, member: &str, tid: u128, partition: i32) ->
         }
     }
     cursor
+}
+
+/// member 当前分配的分区集（serve 端过滤——会话注册面 ≠ 分配面）
+pub fn assigned_partitions(group: &str, member: &str, tid: u128) -> Vec<i32> {
+    let g = groups();
+    let Some(sg) = g.as_ref().and_then(|m| m.get(group)) else { return vec![] };
+    sg.rotation
+        .get(member)
+        .and_then(|a| a.get(&tid).cloned())
+        .unwrap_or_default()
+}
+
+/// 归档区间（serve 端过滤 REJECT 已拒记录）
+pub fn archived_ranges(group: &str, tid: u128, partition: i32) -> Vec<(i64, i64)> {
+    let g = groups();
+    let Some(sg) = g.as_ref().and_then(|m| m.get(group)) else { return vec![] };
+    sg.parts
+        .get(&(tid, partition))
+        .map(|p| p.archived.clone())
+        .unwrap_or_default()
 }
 
 /// member 存在性校验（fetch/ack 前置）：ShareFetch/ShareAcknowledge 不携带
@@ -438,25 +465,31 @@ mod share_tests {
 
     #[test]
     fn heartbeat_join_fence_and_stable() {
-        let sub = vec![(100u128, vec![0, 1])];
-        // member A 加入：epoch 0 → 1，拿全部分配（唯一成员）
+        // 双 topic（各 2 分区）双成员：成员集变化即全员重下发
+        let sub = vec![(100u128, vec![0, 1]), (200u128, vec![0, 1])];
+        // A 加入（唯一成员 → 拿全部 4 分区）
         let (ep, assign) = heartbeat("sg1", "aaa", 0, &sub).unwrap();
         assert_eq!(ep, 1);
-        let a = assign.unwrap();
+        let a = assign.expect("首加入应有分配");
         assert_eq!(a.get(&100).unwrap(), &vec![0, 1]);
-        // member B 加入：轮转分配（2 成员 → B 拿偶数位）
-        let (ep2, assign2) = heartbeat("sg1", "bbb", 0, &sub).unwrap();
-        assert_eq!(ep2, 1);
-        assert!(assign2.is_some());
-        // A 稳定心跳：无新分配
-        let (ep3, stable) = heartbeat("sg1", "aaa", 1, &sub).unwrap();
-        assert_eq!(ep3, 1);
-        assert!(stable.is_some());
-        // A 旧 epoch 心跳 → fence 82
+        assert_eq!(a.get(&200).unwrap(), &vec![0, 1]);
+        // B 加入：成员集变化 → 轮转重算（A/B 各得 2 分区）
+        let (_, assign_b) = heartbeat("sg1", "bbb", 0, &sub).unwrap();
+        let b = assign_b.expect("B 首加入应有分配");
+        // B（pos 1，mod 2）：各 topic 的奇数位
+        assert_eq!(b.get(&100).unwrap(), &vec![1]);
+        assert_eq!(b.get(&200).unwrap(), &vec![1]);
+        // A 下次心跳：看到重分配（topic 100 只剩 [0]，topic 200 只剩 [0]）
+        let (_, assign_a2) = heartbeat("sg1", "aaa", 1, &sub).unwrap();
+        let a2 = assign_a2.expect("A 应收到 rebalance 后的新分配");
+        assert_eq!(a2.get(&100).unwrap(), &vec![0]);
+        assert_eq!(a2.get(&200).unwrap(), &vec![0]);
+        // 稳定心跳：无新分配（None）
+        let (_, stable) = heartbeat("sg1", "aaa", 1, &sub).unwrap();
+        assert!(stable.is_none(), "稳定后不应重复下发");
+        // fence + 未知 member
         assert_eq!(heartbeat("sg1", "aaa", 0, &sub).unwrap_err().0, 82);
-        // 未知 member 带 epoch → 25
         assert_eq!(heartbeat("sg1", "ghost", 3, &sub).unwrap_err().0, 25);
-        let _ = ep2;
     }
 
     #[test]

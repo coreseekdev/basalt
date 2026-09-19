@@ -159,6 +159,13 @@ pub async fn share_fetch(req: &basalt_protocol::value::Struct, ctx: &crate::hand
         // 需删除注册项，spike 面暂由全量 fetch（epoch 0）重建覆盖）
         let mut by_topic: BTreeMap<u128, Vec<Value>> = BTreeMap::new();
         for (tid, index, pmax) in serve_set {
+            // 分配面过滤（会话注册面 ≠ 分配面：成员集变化后，会话中旧分区
+            // 不再服务——分配由 rotation 权威决定）
+            let assigned = crate::share_group::assigned_partitions(&group, &member_id, tid);
+            tracing::info!(member = %member_id, tid = format!("{tid:x}"), index, ?assigned, "assignment filter");
+            if !assigned.contains(&index) {
+                continue;
+            }
             if forgotten_removals.contains(&(tid, index)) {
                 continue;
             }
@@ -260,7 +267,11 @@ async fn serve_share_partition(
     if data.is_empty() {
         return empty_part(index, 0);
     }
-    // 批边界解析 → 逐批 acquire + AcquiredRecords
+    // 批边界解析 → 逐批 acquire + AcquiredRecords；归档批次整批剔除
+    // （REJECT-cursor 连续性：归档区间可能落在游标之后、同页 read 的
+    // 返回流中——整批剔除后交付面不暴露已拒记录）
+    let archived = crate::share_group::archived_ranges(group, topic_id, index);
+    let is_archived = |f: i64, l: i64| archived.iter().any(|(af, al)| *af <= f && l <= *al);
     let mut acquired: Vec<Value> = Vec::new();
     {
         let mut pos = 0usize;
@@ -269,12 +280,14 @@ async fn serve_share_partition(
             if total == 0 || pos + total > data.len() { break; }
             let b_first = h.base_offset;
             let b_last = h.base_offset + h.record_count as i64 - 1;
-            let count = crate::share_group::acquire(group, member, topic_id, index, b_first, b_last);
-            acquired.push(s([
-                ("FirstOffset", Value::I64(b_first)),
-                ("LastOffset", Value::I64(b_last)),
-                ("DeliveryCount", Value::I16(count)),
-            ]));
+            if !is_archived(b_first, b_last) {
+                let count = crate::share_group::acquire(group, member, topic_id, index, b_first, b_last);
+                acquired.push(s([
+                    ("FirstOffset", Value::I64(b_first)),
+                    ("LastOffset", Value::I64(b_last)),
+                    ("DeliveryCount", Value::I16(count)),
+                ]));
+            }
             pos += total;
         }
     }

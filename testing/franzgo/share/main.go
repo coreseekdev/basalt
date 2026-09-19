@@ -109,11 +109,11 @@ func main() {
 		}
 	}
 
-	newShareConsumer := func(group string) *kgo.Client {
+	newShareConsumer := func(group string, topics ...string) *kgo.Client {
 		opts := []kgo.Opt{
 			kgo.SeedBrokers(broker),
 			kgo.ShareGroup(group),
-			kgo.ConsumeTopics(topic),
+			kgo.ConsumeTopics(topics...),
 		}
 		if os.Getenv("SHARE_DEBUG") != "" {
 			opts = append(opts, kgo.WithLogger(kgo.BasicLogger(os.Stderr, kgo.LogLevelDebug, nil)))
@@ -127,7 +127,7 @@ func main() {
 
 	// [1] 20 条 → A poll → AckAccept
 	produce("s1", 20)
-	clA := newShareConsumer("share-spike")
+	clA := newShareConsumer("share-spike", topic)
 	defer clA.Close()
 	r1 := pollAck(clA, 20, 20*time.Second, kgo.AckAccept)
 	if r1.n != 20 {
@@ -160,5 +160,82 @@ func main() {
 		fail("[4] 重投递 DeliveryCount=%d（应 ≥2）", r4.maxDelivery)
 	}
 	fmt.Printf("[4] redelivered %d, DeliveryCount=%d ✔\n", r4.n, r4.maxDelivery)
-	fmt.Println("PASS ✔ (share groups spike：heartbeat/fetch/ack 全链)")
+
+	// ===== 多成员 + REJECT（双分区题） =====
+	topic2 := "share-e2e-2p"
+	_, _ = adm.CreateTopic(ctx, 2, 1, nil, topic2)
+	time.Sleep(800 * time.Millisecond)
+
+
+	// A/B 各自 poll：A → p0（10 条 REJECT），B → p1（10 条 ACCEPT）
+	clA2 := newShareConsumer("share-multi", topic2)
+	defer clA2.Close()
+	clB2 := newShareConsumer("share-multi", topic2)
+	defer clB2.Close()
+	// 双成员心跳稳定（rotation 分配：A=p0, B=p1）
+	time.Sleep(5 * time.Second)
+	p2, err := kgo.NewClient(kgo.SeedBrokers(broker))
+	if err != nil {
+		fail("producer 2p: %v", err)
+	}
+	defer p2.Close()
+	// p0: 10 条 reject 目标；p1: 10 条正常
+	for i := 0; i < 10; i++ {
+		p2.Produce(ctx, &kgo.Record{Topic: topic2, Partition: 0, Value: []byte(fmt.Sprintf("rej-%02d", i))},
+			func(_ *kgo.Record, err error) { if err != nil { fail("produce rej: %v", err) } })
+	}
+	for i := 0; i < 10; i++ {
+		p2.Produce(ctx, &kgo.Record{Topic: topic2, Partition: 1, Value: []byte(fmt.Sprintf("keep-%02d", i))},
+			func(_ *kgo.Record, err error) { if err != nil { fail("produce keep: %v", err) } })
+	}
+	if err := p2.Flush(ctx); err != nil {
+		fail("flush 2p: %v", err)
+	}
+
+	rA := pollMulti(clA2, 10, 20*time.Second, func(r *kgo.Record) kgo.AckStatus {
+		return kgo.AckReject
+	})
+	rB := pollMulti(clB2, 10, 20*time.Second, func(r *kgo.Record) kgo.AckStatus {
+		return kgo.AckAccept
+	})
+	total := rA.n + rB.n
+	if total < 20 {
+		fail("[5] A+B 合计 %d < 20", total)
+	}
+	fmt.Printf("[5] multi-member: A=%d + B=%d (total=%d ≥ 20) ✔\n", rA.n, rB.n, total)
+
+	// [6] REJECT 后不再重投（新 poll 只能看到 keep-*）
+	n6 := pollMulti(clA2, 10, 8*time.Second, func(r *kgo.Record) kgo.AckStatus {
+		return kgo.AckAccept
+	}).n
+	if n6 != 0 {
+		fail("[6] REJECT 后仍 poll 到 %d 条（应 0）", n6)
+	}
+	fmt.Println("[6] rejected records not redelivered ✔")
+	fmt.Println("PASS ✔ (share groups：多成员分配 + REJECT 归档)")
+}
+
+// pollMulti：poll 至 want 条；每条按 fn 决定 ack 状态
+func pollMulti(cl *kgo.Client, want int, timeout time.Duration, fn func(*kgo.Record) kgo.AckStatus) pollResult {
+	ctx, cancel := context.WithTimeout(context.Background(), timeout)
+	defer cancel()
+	var res pollResult
+	deadline := time.Now().Add(timeout)
+	for res.n < want && time.Now().Before(deadline) {
+		fetches := cl.PollRecords(ctx, 100)
+		fetches.EachError(func(_ string, _ int32, err error) {
+			fmt.Printf("  (fetch err: %v)\n", err)
+		})
+		fetches.EachRecord(func(r *kgo.Record) {
+			res.n++
+			if dc := r.DeliveryCount(); dc > res.maxDelivery {
+				res.maxDelivery = dc
+			}
+			r.Ack(fn(r))
+		})
+	}
+	if want > 0 {
+		cl.FlushAcks(ctx)
+	}
+	return res
 }

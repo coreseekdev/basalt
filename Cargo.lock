@@ -203,6 +203,7 @@ dependencies = [
  "bytes",
  "crc32c",
  "hmac",
+ "nix",
  "openraft",
  "protobuf",
  "raft",

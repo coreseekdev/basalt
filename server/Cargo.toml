@@ -38,5 +38,8 @@ tokio-rustls = "0.26"
 rustls = { version = "0.23", default-features = false, features = ["std", "aws-lc-rs", "tls12"] }
 rustls-pki-types = "1"
 
+[target.'cfg(unix)'.dependencies]
+nix = { version = "0.31", default-features = false, features = ["fs"] }
+
 [lints]
 workspace = true

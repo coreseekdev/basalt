@@ -162,8 +162,7 @@ pub struct Log<D: DiskIo> {
     pub log_start_offset: i64,
     pub next_offset: i64,
     /// 复制层维护；单副本分区（replicated=false）append 后 HW=LEO。
-    pub high_watermark: i64,
-    /// true = 多副本分区：HW 只由复制层推进。
+    pub high_watermark: i64,    /// true = 多副本分区：HW 只由复制层推进。
     pub replicated: bool,
     /// IO 批量合并：true 时 append() 只累积到 staging 不写盘，flush_batch() 统一落盘。
     pub batch_io: bool,

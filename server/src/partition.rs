@@ -269,6 +269,9 @@ pub struct PartitionActor {
     /// 磁盘满只读降级（P0-3）：write ENOSPC 后置位；produce 拒绝，
     /// fetch 照常；下次 append 成功自动清除
     read_only: std::sync::atomic::AtomicBool,
+    /// 磁盘前置水位（A2）：BASALT_DISK_WATERMARK_PCT（默认 95，0=关闭）。
+    /// sweep 周期检查，越过即主动进入 read_only（先于 ENOSPC）
+    disk_watermark_pct: u8,
     /// 分层对象侧 retention（T-M4.3 v2）：BASALT_RETENTION_MS（0=关闭）
     retention_ms: u64,
     /// sweep 周期（BASALT_RETENTION_SWEEP_MS）+ 下次触发时刻
@@ -292,6 +295,24 @@ fn now_ms_u64() -> u64 {
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_millis() as u64)
         .unwrap_or(0)
+}
+
+/// 磁盘使用率（A2）：path 所在文件系统 (blocks - 非root可用) / blocks。
+/// 保留块计入已用（保守方向：提前触发水位）。
+#[cfg(unix)]
+fn disk_used_pct(path: &std::path::Path) -> Option<u8> {
+    let st = nix::sys::statvfs::statvfs(path).ok()?;
+    let total = st.blocks();
+    if total == 0 {
+        return None;
+    }
+    let used = total.saturating_sub(st.blocks_available());
+    Some((((used * 100) / total) as u8).min(100))
+}
+
+/// 水位判定（A2）：使用率 ≥ 阈值 → 主动 read_only；threshold=0 关闭。
+fn over_disk_watermark(usage_pct: Option<u8>, threshold: u8) -> bool {
+    threshold > 0 && matches!(usage_pct, Some(u) if u >= threshold)
 }
 
 /// 简单字节配额（窗口 = 1s）：rate=0 时不限速。
@@ -482,6 +503,8 @@ impl PartitionActor {
             retention_sweep_ms,
             next_retention_sweep: Some(Instant::now() + Duration::from_millis(retention_sweep_ms.max(100))),
             read_only: std::sync::atomic::AtomicBool::new(false),
+            disk_watermark_pct: std::env::var("BASALT_DISK_WATERMARK_PCT")
+                .ok().and_then(|v| v.parse().ok()).unwrap_or(95),
         };
         // 恢复收割（ADR-18 §4.4）：重启后事务视图从日志扫描重建——开事务
         // 锚住 LSO（abort 落地前不泄露）、终态 fence 与 aborted 过滤跨重启有效。
@@ -564,9 +587,11 @@ impl PartitionActor {
 
     fn on_deadline(&mut self) {
         let now = Instant::now();
-        // 本地 retention 周期触发（A3：时间 + 字节，分层关闭的分区）
+        // 本地 retention 周期触发（A3：时间 + 字节，分层关闭的分区）；
+        // 磁盘水位前置检查（A2）：含分层分区（本地 active 段同样占盘）
         if let Some(t) = self.next_retention_sweep {
             if now >= t {
+                self.watermark_check();
                 self.local_retention_sweep();
                 self.tiered_retention_sweep();
                 self.next_retention_sweep = Some(now + Duration::from_millis(self.retention_sweep_ms.max(100)));
@@ -1559,6 +1584,35 @@ impl PartitionActor {
                     }
                 }
             }
+        }
+    }
+
+    /// 磁盘水位前置检查（A2）：越过阈值主动进入 read_only（先于 ENOSPC，
+    /// 留出 retention/运维释放空间的窗口）。检查对 read_only 是权威的：
+    /// 低于水位即清除（含 ENOSPC 锁存——空间已可用，append 失败会再锁存）。
+    fn watermark_check(&mut self) {
+        if self.disk_watermark_pct == 0 {
+            return;
+        }
+        let Some(pct) = disk_used_pct(self.log.dir()) else {
+            return;
+        };
+        let over = over_disk_watermark(Some(pct), self.disk_watermark_pct);
+        let was = self
+            .read_only
+            .swap(over, std::sync::atomic::Ordering::Relaxed);
+        if over && !was {
+            tracing::error!(
+                topic = %self.name, partition = self.index,
+                usage_pct = pct, watermark_pct = self.disk_watermark_pct,
+                "disk over watermark: entering read-only (proactive)"
+            );
+        } else if !over && was {
+            tracing::info!(
+                topic = %self.name, partition = self.index,
+                usage_pct = pct, watermark_pct = self.disk_watermark_pct,
+                "disk below watermark: read-only cleared"
+            );
         }
     }
 
@@ -2581,5 +2635,29 @@ mod retry_storm_tests {
 
         drop(tx);
         let _ = std::fs::remove_dir_all(&dir);
+    }
+}
+
+#[cfg(test)]
+mod disk_watermark_tests {
+    //! A2：磁盘水位判定（纯函数面 + statvfs 实路径 sanity）。
+
+    use super::*;
+
+    #[test]
+    fn decision_threshold_semantics() {
+        assert!(over_disk_watermark(Some(95), 95), "等于阈值 = 越过");
+        assert!(over_disk_watermark(Some(100), 95));
+        assert!(!over_disk_watermark(Some(94), 95));
+        assert!(!over_disk_watermark(None, 95), "元数据不可读 = 保守放行（不误伤）");
+        assert!(!over_disk_watermark(Some(100), 0), "0 = 关闭");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn statvfs_sanity_on_real_dir() {
+        let dir = std::env::temp_dir();
+        let pct = disk_used_pct(&dir).expect("temp dir statvfs");
+        assert!(pct <= 100);
     }
 }

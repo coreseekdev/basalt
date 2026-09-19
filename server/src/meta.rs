@@ -47,6 +47,22 @@ impl RoutingTable {
         self.by_name.is_empty()
     }
 
+    /// topic 的分区号列表（share spike：订阅名 → 分区分配）
+    pub fn partitions_of(&self, topic: &str) -> Option<Vec<i32>> {
+        let mut parts: Vec<i32> = self
+            .by_name
+            .keys()
+            .filter(|(n, _)| n == topic)
+            .map(|(_, p)| *p)
+            .collect();
+        if parts.is_empty() {
+            None
+        } else {
+            parts.sort_unstable();
+            Some(parts)
+        }
+    }
+
     pub fn name_for(&self, id: u128) -> Option<String> {
         self.by_name
             .keys()
@@ -151,7 +167,7 @@ fn topic_meta_from_cluster(cluster: &ClusterState, name: &str) -> Option<TopicMe
 /// 与集群态无关的稳定 topic id（POC：名字哈希；删除重建刷新由控制器保证——
 /// 重建经 CreateTopic 记录，名字相同也会因哈希盐一致而相同 → POC 已知限制，
 /// 完整方案（M2）：topic id 存控制器 record）。
-fn topic_id_from(name: &str) -> u128 {
+pub fn topic_id_from(name: &str) -> u128 {
     let mut h: u128 = 0x9E3779B97F4A7C15;
     for b in name.bytes() {
         h ^= u128::from(b);

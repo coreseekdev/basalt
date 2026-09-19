@@ -5,6 +5,7 @@
 use crate::handlers::{self, Ctx, FetchTarget, ProduceTarget};
 use crate::handlers_consumer;
 use crate::handlers_groups;
+use crate::handlers_share;
 use crate::handlers_txn;
 use basalt_protocol::api::key;
 use basalt_protocol::codec;
@@ -492,6 +493,12 @@ async fn dispatch(
         key::LIST_TRANSACTIONS => (handlers_txn::list_transactions(&req, ctx).await, false, false),
         key::OFFSET_FOR_LEADER_EPOCH => (handlers::offset_for_leader_epoch(&req, ctx).await, false, false),
         key::CONSUMER_GROUP_HEARTBEAT => (handlers_consumer::consumer_group_heartbeat(&req, ctx).await, false, false),
+        key::SHARE_GROUP_HEARTBEAT => (handlers_share::share_group_heartbeat(&req, ctx).await, false, false),
+        key::SHARE_FETCH => {
+            let v = handlers_share::share_fetch(&req, ctx).await;
+            (v, false, false)
+        }
+        key::SHARE_ACKNOWLEDGE => (handlers_share::share_acknowledge(&req, ctx).await, false, false),
         key::CONSUMER_GROUP_DESCRIBE => (handlers_consumer::consumer_group_describe(&req, ctx).await, false, false),
         key::DESCRIBE_GROUPS => (handlers_groups::describe_groups(&req, ctx).await, false, false),
         key::LIST_GROUPS => (handlers_groups::list_groups(&req, ctx).await, false, false),

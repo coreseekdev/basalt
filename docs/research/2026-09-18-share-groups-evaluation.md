@@ -119,6 +119,22 @@ broker 拉通一轮 heartbeat/fetch/ack——验证协议面认知（尤其 Shar
 session epoch 与增量语义），再决定 b/c 细节。若 spike 揭示 schema 外的隐含
 约束（如 ack 顺序要求），回到本纪要修订。
 
+## 4.5 spike 结论（2026-09-19，GO ✅）
+
+块 a+ b 核心已落地（share_group.rs 状态机 + 76/78/79 三 handler + 内存
+交付面），franz-go v1.21.6 真客户端 e2e（run_share_spike.sh）四验收面全
+PASS：heartbeat 加入/分配 → fetch 交付 → AckAccept 后不重投 → AckRelease
+后重投递且 DeliveryCount=2。**协议面认知成立的 go 结论生效**，块 c（状态
+持久化）按原计划推进。
+
+spike 实证的两条协议语义（均为纪要预判风险的坐实）：
+1. **ShareFetch 沿用 KIP-227 增量会话**：franz-go 首轮全量后发
+   n_topics=0 的增量 fetch——服务端必须维护会话注册集并以之为服务面
+   （session_register 已实现）；「按请求 Topics 服务」不可行；
+2. **ShareSessionEpoch ≠ member epoch**：fetch/ack 不带 member epoch，
+   epoch 字段是会话计数——按 member-epoch fence 会误拒所有初始 fetch
+   （82），校验只做成员存在性（25）。
+
 ## 5. 风险
 
 1. **ShareFetch session 语义**（增量 vs 全量、ShareSessionEpoch 边界）——

@@ -37,6 +37,9 @@ pub mod key {
     pub const DELETE_RECORDS: i16 = 21;
     pub const CONSUMER_GROUP_HEARTBEAT: i16 = 68;
     pub const CONSUMER_GROUP_DESCRIBE: i16 = 69;
+    pub const SHARE_GROUP_HEARTBEAT: i16 = 76;
+    pub const SHARE_FETCH: i16 = 78;
+    pub const SHARE_ACKNOWLEDGE: i16 = 79;
 }
 
 /// 错误码（Kafka ErrorCodes）。
@@ -176,6 +179,11 @@ pub fn supported_versions() -> &'static [(i16, i16, i16)] {
         (key::DESCRIBE_ACLS, 1, 3),
         (key::CREATE_ACLS, 1, 3),
         (key::DELETE_ACLS, 1, 3),
+        // share groups（KIP-932 spike；fetch/ack v2 的 ShareAcquireMode/
+        // IsRenewAck 字段客户端可发但骨架按 v1 语义处理）
+        (key::SHARE_GROUP_HEARTBEAT, 1, 1),
+        (key::SHARE_FETCH, 1, 2),
+        (key::SHARE_ACKNOWLEDGE, 1, 2),
         // KIP-848 新消费组协议（ADR-19 块 b/c）：heartbeat 宣告 0-1——
         // franz-go v1.21 的 should848 硬性 supportsKIP848v1()（只认 broker
         // 宣告 max≥1，v0 宣告 = 客户端静默回退 classic 路径）。v1 差异：

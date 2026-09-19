@@ -34,7 +34,7 @@ pub struct FetchOutcome {
 }
 
 impl FetchOutcome {
-    fn err(e: StorageError, lso: i64) -> FetchOutcome {
+    pub fn err(e: StorageError, lso: i64) -> FetchOutcome {
         FetchOutcome { result: None, error: Some(e), last_stable_offset: lso }
     }
 }

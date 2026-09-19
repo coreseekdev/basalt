@@ -123,6 +123,9 @@ impl Registry {
                     key::SASL_HANDSHAKE => "SaslHandshake",
                     key::SASL_AUTHENTICATE => "SaslAuthenticate",
                     key::CONSUMER_GROUP_HEARTBEAT => "ConsumerGroupHeartbeat",
+                    key::SHARE_GROUP_HEARTBEAT => "ShareGroupHeartbeat",
+                    key::SHARE_FETCH => "ShareFetch",
+                    key::SHARE_ACKNOWLEDGE => "ShareAcknowledge",
                     key::CONSUMER_GROUP_DESCRIBE => "ConsumerGroupDescribe",
                     _ => "Unknown",
                 };

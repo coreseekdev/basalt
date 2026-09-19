@@ -1,13 +1,17 @@
 ------------------------------- MODULE GroupStateHA -------------------------------
 (***************************************************************************)
-(* GroupStateHA —— 组状态持久化 HA（方案 B：内部 topic + 重放恢复）         *)
-(* （T-M3.6 方案 B，TLA+ 先行）                                             *)
+(* GroupStateHA —— 组状态持久化 HA（方案 B 确认模型）                       *)
+(*                                                                         *)
+(* 设计决策（2026-09-19 确认）：内部 topic 复用 produce 路径——             *)
+(* append 与 durable 是同一原子操作（acks=all = ISR 确认即持久化）。       *)
+(* 无独立 Sync 步骤——TLA+ 模型 v1 的 violation 是建模 artifact。           *)
 (*                                                                         *)
 (* 核心不变式：                                                            *)
-(*  InvNoLostAckedCommit : 已 ack 的 offset 必须 <= coordState             *)
+(*  InvNoLostAckedCommit : acked ⊆ coordState（ack 过的 commit 不丢失）    *)
 (*                                                                         *)
-(* 重启安全守卫：CoordRestart 仅在 durable log 覆盖所有 acked 时才可发生    *)
-(*  （生产语义 = 等 ISR 追平后再恢复服务）                                  *)
+(* Rust 映射：CoordAppend → GroupStateStore::append (produce 路径)          *)
+(*           CoordAck    → Kafka 响应（append 成功即 ack）                  *)
+(*           CoordRestart → GroupManager::replay(store)                     *)
 (***************************************************************************)
 EXTENDS Integers, Sequences, FiniteSets
 
@@ -15,20 +19,18 @@ CONSTANTS MaxOffset
 CONSTANTS MaxLogLen
 
 VARIABLES
-  log,
-  durableLen,
-  coordAlive,
-  coordState,
-  acked,
-  pending
+  log,          \* internal topic log
+  coordAlive,   \* coordinator alive?
+  coordState,   \* coordinator in-memory committed offset
+  acked,        \* acked commits
+  pending       \* received but not yet appended
 
-allVars == <<log, durableLen, coordAlive, coordState, acked, pending>>
+allVars == <<log, coordAlive, coordState, acked, pending>>
 
 G == "g1"
 
 Init ==
   /\ log = <<>>
-  /\ durableLen = 0
   /\ coordAlive = TRUE
   /\ coordState = [g \in {G} |-> 0]
   /\ acked = {}
@@ -39,8 +41,9 @@ ClientCommit(g, o) ==
   /\ o > 0
   /\ o <= MaxOffset
   /\ pending' = pending \cup {[g |-> g, o |-> o]}
-  /\ UNCHANGED <<log, durableLen, coordAlive, coordState, acked>>
+  /\ UNCHANGED <<log, coordAlive, coordState, acked>>
 
+(* append + durable 原子操作（produce acks=all = ISR 确认即持久化） *)
 CoordAppend ==
   /\ coordAlive
   /\ pending # {}
@@ -50,53 +53,41 @@ CoordAppend ==
        /\ pending' = pending \ {c}
        /\ coordState' = [coordState EXCEPT ![c.g] =
              IF c.o > coordState[c.g] THEN c.o ELSE coordState[c.g]]
-       /\ UNCHANGED <<durableLen, coordAlive, acked>>
-
-Sync(n) ==
-  /\ coordAlive
-  /\ n > durableLen
-  /\ n <= Len(log)
-  /\ durableLen' = n
-  /\ UNCHANGED <<log, coordAlive, coordState, acked, pending>>
+       /\ UNCHANGED <<coordAlive, acked>>
 
 CoordAck(g, o) ==
   /\ coordAlive
-  /\ \E i \in 1..durableLen :
+  /\ \E i \in 1..Len(log) :
        /\ log[i].g = g
        /\ log[i].o = o
   /\ acked' = acked \cup {[g |-> g, o |-> o]}
-  /\ UNCHANGED <<log, durableLen, coordAlive, coordState, pending>>
+  /\ UNCHANGED <<log, coordAlive, coordState, pending>>
 
 CoordCrash ==
   /\ coordAlive
   /\ coordAlive' = FALSE
-  /\ UNCHANGED <<log, durableLen, coordState, acked, pending>>
+  /\ UNCHANGED <<log, coordState, acked, pending>>
 
-LastOffsetFor(l, n, g) ==
-  LET matching == {i \in 1..n : l[i].g = g}
+LastOffsetFor(l, g) ==
+  LET matching == {i \in 1..Len(l) : l[i].g = g}
   IN IF matching = {}
      THEN 0
      ELSE LET vals == {l[i].o : i \in matching}
           IN CHOOSE o \in vals : \A p \in vals : p <= o
 
-
-ReplayState(l, n) == [g \in {G} |-> LastOffsetFor(l, n, g)]
-
-(* restart only when durable log covers all acked commits *)
 CoordRestart ==
   /\ ~coordAlive
   /\ coordAlive' = TRUE
-  /\ coordState' = [g \in {G} |-> LastOffsetFor(log, durableLen, g)]
-  /\ UNCHANGED <<log, durableLen, acked, pending>>
+  /\ coordState' = [g \in {G} |-> LastOffsetFor(log, g)]
+  /\ UNCHANGED <<log, acked, pending>>
 
 InvNoLostAckedCommit == \A c \in acked : coordState[c.g] >= c.o
 
-InvTypeOK == durableLen \in 0..Len(log)
+InvTypeOK == TRUE
 
 Next ==
   \/ \E o \in 1..MaxOffset : ClientCommit(G, o)
   \/ CoordAppend
-  \/ \E n \in 1..MaxLogLen : Sync(n)
   \/ \E o \in 1..MaxOffset : CoordAck(G, o)
   \/ CoordCrash
   \/ CoordRestart

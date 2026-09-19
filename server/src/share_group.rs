@@ -62,90 +62,58 @@ struct ShareGroup {
 
 static GROUPS: std::sync::Mutex<Option<HashMap<String, ShareGroup>>> = std::sync::Mutex::new(None);
 
-// ---- 持久化（块 c，评估纪要 §3.2）：data_dir/share-state/{group-file}.json
-// 记 cursor/archived/delivery_counts（accepted 由 cursor 蕴含）；acquired
-// 为瞬态（重启 = 全员锁过期，回到可交付）。acknowledge 变更即落盘；
-// acquire 不落盘（重启丢失至多一次计数增量，§3.2 决策）。
+// ---- 持久化（B4）：__share_group_state 内部 topic 事件流 + 重放。
+// ACK 事件（accept/release/reject）在 acknowledge 变更后经 SHARE_SINK
+// 通道异步下沉（produce 路径，acks=all）；acquired 锁为瞬态（重启 =
+// 全员锁过期，回到可交付——§3.2 决策）。启动时由 main 的监督任务重放
+// 分区数据 install_replay 重建 cursor/archived。
+// 多节点边界（B5 面）：事件只在内部 topic 分区 leader 节点持久化——
+// 非 leader 节点 receive 的 ack 照常服务内存视图但不落盘（spike 语义）。
 
-#[derive(serde::Serialize, serde::Deserialize)]
-struct PersistPartition {
-    topic_id: u128,
-    partition: i32,
-    cursor: i64,
-    archived: Vec<(i64, i64)>,
-    counts: HashMap<i64, i16>,
+/// 单条 share 状态事件：(group, topic_id, partition, first, last, ack_type)。
+pub type ShareEvent = (String, u128, i32, i64, i64, i8);
+
+static SHARE_SINK: std::sync::RwLock<Option<tokio::sync::mpsc::Sender<ShareEvent>>> =
+    std::sync::RwLock::new(None);
+
+/// main 监督任务在内部 topic 路由就绪后注入（仅 leader 节点注入）；
+/// failover 升主后重绑（旧通道随 drop 关闭，下游任务自然退出）。
+pub fn set_share_sink(tx: tokio::sync::mpsc::Sender<ShareEvent>) {
+    if let Ok(mut w) = SHARE_SINK.write() {
+        *w = Some(tx);
+    }
 }
 
-#[derive(serde::Serialize, serde::Deserialize)]
-struct PersistGroup {
-    group: String,
-    partitions: Vec<PersistPartition>,
-}
-
-static STATE_DIR: std::sync::OnceLock<String> = std::sync::OnceLock::new();
-
-pub fn set_data_dir(dir: &str) {
-    let _ = STATE_DIR.set(dir.to_string());
-}
-
-/// 启动装载：扫描 share-state/*.json 重建 cursor/archived/counts
-pub fn load_from_dir(dir: &str) {
-    let _ = STATE_DIR.set(dir.to_string());
-    let sdir = std::path::Path::new(dir).join("share-state");
-    let Ok(entries) = std::fs::read_dir(&sdir) else { return };
-    let mut restored: Vec<PersistGroup> = Vec::new();
-    for e in entries.flatten() {
-        if let Ok(text) = std::fs::read_to_string(e.path()) {
-            if let Ok(pg) = serde_json::from_str::<PersistGroup>(&text) {
-                restored.push(pg);
+fn emit_events(events: &[ShareEvent]) {
+    if events.is_empty() {
+        return;
+    }
+    let sink = SHARE_SINK.read().ok().and_then(|w| w.clone());
+    if let Some(tx) = sink {
+        for e in events {
+            if let Err(e) = tx.try_send(e.clone()) {
+                tracing::warn!(error = %e, "share event sink full; event dropped");
             }
         }
     }
-    if restored.is_empty() {
-        return;
-    }
+}
+
+/// 重放安装：按序重应用事件（与在线 acknowledge 同一状态机语义；
+/// acquired 为空 → release/reject 的锁清理自然 no-op）。
+pub fn install_replay(events: Vec<ShareEvent>) {
     let mut g = groups();
-    for pg in &restored {
-        let sg = group_mut(&mut g, &pg.group);
-        for pp in &pg.partitions {
-            let p = sg.parts.entry((pp.topic_id, pp.partition)).or_default();
-            p.cursor = pp.cursor;
-            p.archived = pp.archived.clone();
-            for (f, c) in pp.counts.clone() {
-                p.delivery_counts.insert(f, c);
-            }
+    let mut applied = 0usize;
+    for (group, tid, partition, first, last, ty) in events {
+        let sg = group_mut(&mut g, &group);
+        let p = sg.parts.entry((tid, partition)).or_default();
+        if apply_ack(p, "", first, last, ty) {
+            applied += 1;
         }
     }
-    tracing::info!(groups = restored.len(), "share state loaded");
+    drop(g);
+    tracing::info!(events = applied, "share state replayed from internal topic");
 }
 
-fn persist_group(group: &str, sg: &ShareGroup) {
-    let Some(dir) = STATE_DIR.get() else { return };
-    let sdir = std::path::Path::new(dir).join("share-state");
-    if std::fs::create_dir_all(&sdir).is_err() {
-        return;
-    }
-    // 文件名安全化：组名非 [A-Za-z0-9._-] 字符以 hex 替换
-    let safe: String = group
-        .chars()
-        .map(|c| if c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-') { c.to_string() } else { format!("%{:02X}", c as u32) })
-        .collect();
-    let partitions: Vec<PersistPartition> = sg
-        .parts
-        .iter()
-        .map(|((tid, p), st)| PersistPartition {
-            topic_id: *tid,
-            partition: *p,
-            cursor: st.cursor,
-            archived: st.archived.clone(),
-            counts: st.delivery_counts.clone(),
-        })
-        .collect();
-    let pg = PersistGroup { group: group.to_string(), partitions };
-    if let Ok(json) = serde_json::to_string_pretty(&pg) {
-        let _ = std::fs::write(sdir.join(format!("{safe}.json")), json);
-    }
-}
 
 /// fetch 会话（KIP-932 沿用 KIP-227 增量语义）：epoch 0 全量注册，≥1 增量
 /// ——请求只带变化分区，服务端须以**会话注册集**为服务面（franz-go 首轮
@@ -369,84 +337,63 @@ pub fn acknowledge(
     let mut g = groups();
     let sg = group_mut(&mut g, group);
     let p = sg.parts.entry((tid, partition)).or_default();
-    let mut applied = 0usize;
+    let mut events: Vec<ShareEvent> = Vec::new();
     for (first, last, types) in batches {
         let ty = types.first().copied().unwrap_or(ACK_ACCEPT);
-        match ty {
-            ACK_ACCEPT => {
-                let before = p.acquired.len();
-                p.acquired.retain(|a| {
-                    !(a.member == member && a.first >= *first && a.last <= *last)
-                });
-                // 合并 accepted 区间 + 游标沿连续段推进（区间含头不含尾）
-                p.accepted.push((*first, *last + 1));
-                p.accepted.sort_unstable();
-                let mut merged: Vec<(i64, i64)> = Vec::new();
-                for (f, l) in &p.accepted {
-                    match merged.last_mut() {
-                        Some(last_mut) if *f <= last_mut.1 => {
-                            if *l > last_mut.1 {
-                                last_mut.1 = *l;
-                            }
-                        }
-                        _ => merged.push((*f, *l)),
-                    }
-                }
-                p.accepted = merged;
-                for (f, l) in &p.accepted {
-                    if *f <= p.cursor && *l > p.cursor {
-                        p.cursor = *l;
-                    }
-                }
-                applied += 1;
-            }
-            ACK_RELEASE => {
-                p.acquired.retain(|a| {
-                    !(a.member == member && a.first >= *first && a.last <= *last)
-                });
-                // 交付计数语义：release 后 cursor 不动 → 下轮重新交付
-                applied += 1;
-            }
-            ACK_REJECT => {
-                p.acquired.retain(|a| {
-                    !(a.member == member && a.first >= *first && a.last <= *last)
-                });
-                p.archived.push((*first, *last));
-                applied += 1;
-            }
-            _ => {}
+        if apply_ack(p, member, *first, *last, ty) {
+            events.push((group.to_string(), tid, partition, *first, *last, ty));
         }
     }
-    if applied > 0 {
-        if let Some(dir) = STATE_DIR.get() {
-            persist_group_snapshot(group, sg);
-        }
-    }
-    applied
+    drop(g);
+    emit_events(&events);
+    events.len()
 }
 
-/// 快照落盘（acknowledge 变更后调用）
-fn persist_group_snapshot(group: &str, sg: &ShareGroup) {
-    let partitions: Vec<PersistPartition> = sg
-        .parts
-        .iter()
-        .map(|((tid, p), st)| PersistPartition {
-            topic_id: *tid,
-            partition: *p,
-            cursor: st.cursor,
-            archived: st.archived.clone(),
-            counts: st.delivery_counts.clone(),
-        })
-        .collect();
-    let pg = PersistGroup { group: group.to_string(), partitions };
-    if let Ok(json) = serde_json::to_string_pretty(&pg) {
-        let safe: String = group
-            .chars()
-            .map(|c| if c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-') { c.to_string() } else { format!("%{:02X}", c as u32) })
-            .collect();
-        let sdir = std::path::Path::new(STATE_DIR.get().map(|s| s.as_str()).unwrap_or(".")).join("share-state");
-        let _ = std::fs::create_dir_all(&sdir);
-        let _ = std::fs::write(sdir.join(format!("{safe}.json")), json);
+/// 单条 ack 的状态机应用（在线 acknowledge 与重放 install_replay 共用）。
+/// 返回是否构成一次有效变更。
+fn apply_ack(p: &mut SharePartition, member: &str, first: i64, last: i64, ty: i8) -> bool {
+    match ty {
+        ACK_ACCEPT => {
+            p.acquired.retain(|a| {
+                !(a.member == member && a.first >= first && a.last <= last)
+            });
+            // 合并 accepted 区间 + 游标沿连续段推进（区间含头不含尾）
+            p.accepted.push((first, last + 1));
+            p.accepted.sort_unstable();
+            let mut merged: Vec<(i64, i64)> = Vec::new();
+            for (f, l) in &p.accepted {
+                match merged.last_mut() {
+                    Some(last_mut) if *f <= last_mut.1 => {
+                        if *l > last_mut.1 {
+                            last_mut.1 = *l;
+                        }
+                    }
+                    _ => merged.push((*f, *l)),
+                }
+            }
+            p.accepted = merged;
+            for (f, l) in &p.accepted {
+                if *f <= p.cursor && *l > p.cursor {
+                    p.cursor = *l;
+                }
+            }
+            true
+        }
+        ACK_RELEASE => {
+            p.acquired.retain(|a| {
+                !(a.member == member && a.first >= first && a.last <= last)
+            });
+            // 交付计数语义：release 后 cursor 不动 → 下轮重新交付
+            true
+        }
+        ACK_REJECT => {
+            p.acquired.retain(|a| {
+                !(a.member == member && a.first >= first && a.last <= last)
+            });
+            p.archived.push((first, last));
+            true
+        }
+        _ => false,
     }
 }
 

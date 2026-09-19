@@ -127,6 +127,11 @@ Basalt：Rust 版 Kafka 兼容消息流平台
 
 ---
 
+## 评审与评估（2026-09-19）
+
+- **生产就绪评估 ✅**：[docs/assessment/production-readiness-20260919.md](docs/assessment/production-readiness-20260919.md)——P0 缺口五项（内部口无鉴权/断电窗口/组协调 HA/观测缺口/磁盘满）、解耦结论（主路径不存在，风险集中在连接内混用与管理面三单 actor）、可观测框架 L1-L5 分层设计。
+- **速赢落地 ✅**：消费指标补齐（messages/bytes_consumed 恒 0 假观测修复）、METRICS_PORT=0 语义（关闭而非随机端口）、/health + /ready 端点、26 处 eprintln 迁移 tracing（核心面清零；ctrl_raft 引擎 13 + 测试 harness 3 列为已知债）。
+
 ## 当前状态
 
 - **里程碑**：T-0 → M0（未开始功能开发）

@@ -652,6 +652,19 @@ pub async fn fetch(
         // AbortedTransactions（ADR-18 §4.2 投递模型 (b)）：服务端已预过滤
         // aborted 批，恒发空数组——客户端无需条目（四档实测兼容）。
         let aborted_val = Value::Array(vec![]);
+        // 消费计数（可观测 L1：此前 messages/bytes_consumed 恒 0——
+        // dead_code，fetch 路径从未递增）。记录数按批头解析（批粒度累计）
+        if !data.is_empty() {
+            let m = crate::partition::metrics();
+            m.bytes_consumed.fetch_add(data.len() as u64, std::sync::atomic::Ordering::Relaxed);
+            let mut pos = 0usize;
+            while let Some(h) = basalt_record::BatchHeader::parse(&data[pos..]) {
+                let total = h.total_len();
+                if total == 0 || pos + total > data.len() { break; }
+                m.messages_consumed.fetch_add(h.record_count.max(0) as u64, std::sync::atomic::Ordering::Relaxed);
+                pos += total;
+            }
+        }
         let entry = s([
             ("PartitionIndex", Value::I32(t.partition)),
             ("ErrorCode", Value::I16(err as i16)),

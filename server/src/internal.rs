@@ -255,7 +255,7 @@ impl Controller {
     /// 非 raft leader 的提案会被引擎拒绝——调用方（run 循环）仅在
     /// is_leader 时行使职权，此处有限重试即可。
     fn engine_propose(&self, rec: &ClusterRecord) -> Result<(), String> {
-        eprintln!("PROPOSE node={} rec={:?}", self.node_id, std::mem::discriminant(rec));
+        tracing::debug!(node = self.node_id, "controller propose");
         let Some(engine) = &self.engine else {
             return Err("engine disabled".into());
         };
@@ -286,7 +286,7 @@ impl Controller {
                             Err(m) => {
                                 // 转发目标瞬态失败（对端选举中/未就绪）——可重试，
                                 // 不能硬返回（否则注册类变更在启动窗口永久丢失）
-                                eprintln!("FWD node={} to={} err={}", self.node_id, leader, m);
+                                tracing::warn!(node = self.node_id, to = leader, error = %m, "controller propose forward failed");
                                 std::thread::sleep(Duration::from_millis(150));
                             }
                         }
@@ -306,7 +306,7 @@ impl Controller {
         let Some(addr) = self.peers.get(&leader) else {
             return Err(format!("no peer addr for leader {leader}"));
         };
-        eprintln!("FWD-BEGIN node={} -> leader={}", self.node_id, leader);
+        tracing::debug!(node = self.node_id, leader, "controller propose forward");
         let payload = encode_record(rec);
         let mut frame = ((payload.len() + 1) as u32).to_be_bytes().to_vec();
         frame.push(MSG_CTRL_PROPOSE);
@@ -372,7 +372,7 @@ impl Controller {
     }
 
     async fn run(mut self) {
-        eprintln!("CTRL-LOOP node={} engine={} start", self.node_id, self.engine.is_some());
+        tracing::info!(node = self.node_id, engine = self.engine.is_some(), "controller loop started");
         loop {
             match tokio::time::timeout(Duration::from_millis(500), self.rx.recv()).await {
                 Ok(Some(cmd)) => {
@@ -441,7 +441,7 @@ impl Controller {
                 });
             }
             ControllerCmd::CreateTopic { name, partitions, rf, tiered, reply } => {
-                eprintln!("CTRL-CREATE node={} name={}", self.node_id, name);
+                tracing::info!(node = self.node_id, topic = %name, "topic create via controller");
                 let exists = self.state.assignments.iter().any(|a| a.topic == name);
                 // rf 守卫：多副本建题时 broker 未注册齐会按不完整集群算
                 // 副本（apply 里 rf 被 min 到 broker 数）——拒绝本次，
@@ -515,17 +515,16 @@ impl Controller {
                         Ok(())
                     }
                     Some(a) => {
-                        eprintln!(
-                            "TRANSFER-REJECT node={} topic={} to={} leader={} replicas={:?} alive={}",
-                            self.node_id, topic, to, a.leader, a.replicas, alive
-                        );
+                        tracing::warn!(
+                            node = self.node_id, topic = %topic, to, leader = a.leader,
+                            replicas = ?a.replicas, alive, "leader transfer rejected: target not eligible");
                         Err("transfer target not eligible".into())
                     }
                     None => {
-                        eprintln!(
-                            "TRANSFER-MISS node={} topic={} assignments={}",
-                            self.node_id, topic, self.state.assignments.len()
-                        );
+                        tracing::warn!(
+                            node = self.node_id, topic = %topic,
+                            assignments = self.state.assignments.len(),
+                            "leader transfer rejected: assignment not found");
                         Err("assignment not found".into())
                     }
                 };
@@ -546,8 +545,11 @@ impl Controller {
             let alive: Vec<i32> = self.last_heartbeat.iter()
                 .filter(|(_, t)| now.duration_since(**t) <= self.heartbeat_timeout)
                 .map(|(id, _)| *id).collect();
-            eprintln!("FC node={} authority={} state_ver={} alive={:?} assignments={}",
-                self.node_id, self.has_engine_authority(), self.state.version, alive, self.state.assignments.len());
+            tracing::debug!(
+                node = self.node_id, authority = self.has_engine_authority(),
+                version = self.state.version, alive = ?alive,
+                assignments = self.state.assignments.len(),
+                "failover check");
         }
         // 控制器自身：免死 + 常驻 alive（无独立心跳线程，每次检查时刷新）
         self.last_heartbeat.insert(self.node_id, now);
@@ -826,7 +828,7 @@ async fn handle_internal_conn(
             MSG_REGISTER => {
                 static N: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
                 let n = N.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                eprintln!("INT-REG node={} n={}", ctx.node_id, n);
+                tracing::debug!(node = ctx.node_id, brokers = n, "internal register");
                 let Ok((node_id, host, port)) = parse_register(payload) else {
                     sock.write_all(&short_frame()).await?;
                     return Ok(());
@@ -845,7 +847,7 @@ async fn handle_internal_conn(
                 static N: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
                 let n = N.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                 if n % 20 == 0 {
-                    eprintln!("INT-HB node={} n={}", ctx.node_id, n);
+                    tracing::debug!(node = ctx.node_id, brokers = n, "internal heartbeat");
                 }
                 if payload.len() < 4 {
                     sock.write_all(&short_frame()).await?;
@@ -1035,7 +1037,7 @@ async fn handle_internal_conn(
             }
             MSG_RAFT => {
                 // 接收探针：确认 wire 帧到达接收端
-                eprintln!("RAFT-RECV payload_len={} first={:?} engine={}", payload.len(), &payload[..std::cmp::min(4, payload.len())], crate::ctrl_raft::raftrs_engine::engine_enabled());
+                tracing::debug!(payload_len = payload.len(), engine = crate::ctrl_raft::raftrs_engine::engine_enabled(), "raft payload received");
                 if crate::ctrl_raft::raftrs_engine::engine_enabled() {
                     crate::ctrl_raft::raftrs_engine::deliver_wire(payload.to_vec());
                 }
@@ -1043,7 +1045,7 @@ async fn handle_internal_conn(
             }
             MSG_CTRL_PROPOSE => {
                 // 引擎模式 propose 转发落地：解码记录交本节点 controller propose
-                eprintln!("FWD-ARRIVE node={} payload_len={}", ctx.node_id, payload.len());
+                tracing::debug!(node = ctx.node_id, payload_len = payload.len(), "raft propose forwarded");
                 let ok = match decode_record(payload) {
                     Some(rec) => {
                         if let Some(tx) = &ctx.controller_tx {

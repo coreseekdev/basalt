@@ -42,6 +42,11 @@ impl RoutingTable {
     /// TopicId，组状态机以名字为键）。topic id 是名字哈希（topic_id_from），
     /// 故由 by_name 键派生反查——零新增状态面，免三表同步失联（㊽ 族教训）；
     /// 心跳频率低（5s 档）+ POC topic 量级小，线性扫描可接受。
+    /// 路由是否为空（readiness 面：空 = 控制器快照尚未应用）
+    pub fn is_empty(&self) -> bool {
+        self.by_name.is_empty()
+    }
+
     pub fn name_for(&self, id: u128) -> Option<String> {
         self.by_name
             .keys()
@@ -591,7 +596,7 @@ impl FollowerPull {
             return;
         };
         tracing::info!(topic=%self.topic, partition=self.partition, leader=self.leader, start=next_offset, "follower pull started");
-        eprintln!("PULL-START t={} p={} addr={}", self.topic, self.partition, self.leader_addr);
+        tracing::debug!(topic = %self.topic, partition = self.partition, addr = %self.leader_addr, "follower pull started");
         loop {
             if self.stop_requested() {
                 tracing::info!(topic=%self.topic, partition=self.partition, "follower pull stopped");
@@ -619,7 +624,7 @@ impl FollowerPull {
                         next_offset = res.leader_next_offset;
                         continue;
                     }
-                    eprintln!("PULL t={} p={} off={} got={}B hw={} lnext={}", self.topic, self.partition, next_offset, res.data.len(), res.high_watermark, res.leader_next_offset);
+                    tracing::debug!(topic = %self.topic, partition = self.partition, offset = next_offset, bytes = res.data.len(), hw = res.high_watermark, "follower pull batch");
                     if !res.data.is_empty() {
                         let (tx, rx) = oneshot::channel();
                         if self
@@ -637,7 +642,7 @@ impl FollowerPull {
                         }
                         match rx.await {
                             Ok(out) => {
-                                eprintln!("PULL-ACK t={} p={} err={:?} last={}", self.topic, self.partition, out.error.is_some(), out.last_offset);
+                                tracing::debug!(topic = %self.topic, partition = self.partition, errored = out.error.is_some(), last = out.last_offset, "follower pull acked");
                                 if out.error.is_none() {
                                     next_offset = out.last_offset + 1;
                                     // T-M2.5 in-flight 重复投递注入：同一切片重放一次。
@@ -669,7 +674,7 @@ impl FollowerPull {
                     }
                 }
                 Err(e) => {
-                    eprintln!("PULL-ERR t={} p={} {}", self.topic, self.partition, e);
+                    tracing::warn!(topic = %self.topic, partition = self.partition, error = %e, "follower pull failed");
                     tracing::debug!(topic=%self.topic, error=%e, "pull failed, retrying");
                     tokio::time::sleep(std::time::Duration::from_millis(500)).await;
                 }

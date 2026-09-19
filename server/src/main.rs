@@ -329,14 +329,42 @@ async fn async_main(cfg: Config) {
         });
     }
 
-    // Metrics HTTP 端点（Prometheus 格式）
+    // Metrics HTTP 端点（Prometheus 格式）；BASALT_METRICS_PORT=0 = 关闭
+    // （此前 0 语义为绑随机端口——e2e 全部传 0 期望关闭，实际每次起一个
+    // 无人访问的 listener，可观测速赢）
     let metrics_port: u16 = std::env::var("BASALT_METRICS_PORT").ok().and_then(|v| v.parse().ok()).unwrap_or(9094);
+    if metrics_port == 0 {
+        tracing::info!("metrics endpoint disabled (BASALT_METRICS_PORT=0)");
+    }
     let metrics_listener = tokio::net::TcpListener::bind(format!("0.0.0.0:{metrics_port}")).await.expect("bind metrics");
     tokio::spawn(async move {
         use tokio::io::AsyncWriteExt;
         loop {
             let Ok((mut sock, _)) = metrics_listener.accept().await else { break };
             tokio::spawn(async move {
+                use tokio::io::AsyncReadExt;
+                let mut buf = [0u8; 1024];
+                let path = match sock.peek(&mut buf).await {
+                    _ if false => String::new(),
+                    Ok(n) => String::from_utf8_lossy(&buf[..n]).to_string(),
+                    Err(_) => String::new(),
+                };
+                // 健康面：GET /health = 进程活着（liveness）；GET /ready =
+                // 路由非空（readiness——控制器快照已应用，可服务客户端）
+                if path.starts_with("GET /health") {
+                    let resp = "HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nok";
+                    let _ = sock.write_all(resp.as_bytes()).await;
+                    let _ = sock.shutdown().await;
+                    return;
+                }
+                if path.starts_with("GET /ready") {
+                    let ready = CTX.get().map(|c| !c.routes().is_empty()).unwrap_or(false);
+                    let (code, body) = if ready { ("200", "ready") } else { ("503", "empty-routing") };
+                    let resp = format!("HTTP/1.1 {code} OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len());
+                    let _ = sock.write_all(resp.as_bytes()).await;
+                    let _ = sock.shutdown().await;
+                    return;
+                }
                 let m = crate::partition::metrics();
                 let produced = m.messages_produced.load(std::sync::atomic::Ordering::Relaxed);
                 let bytes_p = m.bytes_produced.load(std::sync::atomic::Ordering::Relaxed);
@@ -408,12 +436,12 @@ async fn async_main(cfg: Config) {
                 .map(|(id, addr)| (*id, internal::InternalClient::new(addr.clone())))
                 .collect();
             tokio::spawn(async move {
-                eprintln!("HB-LOOP node={} peers={:?}", hb_node, hb_peers);
+                tracing::debug!(node = hb_node, peers = ?hb_peers, "heartbeat loop started");
                 loop {
                     for (pid, pc) in &hb_clients {
                         if !internal::blocked_peers().contains(pid) {
                             if let Err(e) = pc.heartbeat(hb_node).await {
-                                eprintln!("HB-ERR node={} to={} err={}", hb_node, pid, e);
+                                tracing::warn!(node = hb_node, to = pid, error = %e, "heartbeat failed");
                             }
                         }
                     }
@@ -431,7 +459,7 @@ async fn async_main(cfg: Config) {
                     if let Some(state) = basalt_metadata::cluster::ClusterState::decode(&data) {
                         if state.version > last_version || state.assignments.len() > 0 {
                             if state.version != last_version {
-                                eprintln!("SYNC node={} ver={}", sync_cfg.node_id, state.version);
+                                tracing::debug!(node = sync_cfg.node_id, version = state.version, "cluster snapshot applied");
                             }
                             last_version = state.version;
                             let _ = meta_tx_sync.send(meta::MetaCmd::ApplyCluster(Box::new(state))).await;

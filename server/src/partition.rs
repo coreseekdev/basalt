@@ -578,7 +578,7 @@ impl PartitionActor {
         while i < self.parked_acks.len() {
             if self.parked_acks[i].deadline <= now {
                 if std::env::var("BASALT_LEO_PROBE").is_ok() {
-                    eprintln!("ACK-DEADLINE t={} p={} last={}", self.name, self.index, self.parked_acks[i].last_offset);
+                    tracing::warn!(topic = %self.name, partition = self.index, last = self.parked_acks[i].last_offset, "acked deadline exceeded → NotEnoughReplicas");
                 }
                 let p = self.parked_acks.remove(i);
                 let _ = p.reply.send(ProduceOutcome {
@@ -934,7 +934,7 @@ impl PartitionActor {
                     // follower 的拉取起点即其 LEO：记录（>=0）并推进 HW
                     if offset >= 0 {
                         if std::env::var("BASALT_LEO_PROBE").is_ok() {
-                            eprintln!("LEO-REPORT t={} p={} from={} leo={}", self.name, self.index, follower, offset);
+                            tracing::debug!(topic = %self.name, partition = self.index, follower, leo = offset, "follower LEO report");
                         }
                         // ISR 重回（账本 ㉟）：不在 ISR 的 follower 只有完全
                         // 追平（offset ≥ next_offset）才重回；落后者只记 LEO
@@ -1157,7 +1157,7 @@ impl PartitionActor {
         let new_hw = self.log.next_offset.min(min_leo);
         if new_hw > self.log.high_watermark {
             if std::env::var("BASALT_LEO_PROBE").is_ok() {
-                eprintln!("HW-ADV t={} p={} hw={} isr={:?}", self.name, self.index, new_hw, self.isr);
+                tracing::debug!(topic = %self.name, partition = self.index, hw = new_hw, isr = ?self.isr, "HW advanced");
             }
             self.log.high_watermark = new_hw;
         }
@@ -1291,7 +1291,7 @@ impl PartitionActor {
     /// 事务批成功 append 后的开/续事务登记。
     fn txn_register(&mut self, pid: i64, epoch: i16, base: i64, last: i64) {
         if std::env::var("BASALT_LEO_PROBE").is_ok() {
-            eprintln!("DBG-REG t={} p={} pid={} epoch={} base={} last={}", self.name, self.index, pid, epoch, base, last);
+            tracing::trace!(topic = %self.name, partition = self.index, pid, epoch, base, last, "idem registered");
         }
         match self.txn_open.get(&pid).map(|t| (t.epoch, t.first_offset, t.last_offset)) {
             Some((e, _first, _)) if e == epoch => {
@@ -1666,15 +1666,11 @@ impl PartitionActor {
     /// 应用永不见控制记录）+ read_committed 再剥 aborted 区间并汇总条目。
     fn read_for(&mut self, offset: i64, max_bytes: usize, iso: Isolation) -> FetchOutcome {
         let cap = self.cap_for(iso);
-        let probe = (offset, max_bytes, cap);
         if let Some(out) = self.read_through_tiered(offset, max_bytes, cap, iso == Isolation::ReadCommitted) {
             return out;
         }
         match self.log.read_ex(offset, max_bytes, &self.pool, ReadCap::At(cap)) {
-            Err(e) => {
-                eprintln!("PROBE-FETCH actor={}/{} off={} max={} cap={} next={} repl={} => {:?}", self.name, self.index, probe.0, probe.1, probe.2, self.log.next_offset, self.log.replicated, e);
-                FetchOutcome::err(e, self.lso)
-            }
+            Err(e) => FetchOutcome::err(e, self.lso),
             Ok(r) => {
                 let data = self.filter_batches(r.data, iso == Isolation::ReadCommitted);
                 FetchOutcome {

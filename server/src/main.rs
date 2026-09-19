@@ -145,6 +145,10 @@ async fn async_main(cfg: Config) {
         node_id = cfg.node_id, port = cfg.port, data = %cfg.data_dir,
         controller = ?ctrl.as_ref().map(|(id, _, _)| *id), is_controller, "basalt starting"
     );
+    tracing::info!(
+        fsync = ?crate::meta::fsync_schedule_from(std::env::var("BASALT_FSYNC").ok().as_deref()),
+        "fsync schedule resolved"
+    );
     if crate::sasl::auth_enabled() {
         // 空用户表 = 所有认证必败：scram 模式下的配置疏漏信号
         if std::env::var("BASALT_SASL_USERS").map(|v| v.trim().is_empty()).unwrap_or(true) {
@@ -668,7 +672,6 @@ async fn async_main(cfg: Config) {
     }
     // 给 in-flight 请求 2s drain 窗口
     tokio::time::sleep(std::time::Duration::from_millis(2000)).await;
-    // 数据在 OS page cache（默认 FsyncSchedule::Os 不主动 fsync）：
-    // 进程退出不丢（page cache 由内核刷盘），无需显式 sync
+    // 数据落盘由 FsyncSchedule 决定（默认 always：每批 fsync；进程退出无需显式 sync）
     tracing::info!("basalt shutdown complete");
 }

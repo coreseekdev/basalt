@@ -176,6 +176,17 @@ pub fn topic_id_from(name: &str) -> u128 {
     h
 }
 
+/// fsync 档解析（A1）：None / 未识别值 → 默认 SyncEach（每批落盘）；
+/// 显式 `os` 才退回 page cache。env 薄壳见 [`MetaService::fsync_schedule`]。
+pub(crate) fn fsync_schedule_from(v: Option<&str>) -> FsyncSchedule {
+    match v {
+        Some("always") | Some("SyncEach") => FsyncSchedule::SyncEach,
+        Some("on_roll") | Some("OnRoll") => FsyncSchedule::OnRoll,
+        Some("os") | Some("Os") => FsyncSchedule::Os,
+        _ => FsyncSchedule::SyncEach,
+    }
+}
+
 impl MetaService {
     #[allow(clippy::disallowed_types)] // pool 参数：进程单例共享资源池（ADR-13 豁免）
     pub fn spawn(
@@ -440,14 +451,11 @@ impl MetaService {
         }
     }
 
-    /// fsync 档（P0-2）：BASALT_FSYNC=os（默认，page cache）/ always
-    /// （防断电）/ on_roll（折中）
+    /// fsync 档（A1）：默认 always（SyncEach，每批落盘，防断电丢数）。
+    /// BASALT_FSYNC=os 退回 page cache（靠副本保 durable，与 Kafka flush.messages=MAX 同型）；
+    /// on_roll（每段滚动 fsync）折中。
     pub fn fsync_schedule() -> FsyncSchedule {
-        match std::env::var("BASALT_FSYNC").as_deref() {
-            Ok("always") | Ok("SyncEach") => FsyncSchedule::SyncEach,
-            Ok("on_roll") | Ok("OnRoll") => FsyncSchedule::OnRoll,
-            _ => FsyncSchedule::Os,
-        }
+        fsync_schedule_from(std::env::var("BASALT_FSYNC").ok().as_deref())
     }
 
     async fn apply_cluster(&mut self, state: Box<ClusterState>) {
@@ -731,3 +739,33 @@ impl FollowerPull {
 #[cfg(test)]
 #[path = "handlers_layout_tests.rs"]
 mod handlers_layout_tests;
+
+#[cfg(test)]
+mod fsync_schedule_tests {
+    use super::*;
+
+    #[test]
+    fn default_is_sync_each() {
+        assert_eq!(fsync_schedule_from(None), FsyncSchedule::SyncEach);
+    }
+
+    #[test]
+    fn unknown_value_falls_back_to_sync_each() {
+        assert_eq!(fsync_schedule_from(Some("typo")), FsyncSchedule::SyncEach);
+        assert_eq!(fsync_schedule_from(Some("")), FsyncSchedule::SyncEach);
+    }
+
+    #[test]
+    fn explicit_os_opts_out() {
+        assert_eq!(fsync_schedule_from(Some("os")), FsyncSchedule::Os);
+        assert_eq!(fsync_schedule_from(Some("Os")), FsyncSchedule::Os);
+    }
+
+    #[test]
+    fn all_tiers_recognized() {
+        assert_eq!(fsync_schedule_from(Some("always")), FsyncSchedule::SyncEach);
+        assert_eq!(fsync_schedule_from(Some("SyncEach")), FsyncSchedule::SyncEach);
+        assert_eq!(fsync_schedule_from(Some("on_roll")), FsyncSchedule::OnRoll);
+        assert_eq!(fsync_schedule_from(Some("OnRoll")), FsyncSchedule::OnRoll);
+    }
+}

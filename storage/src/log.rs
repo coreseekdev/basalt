@@ -1047,6 +1047,62 @@ impl<D: DiskIo> Log<D> {
         deleted
     }
 
+    /// Retention：按时间删除过期 sealed 段（A3）。active 段永不删除。
+    /// 调用方保证分层分区不走此路径（本地删除会与上传在途赛跑，数据
+    /// 生命周期归对象侧 retention）。
+    ///
+    /// 过期判定 = 时间索引末项 ∧ 段 mtime **双条件**。时间索引是稀疏的
+    /// （push_batch 仅在 INDEX_INTERVAL_BYTES 边界落项）→ 末项≠段内最大
+    /// 时间戳，仅凭索引会误删含新数据的段（retention e2e 实证：段尾追加
+    /// 的新批未被索引，整段按旧批时间过期）。mtime = 段最后一次写入的
+    /// 服务器时钟，合取后客户端时钟偏斜（过去/未来）任一方向都不会误删；
+    /// 真过期段两者必然都老。删除粒度 = 整段：与过期数据同段的未过期
+    /// 数据随之消失（Kafka 同型语义）。
+    pub fn delete_expired_segments(&mut self, now_ms: i64) -> usize {
+        if self.opts.retention_ms == 0 {
+            return 0;
+        }
+        let mut deleted = 0usize;
+        while let Some(first) = self.sealed.first() {
+            let expired_index = first
+                .time_index
+                .entries
+                .last()
+                .map(|&(ts, _)| ts.saturating_add(self.opts.retention_ms as i64) <= now_ms)
+                .unwrap_or(false);
+            let expired_mtime = std::fs::metadata(&first.path)
+                .ok()
+                .and_then(|m| m.modified().ok())
+                .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+                .map(|d| d.as_millis() as i64)
+                .map(|t| t.saturating_add(self.opts.retention_ms as i64) <= now_ms)
+                .unwrap_or(false); // 元数据不可读 = 保守不删
+            if !(expired_index && expired_mtime) {
+                tracing::debug!(
+                    base = first.base_offset,
+                    last_ts = first.time_index.entries.last().map(|&(ts, _)| ts),
+                    expired_index, expired_mtime,
+                    retention_ms = self.opts.retention_ms, now_ms,
+                    "time retention skip"
+                );
+                break;
+            }
+            let seg = self.sealed.remove(0);
+            let _ = self.disk.remove(&seg.path);
+            let _ = self.disk.remove(&seg.index_path);
+            let _ = self.disk.remove(&seg.time_path);
+            deleted += 1;
+        }
+        if deleted > 0 {
+            self.log_start_offset = self.sealed.first()
+                .map(|s| s.base_offset)
+                .unwrap_or(self.active.base_offset);
+            self.persist_checkpoint();
+            tracing::info!(deleted, log_start = self.log_start_offset, "time retention deleted segments");
+        }
+        deleted
+    }
+
     // ---------- 截断（failover 自愈） ----------
 
     /// 截断到 `offset`（含）之前的数据：丢弃 >= offset 的所有批与后续段。
@@ -1362,6 +1418,118 @@ mod retention_reopen_tests {
         assert_eq!(h.base_offset, 100);
         // log_start 之下拒读
         assert!(log2.read_ex(99, 1 << 20, &pool, ReadCap::At(120)).is_err());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+}
+
+#[cfg(test)]
+mod time_retention_tests {
+    //! A3：时间 retention——过期 sealed 段删除、active 保留、log_start 推进。
+    //! 关键回归：时间索引稀疏（末项≠段最大时间戳），索引陈旧但 mtime 新鲜
+    //! 的段必须保留（retention e2e 实证的误删缺陷）。
+
+    use super::*;
+    use crate::disk::StdDisk;
+    use basalt_record::{encode_batch, Rec};
+
+    fn batch_ts(base: i64, count: i64, base_ts: i64) -> Bytes {
+        let recs: Vec<Rec> = (0..count)
+            .map(|i| Rec {
+                timestamp_delta: i,
+                key: None,
+                value: Some(bytes::Bytes::from(format!("t-{:04}-{}", base + i, "x".repeat(96)))),
+                headers: vec![],
+            })
+            .collect();
+        let mut b = bytes::BytesMut::new();
+        encode_batch(base, 0, base_ts, 0, -1, -1, -1, &recs, &mut b);
+        b.freeze()
+    }
+
+    fn unique_dir() -> std::path::PathBuf {
+        let dir = std::env::temp_dir().join(format!(
+            "basalt-tret-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    fn open_log(dir: &std::path::Path, retention_ms: u64) -> Log<StdDisk> {
+        Log::open(StdDisk::new(), dir.to_path_buf(), LogOptions {
+            segment_max_bytes: 2048,
+            fsync: FsyncSchedule::Os,
+            retention_ms,
+            retention_max_bytes: 0,
+        })
+        .unwrap()
+    }
+
+    fn age_mtime(dir: &std::path::Path, base: i64, epoch_ms: u64) {
+        let path = dir.join(crate::segment::log_filename(base));
+        let f = std::fs::File::options().write(true).open(&path).unwrap();
+        f.set_times(std::fs::FileTimes::new().set_modified(
+            std::time::UNIX_EPOCH + std::time::Duration::from_millis(epoch_ms),
+        )).unwrap();
+    }
+
+    #[test]
+    fn expired_sealed_deleted_stale_index_fresh_mtime_kept() {
+        let now0 = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_millis() as i64;
+        let old = now0 - 100_000; // 100s 前：retention 5s 下必然过期
+        let dir = unique_dir();
+        let mut log = open_log(&dir, 5_000);
+        // sealed A/B（旧时间戳），C sealed（新时间戳），D 为 active
+        log.append(&batch_ts(0, 20, old), AssignPolicy::Assign, now0).unwrap();
+        log.append(&batch_ts(20, 20, old), AssignPolicy::Assign, now0).unwrap();
+        log.append(&batch_ts(40, 20, now0), AssignPolicy::Assign, now0).unwrap();
+        log.append(&batch_ts(60, 20, now0), AssignPolicy::Assign, now0).unwrap();
+        assert_eq!(log.sealed.len(), 3);
+        assert_eq!(log.next_offset, 80);
+        // A 段 mtime 拨老；B 段保持新鲜 mtime（模拟索引陈旧 + 段尾仍有写入）
+        age_mtime(&dir, 0, old as u64);
+
+        // 第一轮：A 双条件皆过期 → 删；B 索引过期但 mtime 新鲜 → 必须保留
+        let n = log.delete_expired_segments(now0);
+        assert_eq!(n, 1, "只应删除 A");
+        assert_eq!(log.log_start_offset, 20);
+        assert_eq!(log.sealed.len(), 2, "B（mtime 新鲜）不得误删");
+        assert_eq!(log.next_offset, 80);
+
+        // B 老化后再删：C 时间戳未到期 → 停；log_start 推进到 C
+        age_mtime(&dir, 20, old as u64);
+        let n = log.delete_expired_segments(now0);
+        assert_eq!(n, 1);
+        assert_eq!(log.log_start_offset, 40);
+        assert_eq!(log.sealed.len(), 1);
+        assert_eq!(log.next_offset, 80, "未到期数据不受影响");
+
+        // 巨大截止：sealed 全删，active 保留
+        let n = log.delete_expired_segments(i64::MAX);
+        assert_eq!(n, 1);
+        assert_eq!(log.log_start_offset, 60, "log_start 推进到 active base");
+        assert_eq!(log.sealed.len(), 0);
+        assert_eq!(log.next_offset, 80, "active 段永不删除");
+
+        let local_files = std::fs::read_dir(&dir).unwrap()
+            .filter_map(|e| e.ok())
+            .filter(|e| e.path().extension().map(|x| x == "log").unwrap_or(false))
+            .count();
+        assert_eq!(local_files, 1, "只剩 active 本地段文件");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn retention_disabled_is_noop() {
+        let dir = unique_dir();
+        let mut log = open_log(&dir, 0);
+        log.append(&batch_ts(0, 20, 1), AssignPolicy::Assign, 1000).unwrap();
+        log.append(&batch_ts(20, 20, 1), AssignPolicy::Assign, 1000).unwrap();
+        let sealed_before = log.sealed.len();
+        assert!(sealed_before >= 1, "前两批应滚出 sealed 段");
+        assert_eq!(log.delete_expired_segments(i64::MAX), 0, "retention_ms=0 关闭");
+        assert_eq!(log.log_start_offset, 0);
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

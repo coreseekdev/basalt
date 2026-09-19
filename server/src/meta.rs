@@ -471,11 +471,17 @@ impl MetaService {
                 let dir = PathBuf::from(self.cfg.data_dir.clone())
                     .join(&a.topic)
                     .join(format!("p{}", a.partition));
+                // 本地日志 retention（A3）：时间默认 7 天（0 = 关闭），字节默认不限。
+                // 分层分区数据生命周期归对象侧（BASALT_RETENTION_MS）。
                 let opts = LogOptions {
                     segment_max_bytes: self.cfg.segment_max_bytes,
                     fsync: Self::fsync_schedule(),
-                    retention_ms: 7 * 24 * 3600 * 1000,
-                    retention_max_bytes: 0,
+                    retention_ms: std::env::var("BASALT_LOG_RETENTION_MS")
+                        .ok().and_then(|v| v.parse().ok())
+                        .unwrap_or(7 * 24 * 3600 * 1000),
+                    retention_max_bytes: std::env::var("BASALT_LOG_RETENTION_BYTES")
+                        .ok().and_then(|v| v.parse().ok())
+                        .unwrap_or(0),
                 };
                 match PartitionActor::spawn(a.topic.clone(), a.partition, self.cfg.node_id, dir, opts, self.cfg.replica_config(), self.pool.clone(), a.tiered) {
                     Ok(tx) => {

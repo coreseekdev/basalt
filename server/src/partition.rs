@@ -564,9 +564,10 @@ impl PartitionActor {
 
     fn on_deadline(&mut self) {
         let now = Instant::now();
-        // 分层对象侧 retention 周期触发（T-M4.3 v2）
+        // 本地 retention 周期触发（A3：时间 + 字节，分层关闭的分区）
         if let Some(t) = self.next_retention_sweep {
             if now >= t {
+                self.local_retention_sweep();
                 self.tiered_retention_sweep();
                 self.next_retention_sweep = Some(now + Duration::from_millis(self.retention_sweep_ms.max(100)));
             }
@@ -1073,7 +1074,7 @@ impl PartitionActor {
                     let _ = reply.send(self.log.end_offset_for_epoch(epoch));
                 }
                 PartitionCmd::Retention { reply } => {
-                    let n = self.log.delete_old_segments();
+                    let n = self.local_retention_sweep();
                     self.maybe_offload();
                     if let (Some(store), Some(tier)) = (self.tier_store.as_deref(), self.tier.as_ref()) {
                         let grace = std::env::var("BASALT_TIERED_GC_GRACE_MS")
@@ -1559,6 +1560,18 @@ impl PartitionActor {
                 }
             }
         }
+    }
+
+    /// 本地日志 retention（A3 接线）：时间过期 + 字节上限，仅删除 sealed 段
+    /// （active 恒保留）。分层分区整体跳过——本地删除会与上传在途赛跑
+    /// （未上传段被删即丢数），数据生命周期归对象侧 tiered_retention_sweep。
+    fn local_retention_sweep(&mut self) -> usize {
+        if self.tier.is_some() {
+            return 0;
+        }
+        let mut deleted = self.log.delete_expired_segments(now_ms());
+        deleted += self.log.delete_old_segments();
+        deleted
     }
 
     /// 分层上传（best-effort，ADR-21 §2 写序）：枚举 sealed 段 → 注册表

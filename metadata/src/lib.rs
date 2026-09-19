@@ -19,12 +19,24 @@ pub struct PartitionMeta {
     pub isr: Vec<i32>,
 }
 
+/// per-topic retention 配置（per-topic retention 透传）：None = 跟随
+/// broker 级默认（BASALT_LOG_RETENTION_MS / BYTES）。
+#[derive(Debug, Clone, Copy, PartialEq, Default, serde::Serialize, serde::Deserialize)]
+pub struct TopicRetention {
+    #[serde(default)]
+    pub ms: Option<u64>,
+    #[serde(default)]
+    pub bytes: Option<u64>,
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub struct TopicMeta {
     pub name: String,
     pub topic_id: u128,
     pub internal: bool,
     pub partitions: Vec<PartitionMeta>,
+    /// per-topic retention（DescribeConfigs 回真值；actor spawn 注入）
+    pub retention: TopicRetention,
 }
 
 impl TopicMeta {
@@ -105,7 +117,13 @@ impl TopicTable {
                 isr: assignment,
             });
         }
-        let meta = TopicMeta { name: name.to_string(), topic_id, internal: false, partitions: parts };
+        let meta = TopicMeta {
+            name: name.to_string(),
+            topic_id,
+            internal: false,
+            partitions: parts,
+            retention: Default::default(),
+        };
         self.by_id.insert(topic_id, meta.name.clone());
         self.topics.insert(name.to_string(), meta);
         Ok(self.topics.get(name).expect("just inserted"))

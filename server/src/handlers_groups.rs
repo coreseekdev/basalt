@@ -408,15 +408,24 @@ pub async fn create_topics(req: &basalt_protocol::value::Struct, ctx: &Ctx) -> V
             // ReplicationFactor 线上是 int16——as_i32 窄匹配静默返 0（账本 66，
             // 同 ㊿ as_i8 家族；rf=0 → 无副本分区 → failover 无候选人）
             let rf = ts.get("ReplicationFactor").map(|v| v.as_i16() as i32).unwrap_or(1);
-            // per-topic 分层存储（T-M4.3 v2）：configs 键 basalt.storage.mode=tiered
-            let tiered = match ts.get("Configs") {
-                Some(Value::Array(cfgs)) => cfgs.iter().any(|c| {
-                    let Value::Struct(cs) = c else { return false };
-                    cs.get("Name").map(|v| v.as_str()) == Some("basalt.storage.mode")
-                        && cs.get("Value").map(|v| v.as_str()) == Some("tiered")
-                }),
-                _ => false,
+            // configs 平面（Vec<(k, v)>）：tiered 键 + retention 键共用
+            let configs: Vec<(String, String)> = match ts.get("Configs") {
+                Some(Value::Array(cfgs)) => cfgs
+                    .iter()
+                    .filter_map(|c| match c {
+                        Value::Struct(cs) => Some((
+                            cs.get("Name").map(|v| v.as_str().to_string()).unwrap_or_default(),
+                            cs.get("Value").map(|v| v.as_str().to_string()).unwrap_or_default(),
+                        )),
+                        _ => None,
+                    })
+                    .collect(),
+                _ => Vec::new(),
             };
+            // per-topic 分层存储（T-M4.3 v2）：configs 键 basalt.storage.mode=tiered
+            let tiered = configs
+                .iter()
+                .any(|(k, v)| k == "basalt.storage.mode" && v == "tiered");
             // ACL（T-M4.1）：TOPIC:CREATE 或 CLUSTER:CREATE（骨架）
             let authorized = crate::acl::authorize(&ctx.principal, crate::acl::OP_CREATE, crate::acl::RT_TOPIC, &name)
                 || crate::acl::authorize(&ctx.principal, crate::acl::OP_CREATE, crate::acl::RT_CLUSTER, "");
@@ -432,6 +441,17 @@ pub async fn create_topics(req: &basalt_protocol::value::Struct, ctx: &Ctx) -> V
                 ]));
                 continue;
             }
+            // per-topic retention（CreateTopics configs: retention.ms/bytes）
+            let parse_cfg = |key: &str| -> Option<Option<u64>> {
+                configs.iter().find(|(k, _)| k == key).map(|(_, v)| {
+                    let t = v.trim();
+                    if t.is_empty() || t == "-1" { None } else { t.parse::<u64>().ok() }
+                })
+            };
+            let retention = basalt_metadata::TopicRetention {
+                ms: parse_cfg("retention.ms").unwrap_or(None),
+                bytes: parse_cfg("retention.bytes").unwrap_or(None),
+            };
             let (reply_tx, reply_rx) = oneshot::channel();
             // EnsureTopic：请求的 NumPartitions/RF 是建题参数（≠ Lookup
             // allow_create 的 broker 默认——那会把请求值静默覆盖，账本 59）
@@ -440,6 +460,7 @@ pub async fn create_topics(req: &basalt_protocol::value::Struct, ctx: &Ctx) -> V
                 partitions: num_partitions,
                 rf,
                 tiered,
+                retention,
                 reply: reply_tx,
             }).await;
             let (found, _brokers) = reply_rx.await.unwrap_or_default();

@@ -97,6 +97,7 @@ pub enum MetaCmd {
         partitions: i32,
         rf: i32,
         tiered: bool,
+        retention: basalt_metadata::TopicRetention,
         reply: oneshot::Sender<bool>,
     },
     /// CreateTopics 语义：缺则按请求的 partitions/rf 建，存则查回。
@@ -106,6 +107,8 @@ pub enum MetaCmd {
         rf: i32,
         /// per-topic 分层存储（CreateTopics configs: basalt.storage.mode）
         tiered: bool,
+        /// per-topic retention（CreateTopics configs: retention.ms/bytes）
+        retention: basalt_metadata::TopicRetention,
         reply: oneshot::Sender<(Vec<TopicMeta>, Vec<BrokerInfo>)>,
     },
     /// 删题（转发控制器，raft 复制后本地 assignment 消失）。
@@ -161,7 +164,13 @@ fn topic_meta_from_cluster(cluster: &ClusterState, name: &str) -> Option<TopicMe
             isr: a.replicas.clone(),
         })
         .collect();
-    Some(TopicMeta { name: name.to_string(), topic_id, internal: false, partitions })
+    Some(TopicMeta {
+        name: name.to_string(),
+        topic_id,
+        internal: false,
+        partitions,
+        retention: parts[0].retention,
+    })
 }
 
 /// 与集群态无关的稳定 topic id（POC：名字哈希；删除重建刷新由控制器保证——
@@ -289,7 +298,7 @@ impl MetaService {
                                 if let Some(m) = topic_meta_from_cluster(&self.cluster, n) {
                                     out.push(m);
                                 } else if allow_create {
-                                    if self.create_via_controller(n, self.cfg.num_partitions, self.cfg.default_rf, false).await {
+                                    if self.create_via_controller(n, self.cfg.num_partitions, self.cfg.default_rf, false, Default::default()).await {
                                         if let Some(m) = topic_meta_from_cluster(&self.cluster, n) {
                                             out.push(m);
                                         }
@@ -301,18 +310,18 @@ impl MetaService {
                     let brokers: Vec<BrokerInfo> = self.cluster.brokers.values().cloned().collect();
                     let _ = reply.send((out, brokers));
                 }
-                MetaCmd::CreateTopic { name, partitions, rf, tiered, reply } => {
-                    let ok = self.create_via_controller(&name, partitions, rf, tiered).await;
+                MetaCmd::CreateTopic { name, partitions, rf, tiered, retention, reply } => {
+                    let ok = self.create_via_controller(&name, partitions, rf, tiered, retention).await;
                     let _ = reply.send(ok);
                 }
-                MetaCmd::EnsureTopic { name, partitions, rf, tiered, reply } => {
+                MetaCmd::EnsureTopic { name, partitions, rf, tiered, retention, reply } => {
                     // CreateTopics 语义：请求的 NumPartitions/RF 是**建题参数**
                     // 而非查询——缺失时按请求值建（≠ Lookup allow_create 的
                     // broker 默认值；账本 59：请求值被默认值覆盖）。
                     let mut out = Vec::new();
                     if let Some(m) = topic_meta_from_cluster(&self.cluster, &name) {
                         out.push(m);
-                    } else if self.create_via_controller(&name, partitions, rf, tiered).await {
+                    } else if self.create_via_controller(&name, partitions, rf, tiered, retention).await {
                         if let Some(m) = topic_meta_from_cluster(&self.cluster, &name) {
                             out.push(m);
                         }
@@ -398,7 +407,14 @@ impl MetaService {
         }
     }
 
-    async fn create_via_controller(&mut self, name: &str, partitions: i32, rf: i32, tiered: bool) -> bool {
+    async fn create_via_controller(
+        &mut self,
+        name: &str,
+        partitions: i32,
+        rf: i32,
+        tiered: bool,
+        retention: basalt_metadata::TopicRetention,
+    ) -> bool {
         // 创建：本机持有控制器 actor → 直调；否则 RPC 到控制器内部端口
         if let Some(tx) = &self.controller_tx {
             let (txr, rxr) = oneshot::channel();
@@ -408,6 +424,7 @@ impl MetaService {
                     partitions,
                     rf,
                     tiered,
+                    retention,
                     reply: txr,
                 })
                 .await;
@@ -417,7 +434,7 @@ impl MetaService {
         } else {
             let Some(addr) = self.controller_addr.clone() else { return false };
             let client = crate::internal::InternalClient::new(addr);
-            if client.create_topic(name, partitions, rf, tiered).await.is_err() {
+            if client.create_topic(name, partitions, rf, tiered, retention).await.is_err() {
                 return false;
             }
         }
@@ -471,17 +488,20 @@ impl MetaService {
                 let dir = PathBuf::from(self.cfg.data_dir.clone())
                     .join(&a.topic)
                     .join(format!("p{}", a.partition));
-                // 本地日志 retention（A3）：时间默认 7 天（0 = 关闭），字节默认不限。
-                // 分层分区数据生命周期归对象侧（BASALT_RETENTION_MS）。
+                // 本地日志 retention（A3 + per-topic 透传）：topic 级配置
+                // 优先，未指定回退 broker 级 env（时间默认 7 天 0=关，字节
+                // 默认不限）。分层分区数据生命周期归对象侧。
+                let env_ms = std::env::var("BASALT_LOG_RETENTION_MS")
+                    .ok().and_then(|v| v.parse().ok())
+                    .unwrap_or(7 * 24 * 3600 * 1000);
+                let env_bytes = std::env::var("BASALT_LOG_RETENTION_BYTES")
+                    .ok().and_then(|v| v.parse().ok())
+                    .unwrap_or(0);
                 let opts = LogOptions {
                     segment_max_bytes: self.cfg.segment_max_bytes,
                     fsync: Self::fsync_schedule(),
-                    retention_ms: std::env::var("BASALT_LOG_RETENTION_MS")
-                        .ok().and_then(|v| v.parse().ok())
-                        .unwrap_or(7 * 24 * 3600 * 1000),
-                    retention_max_bytes: std::env::var("BASALT_LOG_RETENTION_BYTES")
-                        .ok().and_then(|v| v.parse().ok())
-                        .unwrap_or(0),
+                    retention_ms: a.retention.ms.unwrap_or(env_ms),
+                    retention_max_bytes: a.retention.bytes.unwrap_or(env_bytes),
                 };
                 match PartitionActor::spawn(a.topic.clone(), a.partition, self.cfg.node_id, dir, opts, self.cfg.replica_config(), self.pool.clone(), a.tiered) {
                     Ok(tx) => {

@@ -265,6 +265,7 @@ async fn async_main(cfg: Config) {
                 partitions: 1,
                 rf,
                 tiered: false,
+                retention: Default::default(),
                 reply: txr,
             })
             .await;
@@ -314,6 +315,7 @@ async fn async_main(cfg: Config) {
                 partitions: 1,
                 rf,
                 tiered: false,
+                retention: Default::default(),
                 reply: txr,
             })
             .await;

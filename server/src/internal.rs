@@ -213,13 +213,24 @@ impl InternalClient {
         }
     }
 
-    pub async fn create_topic(&self, name: &str, partitions: i32, rf: i32, tiered: bool) -> std::io::Result<Bytes> {
+    pub async fn create_topic(
+        &self,
+        name: &str,
+        partitions: i32,
+        rf: i32,
+        tiered: bool,
+        retention: basalt_metadata::TopicRetention,
+    ) -> std::io::Result<Bytes> {
         let mut p = Vec::new();
         p.extend_from_slice(&(name.len() as i16).to_be_bytes());
         p.extend_from_slice(name.as_bytes());
         p.extend_from_slice(&partitions.to_be_bytes());
         p.extend_from_slice(&rf.to_be_bytes());
         p.push(tiered as u8);
+        p.push(retention.ms.is_some() as u8);
+        p.extend_from_slice(&retention.ms.unwrap_or(0).to_be_bytes());
+        p.push(retention.bytes.is_some() as u8);
+        p.extend_from_slice(&retention.bytes.unwrap_or(0).to_be_bytes());
         self.call(MSG_CREATE_TOPIC, &p).await
     }
 
@@ -262,6 +273,7 @@ pub enum ControllerCmd {
         partitions: i32,
         rf: i32,
         tiered: bool,
+        retention: basalt_metadata::TopicRetention,
         reply: oneshot::Sender<()>,
     },
     DeleteTopic { name: String, reply: oneshot::Sender<bool> },
@@ -494,7 +506,7 @@ impl Controller {
                     None
                 });
             }
-            ControllerCmd::CreateTopic { name, partitions, rf, tiered, reply } => {
+            ControllerCmd::CreateTopic { name, partitions, rf, tiered, retention, reply } => {
                 tracing::info!(node = self.node_id, topic = %name, "topic create via controller");
                 let exists = self.state.assignments.iter().any(|a| a.topic == name);
                 // rf 守卫：多副本建题时 broker 未注册齐会按不完整集群算
@@ -507,12 +519,12 @@ impl Controller {
                     return;
                 }
                 if self.engine.is_some() {
-                    if let Err(m) = self.apply_via_engine(&ClusterRecord::CreateTopic { name: name.clone(), partitions, rf, tiered }) {
+                    if let Err(m) = self.apply_via_engine(&ClusterRecord::CreateTopic { name: name.clone(), partitions, rf, tiered, retention }) {
                         tracing::error!(topic=%name, error=%m, "CreateTopic raft propose failed");
                     }
                 } else {
                     if !exists {
-                        self.apply_and_persist(&ClusterRecord::CreateTopic { name, partitions, rf, tiered });
+                        self.apply_and_persist(&ClusterRecord::CreateTopic { name, partitions, rf, tiered, retention });
                     }
                 }
                 let _ = reply.send(());
@@ -732,13 +744,17 @@ fn encode_record(rec: &ClusterRecord) -> Vec<u8> {
             b.extend_from_slice(br.host.as_bytes());
             b.extend_from_slice(&(br.port as i32).to_be_bytes());
         }
-        ClusterRecord::CreateTopic { name, partitions, rf, tiered } => {
+        ClusterRecord::CreateTopic { name, partitions, rf, tiered, retention } => {
             b.push(2);
             b.extend_from_slice(&(name.len() as i16).to_be_bytes());
             b.extend_from_slice(name.as_bytes());
             b.extend_from_slice(&partitions.to_be_bytes());
             b.extend_from_slice(&rf.to_be_bytes());
             b.push(*tiered as u8);
+            b.push(retention.ms.is_some() as u8);
+            b.extend_from_slice(&retention.ms.unwrap_or(0).to_be_bytes());
+            b.push(retention.bytes.is_some() as u8);
+            b.extend_from_slice(&retention.bytes.unwrap_or(0).to_be_bytes());
         }
         ClusterRecord::DeleteTopic { name } => {
             b.push(4);
@@ -789,7 +805,36 @@ fn decode_record(data: &[u8]) -> Option<ClusterRecord> {
             let rf = g32(&mut p);
             // tiered 尾字节：旧 WAL 记录缺失 → false（持久化面兼容）
             let tiered = p < data.len() && data[p] != 0;
-            ClusterRecord::CreateTopic { name, partitions, rf, tiered }
+            p += 1;
+            // retention 尾缀：旧记录缺失 → None（B4 同款兼容）
+            let (has_ms, has_bytes) = if p + 2 <= data.len() {
+                let h1 = data[p] != 0;
+                let h2 = data[p + 1] != 0;
+                (h1, h2)
+            } else {
+                (false, false)
+            };
+            p += 2;
+            let ms = if has_ms && p + 8 <= data.len() {
+                let v = u64::from_be_bytes(data[p..p + 8].try_into().unwrap());
+                p += 8;
+                Some(v)
+            } else {
+                None
+            };
+            let bytes = if has_bytes && p + 8 <= data.len() {
+                let v = u64::from_be_bytes(data[p..p + 8].try_into().unwrap());
+                Some(v)
+            } else {
+                None
+            };
+            ClusterRecord::CreateTopic {
+                name,
+                partitions,
+                rf,
+                tiered,
+                retention: basalt_metadata::TopicRetention { ms, bytes },
+            }
         }
         3 => {
             let topic = gstr(&mut p);
@@ -1240,13 +1285,13 @@ async fn handle_internal_conn(
                 Bytes::from(vec![if ok { 1 } else { 0 }])
             }
             MSG_CREATE_TOPIC => {
-                let Ok((name, partitions, rf, tiered)) = parse_create(payload) else {
+                let Ok((name, partitions, rf, tiered, retention)) = parse_create(payload) else {
                     sock.write_all(&short_frame()).await?;
                     return Ok(());
                 };
                 if let Some(tx) = &ctx.controller_tx {
                     let (txr, rxr) = tokio::sync::oneshot::channel();
-                    let _ = tx.send(ControllerCmd::CreateTopic { name, partitions, rf, tiered, reply: txr }).await;
+                    let _ = tx.send(ControllerCmd::CreateTopic { name, partitions, rf, tiered, retention, reply: txr }).await;
                     let _ = rxr.await;
                 }
                 Bytes::from(0i16.to_be_bytes().to_vec())
@@ -1350,7 +1395,9 @@ fn parse_register(p: &[u8]) -> std::io::Result<(i32, String, u16)> {
     Ok((node_id, host, port))
 }
 
-fn parse_create(p: &[u8]) -> std::io::Result<(String, i32, i32, bool)> {
+fn parse_create(
+    p: &[u8],
+) -> std::io::Result<(String, i32, i32, bool, basalt_metadata::TopicRetention)> {
     if p.len() < 2 {
         return Err(std::io::Error::other("short create"));
     }
@@ -1363,7 +1410,23 @@ fn parse_create(p: &[u8]) -> std::io::Result<(String, i32, i32, bool)> {
     let rf = i32::from_be_bytes(p[6 + n..10 + n].try_into().unwrap());
     // tiered 尾字节（T-M4.3 v2）；旧客户端缺字节 → false
     let tiered = p.len() > 10 + n && p[10 + n] != 0;
-    Ok((name, partitions, rf, tiered))
+    // retention 尾缀（per-topic retention）；旧客户端缺失 → None
+    let mut retention = basalt_metadata::TopicRetention::default();
+    let mut q = 10 + n + 1;
+    if p.len() >= q + 10 {
+        let has_ms = p[q] != 0;
+        q += 1;
+        if has_ms {
+            retention.ms = Some(u64::from_be_bytes(p[q..q + 8].try_into().unwrap()));
+        }
+        q += 8;
+        let has_bytes = p.get(q).copied().unwrap_or(0) != 0;
+        q += 1;
+        if has_bytes && p.len() >= q + 8 {
+            retention.bytes = Some(u64::from_be_bytes(p[q..q + 8].try_into().unwrap()));
+        }
+    }
+    Ok((name, partitions, rf, tiered, retention))
 }
 
 fn parse_fetch_slice(p: &[u8]) -> std::io::Result<(String, i32, i32, i64, usize)> {

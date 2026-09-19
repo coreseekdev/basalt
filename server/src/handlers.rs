@@ -329,13 +329,25 @@ pub async fn describe_configs(req: &basalt_protocol::value::Struct, ctx: &Ctx) -
                             Vec::new(),
                         )
                     } else {
+                        // per-topic retention 回真值：显式配置回显，未配置回
+                        // broker 级默认（env，缺省 7 天 / 不限）——与 actor
+                        // spawn 的 LogOptions 同源语义
+                        let env_ms = std::env::var("BASALT_LOG_RETENTION_MS")
+                            .ok().and_then(|v| v.parse::<u64>().ok())
+                            .unwrap_or(7 * 24 * 3600 * 1000);
+                        let env_bytes = std::env::var("BASALT_LOG_RETENTION_BYTES")
+                            .ok().and_then(|v| v.parse::<u64>().ok())
+                            .unwrap_or(0);
+                        let tm = found.iter().find(|t| t.name == rname);
+                        let rms = tm.and_then(|t| t.retention.ms).unwrap_or(env_ms);
+                        let rbytes = tm.and_then(|t| t.retention.bytes).unwrap_or(env_bytes);
                         (
                             ErrorCode::None,
                             None,
                             vec![
                                 config_entry("cleanup.policy", "delete".into(), &keys),
-                                config_entry("retention.ms", "604800000".into(), &keys),
-                                config_entry("retention.bytes", "-1".into(), &keys),
+                                config_entry("retention.ms", rms.to_string(), &keys),
+                                config_entry("retention.bytes", rbytes.to_string(), &keys),
                                 config_entry("segment.bytes", ctx.segment_max_bytes.to_string(), &keys),
                                 config_entry("min.insync.replicas", ctx.min_isr.to_string(), &keys),
                             ],

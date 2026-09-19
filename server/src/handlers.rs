@@ -450,6 +450,7 @@ pub async fn produce(version: i16, acks: i16, targets: Vec<ProduceTarget>, ctx: 
         for (t, r) in targets.iter().zip(&resolved) {
             // ACL（T-M4.1）：TOPIC:WRITE（骨架）——分区级 TOPIC_AUTHORIZATION_FAILED
             if !crate::acl::authorize(&ctx.principal, crate::acl::OP_WRITE, crate::acl::RT_TOPIC, &t.topic) {
+            crate::partition::metrics().authz_rejections_total.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                 in_flight.push(InFlight { target: t, rx: None, pre_err: Some(Value::I16(ErrorCode::TopicAuthorizationFailed as i16)), leader: -1 });
                 continue;
             }

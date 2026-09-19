@@ -1782,6 +1782,9 @@ pub struct Metrics {
     pub fetch_requests: AtomicU64,
     pub produce_requests: AtomicU64,
     pub compressed_batches: AtomicU64,
+    pub connections_total: AtomicU64,
+    pub auth_failures_total: AtomicU64,
+    pub authz_rejections_total: AtomicU64,
 }
 
 /// 分区维度 gauge（L1 可观测：topic/partition → hw/lso/log_start）

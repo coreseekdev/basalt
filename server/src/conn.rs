@@ -191,6 +191,7 @@ pub async fn serve_connection<S>(
 ) where
     S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send + 'static,
 {
+    crate::partition::metrics().connections_total.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     let conn = std::sync::Arc::new(tokio::sync::Mutex::new(ConnState::new()));
     if conn.lock().await.quota_enabled() {
         tracing::debug!(peer = %peer, "connection quotas active");

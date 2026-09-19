@@ -38,7 +38,27 @@ pub async fn find_coordinator(version: i16, req: &basalt_protocol::value::Struct
                 Err(code) => (ctx.node_id, ctx.host.clone(), ctx.port as i32, code),
             }
         } else {
-            (ctx.node_id, ctx.host.clone(), ctx.port as i32, ErrorCode::None)
+            // 方案 B 块 b2：hash(group_id) → __basalt_group_state 分区 → leader
+            // 单节点时 leader 恒为自身；多节点时 leader 可能是其他 broker
+            let internal_tid = crate::meta::topic_id_from("__basalt_group_state");
+            let part = (crate::meta::topic_id_from(k) % 1) as i32; // 1 分区（spike）
+            let routes = ctx.routes();
+            let leader_info = routes.find("__basalt_group_state", part).map(|r| (r.leader, r.tx.clone()));
+            drop(routes);
+            match leader_info {
+                Some((leader_id, _tx)) if leader_id != ctx.node_id => {
+                    // 非 leader broker：查 brokers cache 获取 leader 地址
+                    let broker = ctx.brokers_cache.lock().unwrap().clone()
+                        .unwrap_or_default()
+                        .into_iter()
+                        .find(|b| b.node_id == leader_id);
+                    match broker {
+                        Some(b) => (leader_id, b.host.clone(), b.port as i32, ErrorCode::None),
+                        None => (ctx.node_id, ctx.host.clone(), ctx.port as i32, ErrorCode::None),
+                    }
+                }
+                _ => (ctx.node_id, ctx.host.clone(), ctx.port as i32, ErrorCode::None),
+            }
         };
         if txn_lookup && version <= 3 {
             // v1-3：扁平位即协调器（单 key 语义）

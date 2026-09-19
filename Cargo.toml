@@ -8,6 +8,7 @@ members = [
     "coordinator",
     "testing",
     "server",
+    "cli",
     "xtask",
 ]
 

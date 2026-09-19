@@ -153,6 +153,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "basalt-cli"
+version = "0.1.0"
+dependencies = [
+ "basalt-protocol",
+ "bytes",
+ "tokio",
+]
+
+[[package]]
 name = "basalt-coordinator"
 version = "0.1.0"
 dependencies = [

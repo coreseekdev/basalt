@@ -32,6 +32,22 @@
   - [测试机制设计](../docs/11-testing-strategy.md) —— 测试分层与验收不变式
   - [项目全景](../docs/00-overview.md) 及各参考项目要点
 
+## 运维 CLI
+
+```bash
+cargo build -p basalt-cli
+./target/debug/basalt-cli --bootstrap localhost:9092 topics list
+./target/debug/basalt-cli topics create demo --partitions 3 --replication 1
+./target/debug/basalt-cli topics describe demo
+./target/debug/basalt-cli topics delete demo
+./target/debug/basalt-cli groups list
+./target/debug/basalt-cli groups describe my-group
+./target/debug/basalt-cli groups offsets my-group   # committed/end/lag
+```
+
+直连 Kafka 线协议（复用 basalt-protocol 数据驱动编解码），无外部客户端依赖。
+`BASALT_BOOTSTRAP` 为缺省地址；`BASALT_CLI_DEBUG=1` 打印原始响应树。
+
 ## 状态
 
 M0 阶段（工程基建 + 协议与单机）。2026-09-08 定位与架构决策定稿（ADR-8~13），v1 范围 = M0–M2 + 幂等 producer（T-M3.1）。详见 [TASK.md](TASK.md)。

@@ -385,6 +385,25 @@ pub async fn create_topics(req: &basalt_protocol::value::Struct, ctx: &Ctx) -> V
         for t in topics {
             let Value::Struct(ts) = t else { continue };
             let name = ts.get("Name").map(|v| v.as_str().to_string()).unwrap_or_default();
+            // topic 名校验（Kafka 同型）：空名/超长/非法字符拒绝——请求侧
+            // 编码按计划名查值，查不到写默认空串；裸放行会建出空名 topic
+            // 污染集群状态（basalt-cli 首轮实证，账本 63）
+            let invalid_name = name.is_empty()
+                || name.len() > 249
+                || name == "." || name == ".."
+                || !name.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'.' || b == b'_' || b == b'-');
+            if invalid_name {
+                results.push(s([
+                    ("Name", Value::str(name.clone())),
+                    ("TopicId", Value::Uuid(0)),
+                    ("ErrorCode", Value::I16(ErrorCode::InvalidTopicException as i16)),
+                    ("ErrorMessage", Value::str(format!("invalid topic name {name:?}"))),
+                    ("NumPartitions", Value::I32(-1)),
+                    ("ReplicationFactor", Value::I32(-1)),
+                    ("Configs", Value::Array(vec![])),
+                ]));
+                continue;
+            }
             let num_partitions = ts.get("NumPartitions").map(|v| v.as_i32()).unwrap_or(1);
             let rf = ts.get("ReplicationFactor").map(|v| v.as_i32()).unwrap_or(1);
             // per-topic 分层存储（T-M4.3 v2）：configs 键 basalt.storage.mode=tiered

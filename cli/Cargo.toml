@@ -1,0 +1,18 @@
+[package]
+name = "basalt-cli"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+
+[[bin]]
+name = "basalt-cli"
+path = "src/main.rs"
+
+[dependencies]
+basalt-protocol = { path = "../protocol" }
+bytes = { workspace = true }
+tokio = { version = "1", features = ["rt", "net", "io-util", "macros", "time"] }
+
+[lints]
+workspace = true

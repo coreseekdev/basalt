@@ -127,6 +127,11 @@ Basalt：Rust 版 Kafka 兼容消息流平台
 
 ---
 
+## P0 续（2026-09-19 第二轮）
+
+- **内部口令牌鉴权 ✅**：BASALT_INTERNAL_TOKEN 设置后，连接级 MSG_AUTH 握手（首帧 type=0 + token），错误/超时即断连；未设 = 信任模式（向后兼容单机开发）。客户端 InternalClient::call 自动发 auth 帧。
+- **磁盘满**：反应式 ENOSPC 检测已落地（上轮）；前置水位探针留 P1（需 statvfs 依赖或 probe-file 技巧）。
+
 ## P0 速赢落地（2026-09-19 续）
 
 - **内部口安全**：默认绑定 127.0.0.1（BASALT_INTERNAL_BIND 可覆盖）；非 localhost 时 warn。

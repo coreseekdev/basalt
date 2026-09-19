@@ -63,6 +63,18 @@ impl InternalClient {
     async fn call(&self, msg_type: u8, payload: &[u8]) -> std::io::Result<Bytes> {
         let sock = tokio::net::TcpStream::connect(&self.addr).await?;
         let mut sock = sock;
+        // 连接级令牌（P0-1）：服务端 BASALT_INTERNAL_TOKEN 设置时自动发 auth
+        if let Ok(token) = std::env::var("BASALT_INTERNAL_TOKEN") {
+            if !token.is_empty() {
+                let mut auth_frame = BytesMut::with_capacity(token.len() + 5);
+                auth_frame.put_u32((token.len() + 1) as u32);
+                auth_frame.put_u8(MSG_AUTH);
+                auth_frame.extend_from_slice(token.as_bytes());
+                sock.write_all(&auth_frame).await?;
+                let mut ack = [0u8; 4];
+                sock.read_exact(&mut ack).await?;
+            }
+        }
         let mut frame = BytesMut::with_capacity(payload.len() + 5);
         frame.put_u32((payload.len() + 1) as u32);
         frame.put_u8(msg_type);
@@ -808,10 +820,40 @@ pub async fn serve(listener: tokio::net::TcpListener, ctx: InternalCtx) {
     }
 }
 
+pub const MSG_AUTH: u8 = 0;
+
+/// 令牌校验（P0-1 补充）：BASALT_INTERNAL_TOKEN 设置后，连接首帧须为
+/// MSG_AUTH + 正确 token；否则关闭。未设 → 全放行（向后兼容单机开发）。
+fn check_internal_token(token: &str) -> bool {
+    match std::env::var("BASALT_INTERNAL_TOKEN") {
+        Ok(expected) if !expected.is_empty() => token == expected,
+        _ => true,
+    }
+}
+
 async fn handle_internal_conn(
     mut sock: tokio::net::TcpStream,
     ctx: InternalCtx,
 ) -> std::io::Result<()> {
+    // 连接级令牌校验（首帧前一次性握手）
+    if let Ok(expected) = std::env::var("BASALT_INTERNAL_TOKEN") {
+        if !expected.is_empty() {
+            let mut len_buf = [0u8; 4];
+            tokio::time::timeout(std::time::Duration::from_secs(5), sock.read_exact(&mut len_buf)).await
+                .map_err(|_| std::io::Error::other("auth timeout"))??;
+            let len = u32::from_be_bytes(len_buf) as usize;
+            let mut msg = vec![0u8; len];
+            tokio::time::timeout(std::time::Duration::from_secs(5), sock.read_exact(&mut msg)).await
+                .map_err(|_| std::io::Error::other("auth read timeout"))??;
+            if msg[0] != MSG_AUTH || &msg[1..] != expected.as_bytes() {
+                tracing::warn!(node = ctx.node_id, "internal connection auth failed");
+                return Err(std::io::Error::new(std::io::ErrorKind::PermissionDenied, "internal auth failed"));
+            }
+            // 回 ACK 帧
+            let ack = (1u32).to_be_bytes();
+            sock.write_all(&ack).await?;
+        }
+    }
     loop {
         let mut len_buf = [0u8; 4];
         sock.read_exact(&mut len_buf).await?;

@@ -133,14 +133,16 @@ pub enum GroupCmd {
     },
 }
 
-/// 组状态下沉通道（server 侧 GroupStateSync 实现：内部 topic produce 路径）。
-/// 消息 = (group, 批量提交, 持久化完成应答)——应答 Ok 即已落内部 topic
-/// （acks=all 语义，B2 权威存储；本地 OffsetLog 已移除）。
-pub type StateSinkTx = tokio::sync::mpsc::Sender<(
+/// 组状态下沉消息：(group, 批量提交, 持久化完成应答)——应答 Ok 即已落
+/// 内部 topic（acks=all 语义，B2 权威存储；本地 OffsetLog 已移除）。
+pub type StateSinkMsg = (
     String,
     Vec<CommittedOffset>,
     tokio::sync::oneshot::Sender<Result<(), String>>,
-)>;
+);
+
+/// 组状态下沉通道（server 侧 GroupStateSync 实现：内部 topic produce 路径）。
+pub type StateSinkTx = tokio::sync::mpsc::Sender<StateSinkMsg>;
 
 /// ListGroups 条目。
 #[derive(Debug, Clone)]

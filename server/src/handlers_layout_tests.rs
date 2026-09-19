@@ -35,7 +35,10 @@ pub mod handlers_layout_tests {
         let dir = tmpdir("groups");
         let group_tx = basalt_coordinator::GroupManager::spawn();
         // B2：commit 需要 sink 绑定——假 sink（内存 Ok 应答）锁协议面语义
-        let (stx, mut srx) = tokio::sync::mpsc::channel(8);
+        let (stx, mut srx): (
+            tokio::sync::mpsc::Sender<basalt_coordinator::StateSinkMsg>,
+            tokio::sync::mpsc::Receiver<basalt_coordinator::StateSinkMsg>,
+        ) = tokio::sync::mpsc::channel(8);
         tokio::spawn(async move {
             while let Some((_, _, r)) = srx.recv().await {
                 let _ = r.send(Ok(()));

@@ -56,6 +56,20 @@ tokio 调度延迟，后续可通过减少 per-request spawn 优化。
 **慢的根源常是正确性缺陷的级联**：吞吐类「优化」诉求先查处理序/去重面的
 缺陷，再谈调参。
 
+## fsync 默认档基线（2026-09-19：Track A1 默认化后）
+
+A1 将 fsync 默认档从 Os（page cache）翻转为 always（SyncEach，每批落盘）。
+同一基准（release 二进制 + franz-go 直连，NVMe 实盘非 tmpfs）：
+
+| 指标 | Os 档（旧默认，2026-09-18 基线） | always 档（新默认） | 持久化代价 |
+|---|---|---|---|
+| Produce | 1702.9 MB/s | **1416.8 MB/s** | ≈ -17%（每批一次 fsync 的诚实代价）|
+| Consume | 1058 MB/s | **1149.2 MB/s** | 读路径无 fsync 面，量级持平（波动内）|
+
+**结论**：断电零丢失语义（单节点不靠副本）的代价 ≈ 17% produce 吞吐，
+可接受。需要极致吞吐且容忍断电窗口的部署可用 `BASALT_FSYNC=os` 显式退回
+page cache 档（与 Kafka flush.messages=MAX 同型，靠副本保 durable）。
+
 ## 客户端多样性：confluent-kafka（librdkafka 2.15）档（2026-09-10）
 
 同场景与 kafka-python 档一一对应（`benches/throughput_confluent.py`，

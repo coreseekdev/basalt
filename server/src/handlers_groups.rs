@@ -387,7 +387,7 @@ pub async fn create_topics(req: &basalt_protocol::value::Struct, ctx: &Ctx) -> V
             let name = ts.get("Name").map(|v| v.as_str().to_string()).unwrap_or_default();
             // topic 名校验（Kafka 同型）：空名/超长/非法字符拒绝——请求侧
             // 编码按计划名查值，查不到写默认空串；裸放行会建出空名 topic
-            // 污染集群状态（basalt-cli 首轮实证，账本 63）
+            // 污染集群状态（basalt-cli 首轮实证，账本 65）
             let invalid_name = name.is_empty()
                 || name.len() > 249
                 || name == "." || name == ".."

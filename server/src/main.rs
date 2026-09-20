@@ -320,24 +320,51 @@ async fn async_main(cfg: Config) {
             })
             .await;
             let _ = rxr.await;
-            let mut bound_epoch: Option<i32> = None;
+            let mut bound_fp: Option<u64> = None;
             loop {
                 tokio::time::sleep(std::time::Duration::from_millis(500)).await;
-                let route = {
+                // 触发条件（B5）：share topic epoch 变化 或 本节点 lead 的分区
+                // 集合变化（任一 fingerprint 变化即重放——交付状态全量副本，
+                // 权威面 = 各分区当前 leader；重放会清 in-flight 锁 = 全员
+                // 重新可交付，与重启同语义）
+                let (share_route, fp) = {
                     let table = routes_rx_s.borrow();
-                    table.find("__share_group_state", 0).cloned()
+                    let fp: u64 = table
+                        .iter_entries()
+                        .map(|(t, p, l, e)| {
+                            let mut h = t.len() as u64;
+                            for b in t.bytes() {
+                                h = h.wrapping_mul(31).wrapping_add(b as u64);
+                            }
+                            h ^ ((p as u64) << 32) ^ ((l as u64) << 16) ^ (e as u64 & 0xffff)
+                        })
+                        .fold(0u64, |a, x| a.wrapping_add(x));
+                    let share = table
+                        .find("__share_group_state", 0)
+                        .map(|r| (r.tx.clone(), r.leader, r.epoch));
+                    (share, fp)
                 };
-                let Some(route) = route else { continue };
-                if route.leader != self_node || bound_epoch == Some(route.epoch) {
+                if bound_fp == Some(fp) {
                     continue;
                 }
+                let Some((part_tx, leader, epoch)) = share_route else { continue };
+                // 沉降延迟：等就任拉齐（reconcile 从存活副本回补缺失尾）完成
+                // 后再重放——否则读到未回补的空副本（B5 failover 实证）
+                tokio::time::sleep(std::time::Duration::from_millis(1500)).await;
                 let (etx, erx) = tokio::sync::mpsc::channel(1024);
-                share_group::set_share_sink(etx);
-                let events = group_sync::replay_share(route.tx.clone()).await;
+                share_group::set_share_sink(etx.clone());
+                let events = group_sync::replay_share(part_tx.clone()).await;
                 share_group::install_replay(events);
-                group_sync::spawn_share_sink(erx, route.tx.clone());
-                tracing::info!(epoch = route.epoch, "share state topic bound (leader)");
-                bound_epoch = Some(route.epoch);
+                group_sync::spawn_share_sink_ext(
+                    erx,
+                    part_tx,
+                    routes_rx_s.clone(),
+                    self_node,
+                    itx.clone(),
+                );
+                tracing::info!(epoch, leader, "share state replayed and sink bound");
+                bound_fp = Some(fp);
+                let _ = leader;
             }
         });
     }

@@ -19,7 +19,7 @@ cleanup() {
     [ -f "$f" ] && kill -9 "$(cat "$f")" 2>/dev/null
   done
   cp "$PID_DIR"/node*.log /tmp/ 2>/dev/null || true
-  rm -rf "$PID_DIR" "$DATA_DIR"
+  [ "${KEEP_DATA:-0}" = "1" ] || rm -rf "$PID_DIR" "$DATA_DIR"
 }
 trap cleanup EXIT
 
@@ -39,7 +39,8 @@ sleep 2
 RC=1
 {
   echo "=== phase 1: node0 上 share 组 poll+accept 前缀 ==="
-  (cd testing/franzgo && go run ./share localhost:9092 failover-setup sf-grp sf-e2e 10)
+  (cd testing/franzgo && SHARE_DEBUG=1 go run ./share localhost:9092 failover-setup sf-grp sf-e2e 30,10) 2> /tmp/sf-setup-debug.log
+  echo "=== 等待副本追平（2s）===" && sleep 2 &&
   echo "=== kill -9 node0（share 协调器所在）===" &&
   kill -9 "$(cat "$PID_DIR/pid-0")" &&
   sleep 1 &&

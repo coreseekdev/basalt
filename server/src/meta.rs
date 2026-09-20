@@ -70,6 +70,11 @@ impl RoutingTable {
             .map(|(n, _)| n.to_string())
     }
 
+    /// 全量路由条目迭代（监督任务的拓扑指纹用）。
+    pub fn iter_entries(&self) -> impl Iterator<Item = (&str, i32, i32, i32)> {
+        self.by_name.iter().map(|((t, p), r)| (t.as_str(), *p, r.leader, r.epoch))
+    }
+
     pub fn iter_all_topics(&self) -> Vec<String> {
         self.by_name
             .keys()
@@ -521,6 +526,13 @@ impl MetaService {
                             if let Some(leader_info) = self.cluster.brokers.get(&a.leader) {
                                 let leader_addr = format!("{}:{}", leader_info.host, leader_info.port + 1);
                                 self.spawn_pull(&a.topic, a.partition, a.leader, &leader_addr, &tx);
+                                // 初始 spawn 同步登记地址——否则首个 sync 周期
+                                // get→None→unwrap_or(true) 会 stop+respawn（churn
+                                // 推迟首拉 → ISR 开除 → acks=all 退化为仅 leader 写）
+                                self.active_pull_addrs.insert(
+                                    (a.topic.clone(), a.partition),
+                                    leader_addr.to_string(),
+                                );
                             }
                         }
                     }

@@ -254,44 +254,95 @@ fn parse_share_event(group: &str, mut v: &[u8]) -> Option<crate::share_group::Sh
     Some((group, tid, part, first, last, ty))
 }
 
-/// share 事件转发任务：SHARE_SINK 通道 → 内部分区 actor produce。
-/// 事件丢失的后果 = 重启后游标回退 → 重投递（KIP-932 至多一次语义容忍），
-/// 因此通道满/写失败只记日志不阻塞 ack 应答。
-pub fn spawn_share_sink(
+/// share 事件转发任务（多节点版，B5）：share-state leader == 自身 →
+/// 本地 actor produce（持久化）；否则内部 RPC 转发到 leader 落地
+/// （落地节点持久化 + 应用内存视图）。事件丢失的后果 = 重启后游标回退
+/// → 重投递（KIP-932 至多一次语义容忍），通道满/写失败只记日志。
+pub fn spawn_share_sink_ext(
     mut rx: tokio::sync::mpsc::Receiver<crate::share_group::ShareEvent>,
     part_tx: mpsc::Sender<PartitionCmd>,
+    routes_rx: tokio::sync::watch::Receiver<crate::meta::RoutingTable>,
+    self_node: i32,
+    meta_tx: mpsc::Sender<crate::meta::MetaCmd>,
 ) {
     tokio::spawn(async move {
+        let mut fwd: Option<(i32, crate::internal::InternalClient)> = None;
         loop {
             let Some(event) = rx.recv().await else { break };
-            let recs = vec![Rec {
-                timestamp_delta: 0,
-                key: Some(Bytes::copy_from_slice(event.0.as_bytes())),
-                value: Some(Bytes::from(encode_share_event(&event))),
-                headers: vec![],
-            }];
-            let mut buf = BytesMut::new();
-            encode_batch(-1, 0, crate::partition::now_ms(), 0, -1, -1, -1, &recs, &mut buf);
-            let (rtx, rrx) = oneshot::channel();
-            if part_tx
-                .send(PartitionCmd::Produce {
-                    batches: buf.freeze(),
-                    policy: AssignPolicy::Assign,
-                    acks: -1,
-                    reply: rtx,
-                })
-                .await
-                .is_err()
-            {
-                continue;
-            }
-            if let Ok(outcome) = rrx.await {
-                if let Some(e) = outcome.error {
-                    tracing::warn!(error = %e, "share event persist failed");
+            let leader = {
+                let table = routes_rx.borrow();
+                table.find("__share_group_state", 0).map(|r| r.leader)
+            };
+            match leader {
+                Some(l) if l == self_node => {
+                    produce_share_local(&part_tx, &event).await;
                 }
+                Some(l) => {
+                    if fwd.as_ref().map(|(id, _)| *id) != Some(l) {
+                        fwd = broker_internal_addr(&meta_tx, l)
+                            .await
+                            .map(|a| (l, crate::internal::InternalClient::new(a)));
+                    }
+                    let (g, tid, part, first, last, ty) = &event;
+                    match fwd.as_ref() {
+                        Some((_, cl)) => {
+                            if let Err(e) = cl.share_event(g, *tid, *part, *first, *last, *ty).await {
+                                tracing::warn!(error = %e, leader = l, "share event forward failed");
+                            }
+                        }
+                        None => tracing::warn!(leader = l, "share leader address unknown; event dropped"),
+                    }
+                }
+                _ => tracing::warn!("share event dropped: no share-state route"),
             }
         }
     });
+}
+
+async fn produce_share_local(
+    part_tx: &mpsc::Sender<PartitionCmd>,
+    event: &crate::share_group::ShareEvent,
+) {
+    let recs = vec![Rec {
+        timestamp_delta: 0,
+        key: Some(Bytes::copy_from_slice(event.0.as_bytes())),
+        value: Some(Bytes::from(encode_share_event(event))),
+        headers: vec![],
+    }];
+    let mut buf = BytesMut::new();
+    encode_batch(-1, 0, crate::partition::now_ms(), 0, -1, -1, -1, &recs, &mut buf);
+    let (rtx, rrx) = oneshot::channel();
+    if part_tx
+        .send(PartitionCmd::Produce {
+            batches: buf.freeze(),
+            policy: AssignPolicy::Assign,
+            acks: -1,
+            reply: rtx,
+        })
+        .await
+        .is_err()
+    {
+        return;
+    }
+    if let Ok(outcome) = rrx.await {
+        if let Some(e) = outcome.error {
+            tracing::warn!(error = %e, "share event persist failed");
+        }
+    }
+}
+
+/// 节点内部口地址（主口 + 1；经本地集群快照解析）。
+async fn broker_internal_addr(
+    meta_tx: &mpsc::Sender<crate::meta::MetaCmd>,
+    node: i32,
+) -> Option<String> {
+    let (tx, rx) = oneshot::channel();
+    meta_tx
+        .send(crate::meta::MetaCmd::BrokerAddr { node, reply: tx })
+        .await
+        .ok()?;
+    let (host, port) = rx.await.ok()??;
+    Some(format!("{}:{}", host, port as u16 + 1))
 }
 
 /// share 事件重放：读全部分区数据解码事件列表。

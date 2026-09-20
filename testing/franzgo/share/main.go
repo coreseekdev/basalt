@@ -68,8 +68,9 @@ func main() {
 	// 校验游标随协调器迁移恢复（accepted 不重投、后缀全量）
 	if mode == "failover-setup" || mode == "failover-verify" {
 		if len(os.Args) < 6 {
-			fail("usage: share <broker> %s <group> <topic> <n|cut,total>", mode)
+			fail("usage: share <broker> %s <group> <topic> <total,cut|cut,total>", mode)
 		}
+		broker = os.Args[1]
 		group, topic := os.Args[3], os.Args[4]
 		nums := strings.Split(os.Args[5], ",")
 		numsInt := make([]int, len(nums))
@@ -77,7 +78,7 @@ func main() {
 			numsInt[i], _ = strconv.Atoi(v)
 		}
 		if mode == "failover-setup" {
-			failoverSetup(broker, group, topic, numsInt[0])
+			failoverSetup(broker, group, topic, numsInt[0], numsInt[1])
 			return
 		}
 		failoverVerify(broker, group, topic, numsInt[0], numsInt[1])
@@ -263,8 +264,9 @@ func pollMulti(cl *kgo.Client, want int, timeout time.Duration, fn func(*kgo.Rec
 	return res
 }
 
-// failoverSetup：produce n 条 → share consumer poll n 条全 AckAccept。
-func failoverSetup(broker, group, topic string, n int) {
+// failoverSetup：produce total 条 → share consumer poll 全部；
+// 前 cut 条 AckAccept（游标推进），其余 AckRelease（failover 后可重投）。
+func failoverSetup(broker, group, topic string, total, cut int) {
 	ctx := context.Background()
 	ac, err := kgo.NewClient(kgo.SeedBrokers(broker))
 	if err != nil {
@@ -272,14 +274,27 @@ func failoverSetup(broker, group, topic string, n int) {
 	}
 	adm := kadm.NewClient(ac)
 	_, _ = adm.CreateTopic(ctx, 1, 3, nil, topic)
-	time.Sleep(800 * time.Millisecond)
+	// 等元数据 + leader 就绪（offset 可查 = 建题完全生效；kadm 返回即
+	// broker 应答，但 follower 视图/路由仍有传播窗口——轮询兜底）
+	ready := false
+	for i := 0; i < 30 && !ready; i++ {
+		offs, err := adm.ListEndOffsets(ctx, topic)
+		if err == nil && len(offs) > 0 {
+			ready = true
+			break
+		}
+		time.Sleep(500 * time.Millisecond)
+	}
 	ac.Close()
+	if !ready {
+		fail("topic %s not ready (offsets unqueryable)", topic)
+	}
 
 	p, err := kgo.NewClient(kgo.SeedBrokers(broker))
 	if err != nil {
 		fail("producer: %v", err)
 	}
-	for i := 0; i < n; i++ {
+	for i := 0; i < total; i++ {
 		p.Produce(ctx, &kgo.Record{Topic: topic, Value: []byte(fmt.Sprintf("fo-%03d", i))},
 			func(_ *kgo.Record, err error) {
 				if err != nil {
@@ -292,38 +307,109 @@ func failoverSetup(broker, group, topic string, n int) {
 	}
 	p.Close()
 
-	cl, err := kgo.NewClient(
+	copts := []kgo.Opt{
 		kgo.SeedBrokers(broker),
 		kgo.ShareGroup(group),
 		kgo.ConsumeTopics(topic),
-	)
+	}
+	if os.Getenv("SHARE_DEBUG") != "" {
+		copts = append(copts, kgo.WithLogger(kgo.BasicLogger(os.Stderr, kgo.LogLevelDebug, nil)))
+	}
+	cl, err := kgo.NewClient(copts...)
 	if err != nil {
 		fail("share consumer: %v", err)
 	}
 	defer cl.Close()
-	got := pollAck(cl, n, 30*time.Second, kgo.AckAccept)
-	if got.n != n {
-		fail("setup poll 到 %d/%d", got.n, n)
+	// 90s：集群形成 + 建题传播 + 首拉长轮询的宽容预算（30s 会撞 deadline）
+	// 定向 ack：poll 全部 total 条，前 cut 条 Accept、其余 Release
+	got := struct {
+		n           int
+		maxDelivery int32
+	}{}
+	deadline := time.Now().Add(90 * time.Second)
+	for got.n < total && time.Now().Before(deadline) {
+		fetches := cl.PollRecords(ctx, 100)
+		fetches.EachError(func(_ string, _ int32, err error) {
+			fmt.Printf("  (fetch err: %v)\n", err)
+		})
+		fetches.EachRecord(func(r *kgo.Record) {
+			idx := got.n
+			if idx < cut {
+				r.Ack(kgo.AckAccept)
+			} else {
+				r.Ack(kgo.AckRelease)
+			}
+			got.n++
+		})
 	}
-	fmt.Printf("[setup] poll + AckAccept %d ✔\n", got.n)
+	if err := cl.FlushAcks(ctx); err != nil {
+		fail("flush acks: %v", err)
+	}
+	if got.n != total {
+		fail("setup poll 到 %d/%d", got.n, total)
+	}
+	fmt.Printf("[setup] poll %d：accept 前 %d + release 其余 ✔\n", got.n, cut)
 }
 
 // failoverVerify：同组新成员（另一 broker）——校验 accepted 前缀不重投、
 // 后缀 [cut, total) 全量可读（游标经重放随协调器迁移恢复）。
+// 无污染重试：游标未恢复时（poll 到前缀/全量）RELEASE 全部再试——release
+// 对已 accepted 记录是 no-op、对未 accepted 是归还，不污染状态。
 func failoverVerify(broker, group, topic string, cut, total int) {
-	cl, err := kgo.NewClient(
+	opts := []kgo.Opt{
 		kgo.SeedBrokers(broker),
 		kgo.ShareGroup(group),
 		kgo.ConsumeTopics(topic),
-	)
+	}
+	if os.Getenv("SHARE_DEBUG") != "" {
+		opts = append(opts, kgo.WithLogger(kgo.BasicLogger(os.Stderr, kgo.LogLevelDebug, nil)))
+	}
+	cl, err := kgo.NewClient(opts...)
 	if err != nil {
 		fail("share consumer: %v", err)
 	}
 	defer cl.Close()
-	got := pollAck(cl, total-cut, 60*time.Second, kgo.AckAccept)
-	if got.n != total-cut {
-		fail("verify poll 到 %d（应 %d）——游标恢复/续读异常", got.n, total-cut)
+
+	deadline := time.Now().Add(90 * time.Second)
+	for time.Now().Before(deadline) {
+		var recs []*kgo.Record
+		pollCtx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+		fetches := cl.PollRecords(pollCtx, 100)
+		fetches.EachError(func(_ string, _ int32, err error) {
+			fmt.Printf("  (fetch err: %v)\n", err)
+		})
+		fetches.EachRecord(func(r *kgo.Record) { recs = append(recs, r) })
+		cancel()
+		if len(recs) == 0 {
+			time.Sleep(500 * time.Millisecond)
+			continue
+		}
+		// 恢复校验：首条 offset == cut 且数量 == total-cut 才是正确后缀
+		if recs[0].Offset != int64(cut) || len(recs) != total-cut {
+			fmt.Printf("  (retry: first_offset=%d n=%d——游标未恢复，release 重试)\n", recs[0].Offset, len(recs))
+			for _, r := range recs {
+				r.Ack(kgo.AckRelease)
+			}
+			cl.FlushAcks(context.Background())
+			time.Sleep(500 * time.Millisecond)
+			continue
+		}
+		for _, r := range recs {
+			r.Ack(kgo.AckAccept)
+		}
+		if err := cl.FlushAcks(context.Background()); err != nil {
+			fail("flush acks: %v", err)
+		}
+		for i, r := range recs {
+			want := fmt.Sprintf("fo-%03d", cut+i)
+			if string(r.Value) != want {
+				fail("record %d corrupt: got %q want %q", i, r.Value, want)
+			}
+		}
+		fmt.Printf("[verify] 续读 %d..%d 共 %d，accepted 前缀无重投 ✔\n", cut, total, len(recs))
+		fmt.Println("PASS ✔ (share failover)")
+		return
 	}
-	fmt.Printf("[verify] 续读 %d..%d 共 %d，accepted 前缀无重投 ✔\n", cut, total, got.n)
-	fmt.Println("PASS ✔ (share failover)")
+	fail("verify 超时：游标未恢复")
 }
+

@@ -54,10 +54,13 @@ struct ShareGroup {
     sessions: HashMap<String, ShareSession>,
     /// (topic_id, partition) → 交付状态
     parts: HashMap<(u128, i32), SharePartition>,
-    /// 分配代次：成员集变化即 bump——下次心跳全员重下发分配
+    /// 分配代次：成员集/订阅变化即 bump——下次心跳全员重下发分配
     assignment_epoch: u64,
     /// 最近一次确定性轮转分配（member_id → 分配面）
     rotation: HashMap<String, BTreeMap<u128, Vec<i32>>>,
+    /// per-member 订阅（B5 flake 修复：join 时路由未传播 → resolved 空 →
+    /// 空分配被固化；订阅变化/rotation 空缺时自动重算自愈）
+    subs: HashMap<String, BTreeMap<u128, Vec<i32>>>,
 }
 
 static GROUPS: std::sync::Mutex<Option<HashMap<String, ShareGroup>>> = std::sync::Mutex::new(None);
@@ -96,6 +99,29 @@ fn emit_events(events: &[ShareEvent]) {
             }
         }
     }
+}
+
+/// 远端事件落地（SHARE_EVENT RPC 到达 share-state leader 时）：应用内存
+/// 视图；持久化由落地节点把事件推入本地 sink 通道完成。
+pub fn ingest_event(group: &str, tid: u128, partition: i32, first: i64, last: i64, ty: i8) {
+    let mut g = groups();
+    let sg = group_mut(&mut g, group);
+    let p = sg.parts.entry((tid, partition)).or_default();
+    let _ = apply_ack(p, "", first, last, ty);
+}
+
+/// 下沉通道的只读句柄（SHARE_EVENT 落地侧二次持久化用）。
+pub fn sink_channel() -> Option<tokio::sync::mpsc::Sender<ShareEvent>> {
+    SHARE_SINK.read().ok().and_then(|w| w.clone())
+}
+
+/// 数据 leader 侧成员机会性注册（B5 多节点）：fetch 到达时成员未知即本地
+/// 登记（会话/锁面需要成员存在）。成员权威仍在组协调器（heartbeat/join/
+/// assignment）；数据 leader 的视图是机会性副本，不做 rotation 过滤门。
+pub fn ensure_member_local(group: &str, member_id: &str) {
+    let mut g = groups();
+    let sg = group_mut(&mut g, group);
+    sg.members.entry(member_id.to_string()).or_insert((1, 0));
 }
 
 /// 重放安装：按序重应用事件（与在线 acknowledge 同一状态机语义；
@@ -170,6 +196,44 @@ fn group_mut<'a>(
 /// ShareGroupHeartbeat：epoch 0（或未知 member）= 加入；否则校验 fencing。
 /// 返回 (new_epoch, assignment)；assignment 为 None 表示无变化。
 /// Err = (error_code, message)。
+/// 确定性轮转重算：全员订阅并集 → 按 member 序轮转分配。
+fn recompute_rotation(sg: &mut ShareGroup) {
+    sg.rotation.clear();
+    sg.assignment_epoch += 1;
+    let n = sg.members.len().max(1);
+    let mut ids: Vec<String> = sg.members.keys().cloned().collect();
+    ids.sort();
+    let mut union: BTreeMap<u128, Vec<i32>> = BTreeMap::new();
+    for sub in sg.subs.values() {
+        for (tid, ps) in sub {
+            let e = union.entry(*tid).or_default();
+            for p in ps {
+                if !e.contains(p) {
+                    e.push(*p);
+                }
+            }
+        }
+    }
+    for (pos, mid) in ids.iter().enumerate() {
+        let mut assignment: BTreeMap<u128, Vec<i32>> = BTreeMap::new();
+        for (tid, ps) in &union {
+            let mine: Vec<i32> = ps
+                .iter()
+                .copied()
+                .enumerate()
+                .filter(|(i, _)| i % n == pos)
+                .map(|(_, p)| p)
+                .collect();
+            if !mine.is_empty() {
+                assignment.insert(*tid, mine);
+            }
+        }
+        if !assignment.is_empty() {
+            sg.rotation.insert(mid.clone(), assignment);
+        }
+    }
+}
+
 pub fn heartbeat(
     group: &str,
     member_id: &str,
@@ -193,33 +257,32 @@ pub fn heartbeat(
             return Err((82, "Fenced member epoch".into()));
         }
     }
+    // 订阅存储（B5 flake 修复）：resolved 非空且与存量不同 → 更新并标记
+    // 重算（join 时路由未传播 → resolved 空 → 空分配被永久固化的自愈面）
+    let subs_changed = if subscribed.is_empty() {
+        false
+    } else {
+        let changed = sg.subs.get(member_id).map(|old| old != &subscribed).unwrap_or(true);
+        if changed {
+            sg.subs.insert(member_id.to_string(), subscribed.clone());
+        }
+        changed
+    };
+    let mut need_recompute = subs_changed;
     if !known {
-        // 新加入：注册 + bump 分配代次 + 确定性轮转重算全员分配
+        // 新加入：注册 + bump 分配代次
         sg.members.insert(member_id.to_string(), (1, 0));
         sg.assignment_epoch += 1;
-        let member_ids: Vec<String> = {
-            let mut ids: Vec<String> = sg.members.keys().cloned().collect();
-            ids.sort();
-            ids
-        };
-        sg.rotation.clear();
-        let n = member_ids.len();
-        for (pos, mid) in member_ids.iter().enumerate() {
-            let mut assignment: BTreeMap<u128, Vec<i32>> = BTreeMap::new();
-            for (tid, ps) in &subscribed {
-                let mine: Vec<i32> = ps
-                    .iter()
-                    .copied()
-                    .enumerate()
-                    .filter(|(i, _)| i % n == pos)
-                    .map(|(_, p)| p)
-                    .collect();
-                if !mine.is_empty() {
-                    assignment.insert(*tid, mine);
-                }
-            }
-            sg.rotation.insert(mid.clone(), assignment);
+        need_recompute = true;
+    }
+    // 自愈：该成员有订阅但 rotation 缺失/为空（历史空分配固化）
+    if sg.rotation.get(member_id).map(|a| a.is_empty()).unwrap_or(true) {
+        if sg.subs.get(member_id).map(|s| !s.is_empty()).unwrap_or(false) {
+            need_recompute = true;
         }
+    }
+    if need_recompute {
+        recompute_rotation(sg);
     }
     let cur_epoch = sg.members.get(member_id).map(|(e, _)| *e).unwrap_or(1);
     let last_seen = sg.members.get(member_id).map(|(_, s)| *s).unwrap_or(0);

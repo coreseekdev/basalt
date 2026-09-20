@@ -6,6 +6,7 @@
 
 use basalt_protocol::value::{s, Value};
 use bytes::Bytes;
+use tokio::sync::oneshot;
 
 const HEARTBEAT_INTERVAL_MS: i32 = 1000;
 
@@ -39,6 +40,7 @@ pub async fn share_group_heartbeat(req: &basalt_protocol::value::Struct, ctx: &c
             .collect()
     };
 
+    tracing::debug!(group = %group, %member_id, epoch, subscribed = ?subscribed_resolved, "share heartbeat: enter");
     let mut err: Option<(i16, String)> = None;
     let mut member_epoch = epoch;
     let mut assignment: Option<BTreeMap<u128, Vec<i32>>> = None;
@@ -79,6 +81,7 @@ pub async fn share_group_heartbeat(req: &basalt_protocol::value::Struct, ctx: &c
         Some(_) => s([("TopicPartitions", Value::Array(tp))]),
         None => Value::Null,
     };
+    tracing::debug!(group = %group, %member_id, has_assignment = assignment.is_some(), "share heartbeat: reply");
     s([
         ("ThrottleTimeMs", Value::I32(0)),
         ("ErrorCode", Value::I16(0)),
@@ -100,18 +103,11 @@ pub async fn share_fetch(req: &basalt_protocol::value::Struct, ctx: &crate::hand
     let max_bytes_total = req.get("MaxBytes").map(|v| v.as_i32()).unwrap_or(i32::MAX).max(0) as usize;
     let max_wait_ms = req.get("MaxWaitMs").map(|v| v.as_i32()).unwrap_or(500).clamp(0, 60_000);
 
-    // member 校验（FINAL_EPOCH 关会话除外）
+    // member 机会性本地注册（B5 多节点）：数据面不做协调器侧成员反查
+    // （跨节点反查在陈旧路由窗口会造成 25 循环）；成员权威在协调器，
+    // 数据 leader 的视图是机会性副本
     if session_epoch != -1 {
-        if let Err((code, msg)) = crate::share_group::validate_exists(&group, &member_id) {
-            return s([
-                ("ThrottleTimeMs", Value::I32(0)),
-                ("ErrorCode", Value::I16(code)),
-                ("ErrorMessage", Value::str(msg)),
-                ("AcquisitionLockTimeoutMs", Value::I32(30_000)),
-                ("Responses", Value::Array(vec![])),
-                ("NodeEndpoints", Value::Array(vec![])),
-            ]);
-        }
+        crate::share_group::ensure_member_local(&group, &member_id);
     }
 
     tracing::debug!(group = %group, %member_id, session_epoch, "share_fetch: enter");
@@ -163,15 +159,23 @@ pub async fn share_fetch(req: &basalt_protocol::value::Struct, ctx: &crate::hand
         for (tid, index, pmax) in serve_set {
             // 分配面过滤（会话注册面 ≠ 分配面：成员集变化后，会话中旧分区
             // 不再服务——分配由 rotation 权威决定）
-            let assigned = crate::share_group::assigned_partitions(&group, &member_id, tid);
-            tracing::info!(member = %member_id, tid = format!("{tid:x}"), index, ?assigned, "assignment filter");
-            if !assigned.contains(&index) {
-                continue;
-            }
+            // 分配过滤已移除（B5 多节点）：客户端按协调器分配向各分区
+            // leader 发 fetch——本地 rotation 视图在多节点下非权威
             if forgotten_removals.contains(&(tid, index)) {
                 continue;
             }
             let topic_name = ctx.routes().name_for(tid).unwrap_or_default();
+            // 分区 leader 门：非 leader 节点不服务（客户端经 metadata 重路由）
+            if !partition_is_led_locally(ctx, &topic_name, index) {
+                by_topic.entry(tid).or_default().push(s([
+                    ("PartitionIndex", Value::I32(index)),
+                    ("ErrorCode", Value::I16(6)), // NOT_LEADER_OR_FOLLOWER
+                    ("ErrorMessage", Value::str("not leader for partition")),
+                    ("AcknowledgeErrorCode", Value::I16(0)),
+                    ("Records", Value::Null),
+                ]));
+                continue;
+            }
             let entry = serve_share_partition(
                 ctx, &group, &member_id, tid, &topic_name, index,
                 (pmax as usize).min(max_bytes_total.max(1)), max_wait_ms,
@@ -246,11 +250,13 @@ async fn serve_share_partition(
         .await
         .is_err()
     {
+        tracing::warn!(group, member, topic = %topic_name, index, "share fetch: local actor unavailable");
         return empty_part(index, 15);
     }
     let out = rx.await.unwrap_or_else(|_| crate::partition::FetchOutcome::err(
         basalt_storage::error::StorageError::Other("share fetch dropped".into()), -1));
     if let Some(e) = &out.error {
+        tracing::warn!(group, member, topic = %topic_name, index, error = %e, "share fetch read error");
         let code = crate::handlers::storage_error_code(e);
         return s([
             ("PartitionIndex", Value::I32(index)),
@@ -266,6 +272,7 @@ async fn serve_share_partition(
     let Some(r) = out.result else {
         return empty_part(index, 1); // OFFSET_OUT_OF_RANGE
     };
+    tracing::info!(group, member, topic = %topic_name, index, from, hw = r.high_watermark, bytes = r.data.len(), "share fetch read");
     let data = r.data;
     if data.is_empty() {
         return empty_part(index, 0);
@@ -322,6 +329,20 @@ fn empty_part(index: i32, code: i16) -> Value {
 
 
 /// ShareAcknowledge(79) v1-2
+
+/// 分区 leader 门（B5）：非本节点 leader 的分区不服务/不受理写（客户端
+/// 按 metadata 重路由；陈旧元数据竞态下的写拒绝面）。
+fn partition_is_led_locally(
+    ctx: &crate::handlers::Ctx,
+    topic_name: &str,
+    index: i32,
+) -> bool {
+    ctx.routes()
+        .find(topic_name, index)
+        .map(|r| r.leader == ctx.node_id)
+        .unwrap_or(false)
+}
+
 pub async fn share_acknowledge(req: &basalt_protocol::value::Struct, ctx: &crate::handlers::Ctx) -> Value {
     let _ = ctx;
     let group = req.get("GroupId").map(|v| v.as_str().to_string()).unwrap_or_default();
@@ -356,10 +377,24 @@ pub async fn share_acknowledge(req: &basalt_protocol::value::Struct, ctx: &crate
                             batches.push((f, l, tys));
                         }
                     }
-                    let applied = crate::share_group::acknowledge(&group, &member_id, topic_id, index, &batches);
+                    // 分区 leader 门（B5）：ack 交付状态权威在分区 leader 节点
+                    let topic_name = ctx.routes().name_for(topic_id).unwrap_or_default();
+                    let mut err_code = if partition_is_led_locally(&ctx, &topic_name, index) { 0 } else { 6 };
+                    let applied = if err_code == 0 {
+                        crate::share_group::acknowledge(&group, &member_id, topic_id, index, &batches)
+                    } else {
+                        0
+                    };
+                    if applied > 0 {
+                        err_code = 0;
+                    } else if batches.is_empty() {
+                        err_code = 0;
+                    } else if err_code == 0 {
+                        err_code = 78; // 无有效变更（未知 ack 类型等）
+                    }
                     parts_out.push(s([
                         ("PartitionIndex", Value::I32(index)),
-                        ("ErrorCode", Value::I16(if applied > 0 || batches.is_empty() { 0 } else { 78 })),
+                        ("ErrorCode", Value::I16(err_code)),
                         ("ErrorMessage", Value::Null),
                         ("CurrentLeader", s([("LeaderId", Value::I32(-1)), ("LeaderEpoch", Value::I32(-1))])),
                     ]));

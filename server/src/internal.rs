@@ -29,6 +29,11 @@ pub const MSG_CTRL_PROPOSE: u8 = 8;
 pub const MSG_WRITE_TXN_MARKER: u8 = 9;
 /// TxnOffsetCommit 代理（ADR-18 §7）：组协调器节点 → controller 事务协调器。
 pub const MSG_TXN_OFFSET_COMMIT: u8 = 10;
+/// B5 多节点 share：成员存在性校验（数据 leader → 组协调器）。
+pub const MSG_SHARE_VALIDATE: u8 = 11;
+/// B5 多节点 share：交付事件转发（数据 leader → share-state topic leader，
+/// 落地节点经本地 sink 持久化）。
+pub const MSG_SHARE_EVENT: u8 = 12;
 
 /// 分区注入（T-M2.5）：本节点拒绝与之通信的对端集合（双向断边）。
 /// BASALT_BLOCK_PEERS="1,2" —— 心跳/元数据/FetchSlice 全部断开。
@@ -211,6 +216,39 @@ impl InternalClient {
         } else {
             Err(basalt_storage::error::StorageError::InvalidTxnState)
         }
+    }
+
+    /// share 成员校验（B5）：问目标节点（组协调器）(group, member) 是否有效。
+    pub async fn share_validate(&self, group: &str, member: &str) -> std::io::Result<bool> {
+        let mut p = Vec::new();
+        p.extend_from_slice(&(group.len() as i16).to_be_bytes());
+        p.extend_from_slice(group.as_bytes());
+        p.extend_from_slice(&(member.len() as i16).to_be_bytes());
+        p.extend_from_slice(member.as_bytes());
+        let body = self.call(MSG_SHARE_VALIDATE, &p).await?;
+        Ok(body.first().copied().unwrap_or(0) == 1)
+    }
+
+    /// share 交付事件转发（B5）：目标节点（share-state topic leader）经本地
+    /// sink 持久化 + 应用内存视图。
+    pub async fn share_event(
+        &self,
+        group: &str,
+        tid: u128,
+        partition: i32,
+        first: i64,
+        last: i64,
+        ty: i8,
+    ) -> std::io::Result<()> {
+        let mut p = Vec::new();
+        p.extend_from_slice(&(group.len() as i16).to_be_bytes());
+        p.extend_from_slice(group.as_bytes());
+        p.extend_from_slice(&tid.to_be_bytes());
+        p.extend_from_slice(&partition.to_be_bytes());
+        p.extend_from_slice(&first.to_be_bytes());
+        p.extend_from_slice(&last.to_be_bytes());
+        p.push(ty as u8);
+        self.call(MSG_SHARE_EVENT, &p).await.map(|_| ())
     }
 
     pub async fn create_topic(
@@ -1296,6 +1334,27 @@ async fn handle_internal_conn(
                 }
                 Bytes::from(0i16.to_be_bytes().to_vec())
             }
+            MSG_SHARE_VALIDATE => {
+                let Ok(v) = parse_share_validate(payload) else {
+                    sock.write_all(&short_frame()).await?;
+                    return Ok(());
+                };
+                let ok = crate::share_group::validate_exists(&v.0, &v.1).is_ok();
+                Bytes::from(vec![if ok { 1 } else { 0 }])
+            }
+            MSG_SHARE_EVENT => {
+                let Ok((group, tid, partition, first, last, ty)) = parse_share_event_wire(payload) else {
+                    sock.write_all(&short_frame()).await?;
+                    return Ok(());
+                };
+                // 落地节点 = share-state topic leader：持久化（本地 sink 通道）
+                // + 应用内存视图（本节点可能同为该数据分区的后任 leader）
+                crate::share_group::ingest_event(&group, tid, partition, first, last, ty);
+                if let Some(tx) = crate::share_group::sink_channel() {
+                    let _ = tx.try_send((group, tid, partition, first, last, ty));
+                }
+                Bytes::from(vec![1])
+            }
             MSG_FETCH_SLICE => {
                 let Ok((topic, partition, follower_id, from_offset, max_bytes)) = parse_fetch_slice(payload) else {
                     sock.write_all(&short_frame()).await?;
@@ -1393,6 +1452,48 @@ fn parse_register(p: &[u8]) -> std::io::Result<(i32, String, u16)> {
     let host = String::from_utf8_lossy(&p[6..6 + n]).into_owned();
     let port = i32::from_be_bytes(p[6 + n..10 + n].try_into().unwrap()) as u16;
     Ok((node_id, host, port))
+}
+
+fn parse_share_validate(p: &[u8]) -> std::io::Result<(String, String)> {
+    if p.len() < 2 {
+        return Err(std::io::Error::other("short validate"));
+    }
+    let n = i16::from_be_bytes(p[0..2].try_into().unwrap()) as usize;
+    if p.len() < 2 + n + 2 {
+        return Err(std::io::Error::other("short validate fields"));
+    }
+    let group = String::from_utf8_lossy(&p[2..2 + n]).into_owned();
+    let rest = &p[2 + n..];
+    let m = i16::from_be_bytes(rest[0..2].try_into().unwrap()) as usize;
+    if rest.len() < 2 + m {
+        return Err(std::io::Error::other("short validate member"));
+    }
+    let member = String::from_utf8_lossy(&rest[2..2 + m]).into_owned();
+    Ok((group, member))
+}
+
+fn parse_share_event_wire(
+    p: &[u8],
+) -> std::io::Result<(String, u128, i32, i64, i64, i8)> {
+    if p.len() < 2 {
+        return Err(std::io::Error::other("short share event"));
+    }
+    let n = i16::from_be_bytes(p[0..2].try_into().unwrap()) as usize;
+    if p.len() < 2 + n + 16 + 4 + 8 + 8 + 1 {
+        return Err(std::io::Error::other("short share event fields"));
+    }
+    let group = String::from_utf8_lossy(&p[2..2 + n]).into_owned();
+    let mut q = 2 + n;
+    let tid = u128::from_be_bytes(p[q..q + 16].try_into().unwrap());
+    q += 16;
+    let partition = i32::from_be_bytes(p[q..q + 4].try_into().unwrap());
+    q += 4;
+    let first = i64::from_be_bytes(p[q..q + 8].try_into().unwrap());
+    q += 8;
+    let last = i64::from_be_bytes(p[q..q + 8].try_into().unwrap());
+    q += 8;
+    let ty = p[q] as i8;
+    Ok((group, tid, partition, first, last, ty))
 }
 
 fn parse_create(

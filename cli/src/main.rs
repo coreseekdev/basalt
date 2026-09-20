@@ -180,7 +180,7 @@ fn check(st: &Struct, what: &str) -> Result<()> {
 const V_METADATA: i16 = 12;
 const V_CREATE_TOPICS: i16 = 5;
 const V_DELETE_TOPICS: i16 = 6;
-const V_LIST_GROUPS: i16 = 2;
+const V_LIST_GROUPS: i16 = 4;
 const V_DESCRIBE_GROUPS: i16 = 1;
 const V_OFFSET_FETCH: i16 = 5;
 const V_LIST_OFFSETS: i16 = 1;
@@ -341,7 +341,11 @@ async fn topics_delete(c: &mut Client, name: &str) -> Result<()> {
 }
 
 async fn groups_list(c: &mut Client) -> Result<()> {
-    let resp = c.call(key::LIST_GROUPS, V_LIST_GROUPS, s([])).await?;
+    // v4：GroupState 字段自 v4 起才有（v0-3 响应无状态列）；请求 StatesFilter
+    // = Null → 全量
+    let resp = c.call(key::LIST_GROUPS, V_LIST_GROUPS, s([
+        ("StatesFilter", Value::Null),
+    ])).await?;
     dump(&resp);
     let empty: &[Value] = &[];
     let gs = resp.get_array("Groups").unwrap_or(empty);
@@ -374,7 +378,7 @@ async fn groups_describe(c: &mut Client, group: &str) -> Result<()> {
     }
     check(g, "describe group")?;
     println!("group:  {}", get_str(g, "GroupId"));
-    println!("state:  {}", get_str(g, "State"));
+    println!("state:  {}", get_str(g, "GroupState"));
     println!("type:   {}", get_str(g, "ProtocolType"));
     println!("proto:  {}", get_str(g, "ProtocolData"));
     println!("{:<36} {:<20} {}", "MEMBER", "CLIENT", "HOST");

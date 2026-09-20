@@ -607,8 +607,10 @@ pub async fn describe_groups(req: &basalt_protocol::value::Struct, ctx: &Ctx) ->
 }
 
 pub async fn list_groups(req: &basalt_protocol::value::Struct, ctx: &Ctx) -> Value {
+    // StatesFilter：Kafka 语义 null 与**空数组都 = 不过滤**（字段非可空，
+    // 客户端"全部"语义即空数组——CLI v4 Null 编码为空数组实测踩中）
     let states_filter: Option<Vec<String>> = req.get("StatesFilter").and_then(|v| match v {
-        Value::Array(a) => Some(a.iter().map(|x| x.as_str().to_string()).collect()),
+        Value::Array(a) if !a.is_empty() => Some(a.iter().map(|x| x.as_str().to_string()).collect()),
         _ => None,
     });
     let (tx, rx) = oneshot::channel();

@@ -43,7 +43,10 @@ RC=1
   echo "=== 等待副本追平（2s）===" && sleep 2 &&
   echo "=== kill -9 node0（share 协调器所在）===" &&
   kill -9 "$(cat "$PID_DIR/pid-0")" &&
-  sleep 1 &&
+  # 等 promotion 完成（选举 + 分区升主 + 重放绑定 ≈ 3-8s）：franz-go share
+  # 源在首个 metadata 视图钉死 fetch broker（preview 限制，不 re-seed）——
+  # 客户端启动过早会钉到死节点
+  sleep 10 &&
   echo "=== phase 2: node1 上同组续读（游标随协调器迁移恢复）===" &&
   (cd testing/franzgo && SHARE_DEBUG=1 go run ./share localhost:9102 failover-verify sf-grp sf-e2e 10,30) 2> /tmp/sf-verify-debug.log
 } && RC=0
@@ -51,14 +54,10 @@ RC=1
 if [ $RC -eq 0 ]; then
   echo "PASS: share group coordinator failover (multi-node)"
 else
-  # 已知缺口（B5/块 b3-e 未完成）：成员状态在组协调器节点、数据在分区
-  # leader 节点——多节点下 fetch 落在无成员状态的节点上（25 拒绝）。
-  # 本场景保留为多节点 share 协调落地后的验收测试；在此之前跳过（77）。
-  echo "SKIP: multi-node share ops not implemented (known gap — see HANDOFF §2 / 块 b3-e)"
+  echo "FAIL: share failover"
   for i in 1 2; do
     echo "--- node$i ---"
     sed 's/\x1b\[[0-9;]*m//g' "$PID_DIR/node$i.log" 2>/dev/null | grep -E "WARN|ERROR|panic|bound" | tail -5
   done
-  exit 77
 fi
 exit $RC

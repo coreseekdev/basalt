@@ -330,69 +330,82 @@ pub fn encode_batch(
 
 // ---------- zigzag varint（记录内部用） ----------
 
-/// 解码未压缩批的记录区（内部消费面：组状态重放等）。produce 路径不解
-/// 记录体；压缩批返回 None（内部 topic 恒未压缩）。buf = 完整批。
+/// 解码批的记录区（内部消费面：组状态/share 事件重放、交付切片）。
+/// 压缩批自动解压（lz4/zstd/gzip；Snappy 未实现 → None）；
+/// 控制批返回 None。buf = 完整批。
 pub fn decode_records(buf: &[u8]) -> Option<Vec<Rec>> {
     let h = BatchHeader::parse(buf)?;
-    // from_bits(0) = Some(Compression::None)：未压缩也是 Some——只拒真压缩批
-    if !matches!(h.compression(), None | Some(Compression::None)) {
-        return None;
-    }
     if h.is_control() {
         return None;
     }
     let count = h.record_count.max(0) as usize;
     let end = h.total_len().min(buf.len());
-    let mut pos = RECORD_BATCH_HEADER_LEN;
+    // from_bits(0) = Some(Compression::None)：未压缩也是 Some
+    match h.compression() {
+        None | Some(Compression::None) => {
+            let mut pos = RECORD_BATCH_HEADER_LEN;
+            parse_record_area_at(buf, &mut pos, end, count)
+        }
+        codec @ (Some(Compression::Lz4) | Some(Compression::Zstd) | Some(Compression::Gzip) | Some(Compression::Snappy)) => {
+            let comp = &buf[RECORD_BATCH_HEADER_LEN..end];
+            let raw = decompress(codec.unwrap(), comp, 0)?;
+            let mut pos = 0usize;
+            parse_record_area_at(&raw, &mut pos, raw.len(), count)
+        }
+        Some(Compression::Snappy) => None,
+    }
+}
+
+fn parse_record_area_at(buf: &[u8], pos: &mut usize, end: usize, count: usize) -> Option<Vec<Rec>> {
     let mut out = Vec::with_capacity(count);
     for _ in 0..count {
-        if pos >= end {
+        if *pos >= end {
             return None;
         }
-        let _len = read_zigzag(buf, &mut pos)?;
-        let _attrs = *buf.get(pos)?;
-        pos += 1;
-        let ts = read_zigzag(buf, &mut pos)?;
-        let _off_delta = read_zigzag(buf, &mut pos)?;
-        let klen = read_zigzag(buf, &mut pos)?;
+        let _len = read_zigzag(buf, pos)?;
+        let _attrs = *buf.get(*pos)?;
+        *pos += 1;
+        let ts = read_zigzag(buf, pos)?;
+        let _off_delta = read_zigzag(buf, pos)?;
+        let klen = read_zigzag(buf, pos)?;
         let key = if klen < 0 {
             None
         } else {
             let k = klen as usize;
-            if pos + k > end {
+            if *pos + k > end {
                 return None;
             }
-            let b = Bytes::copy_from_slice(&buf[pos..pos + k]);
-            pos += k;
+            let b = Bytes::copy_from_slice(&buf[*pos..*pos + k]);
+            *pos += k;
             Some(b)
         };
-        let vlen = read_zigzag(buf, &mut pos)?;
+        let vlen = read_zigzag(buf, pos)?;
         let value = if vlen < 0 {
             None
         } else {
             let v = vlen as usize;
-            if pos + v > end {
+            if *pos + v > end {
                 return None;
             }
-            let b = Bytes::copy_from_slice(&buf[pos..pos + v]);
-            pos += v;
+            let b = Bytes::copy_from_slice(&buf[*pos..*pos + v]);
+            *pos += v;
             Some(b)
         };
-        let hcount = read_zigzag(buf, &mut pos)?.max(0) as usize;
+        let hcount = read_zigzag(buf, pos)?.max(0) as usize;
         let mut headers = Vec::with_capacity(hcount);
         for _ in 0..hcount {
-            let hklen = read_zigzag(buf, &mut pos)?;
+            let hklen = read_zigzag(buf, pos)?;
             if hklen < 0 {
                 return None;
             }
-            let hk = Bytes::copy_from_slice(&buf[pos..pos + hklen as usize]);
-            pos += hklen as usize;
-            let hvlen = read_zigzag(buf, &mut pos)?;
+            let hk = Bytes::copy_from_slice(&buf[*pos..*pos + hklen as usize]);
+            *pos += hklen as usize;
+            let hvlen = read_zigzag(buf, pos)?;
             let hv = if hvlen < 0 {
                 None
             } else {
-                let b = Bytes::copy_from_slice(&buf[pos..pos + hvlen as usize]);
-                pos += hvlen as usize;
+                let b = Bytes::copy_from_slice(&buf[*pos..*pos + hvlen as usize]);
+                *pos += hvlen as usize;
                 Some(b)
             };
             headers.push((hk, hv));
@@ -458,8 +471,55 @@ pub fn decompress(codec: Compression, data: &[u8], expected_uncompressed: usize)
             std::io::Read::read_to_end(&mut dec, &mut out).ok()?;
             Some(out)
         }
-        Compression::Snappy => None, // KIP-375 xerial 框架；由 report card 缺口驱动补齐
+        Compression::Snappy => decompress_snappy_xerial(data),
     }
+}
+
+/// Kafka Snappy（KIP-375 xerial 框架）：magic \x82SNAPPY\0\0 + version/compat
+/// + 分块裸 snappy block。非框架整段裸 snappy 也接受。
+fn decompress_snappy_xerial(data: &[u8]) -> Option<Vec<u8>> {
+    let xerial = data.len() > 16 && data[0..8] == [0x82, b'S', b'N', b'A', b'P', b'P', b'Y', 0];
+    if !xerial {
+        let mut dec = snap::raw::Decoder::new();
+        // 裸 block 解压长度未知：从输入的数倍起逐步放大
+        let mut cap = data.len().saturating_mul(4).max(1024);
+        loop {
+            let mut buf = vec![0u8; cap];
+            match dec.decompress(data, &mut buf) {
+                Ok(w) => {
+                    buf.truncate(w);
+                    return Some(buf);
+                }
+                Err(snap::Error::BufferTooSmall { .. }) => cap = cap.saturating_mul(2),
+                Err(_) => return None,
+            }
+        }
+    }
+    let mut out = Vec::new();
+    let mut p = 16usize;
+    let mut dec = snap::raw::Decoder::new();
+    while p + 4 <= data.len() {
+        let n = u32::from_be_bytes(data[p..p + 4].try_into().ok()?) as usize;
+        p += 4;
+        if p + n > data.len() {
+            return None;
+        }
+        let chunk = &data[p..p + n];
+        let mut cap = n.saturating_mul(8).max(1024);
+        loop {
+            let mut buf = vec![0u8; cap];
+            match dec.decompress(chunk, &mut buf) {
+                Ok(w) => {
+                    out.extend_from_slice(&buf[..w]);
+                    break;
+                }
+                Err(snap::Error::BufferTooSmall { .. }) => cap = cap.saturating_mul(2),
+                Err(_) => return None,
+            }
+        }
+        p += n;
+    }
+    Some(out)
 }
 
 pub fn compress(codec: Compression, data: &[u8]) -> Option<Vec<u8>> {
@@ -477,6 +537,67 @@ pub fn compress(codec: Compression, data: &[u8]) -> Option<Vec<u8>> {
             enc.finish().ok()
         }
         Compression::Snappy => None,
+    }
+}
+
+#[cfg(test)]
+mod snappy_xerial_tests {
+    use super::*;
+    use bytes::BufMut;
+
+    #[test]
+    fn decode_records_from_xerial_snappy_batch() {
+        // 模拟 franz-go 默认档：snappy 压缩的批（KIP-375 xerial 框架）
+        let recs: Vec<Rec> = (0..30)
+            .map(|i| Rec {
+                timestamp_delta: i,
+                key: None,
+                value: Some(Bytes::from(format!("fo-{i:03}"))),
+                headers: vec![],
+            })
+            .collect();
+        let mut body = BytesMut::new();
+        for (i, r) in recs.iter().enumerate() {
+            let mut e = BytesMut::new();
+            e.put_i8(0);
+            put_zigzag(&mut e, r.timestamp_delta);
+            put_zigzag(&mut e, i as i64);
+            put_zigzag(&mut e, -1);
+            put_zigzag(&mut e, r.value.as_ref().unwrap().len() as i64);
+            e.extend_from_slice(r.value.as_ref().unwrap());
+            put_zigzag(&mut e, 0);
+            put_zigzag(&mut body, e.len() as i64);
+            body.extend_from_slice(&e);
+        }
+        let comp = snap::raw::Encoder::new()
+            .compress_vec(&body)
+            .expect("snappy encode");
+        let mut framed = BytesMut::new();
+        framed.extend_from_slice(&[0x82, b'S', b'N', b'A', b'P', b'P', b'Y', 0]);
+        framed.extend_from_slice(&1i32.to_be_bytes());
+        framed.extend_from_slice(&1i32.to_be_bytes());
+        framed.extend_from_slice(&(comp.len() as i32).to_be_bytes());
+        framed.extend_from_slice(&comp);
+        // 组批头：attributes = Snappy(2)
+        let total = RECORD_BATCH_HEADER_LEN - 12 + framed.len();
+        let mut batch = BytesMut::new();
+        batch.put_i64(0);
+        batch.put_i32(total as i32);
+        batch.put_i32(0);
+        batch.put_i8(MAGIC_V2);
+        batch.put_u32(0);
+        batch.put_i16(2); // attributes = snappy
+        batch.put_i32((recs.len() - 1) as i32);
+        batch.put_i64(1000);
+        batch.put_i64(1000);
+        batch.put_i64(-1);
+        batch.put_i16(-1);
+        batch.put_i32(-1);
+        batch.put_i32(recs.len() as i32);
+        batch.extend_from_slice(&framed);
+        let got = decode_records(&batch.freeze()).expect("snappy 批应可解码");
+        assert_eq!(got.len(), 30);
+        assert_eq!(got[7].value.as_deref(), Some(b"fo-007".as_ref()));
     }
 }
 

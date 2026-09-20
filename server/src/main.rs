@@ -347,6 +347,9 @@ async fn async_main(cfg: Config) {
                 if bound_fp == Some(fp) {
                     continue;
                 }
+                // 先置陈旧（fetch/ack 拒绝 retriable）再等沉降——重放完成前
+                // 不得以陈旧游标服务（B5 failover e2e 实证）
+                share_group::mark_share_state_stale();
                 let Some((part_tx, leader, epoch)) = share_route else { continue };
                 // 沉降延迟：等就任拉齐（reconcile 从存活副本回补缺失尾）完成
                 // 后再重放——否则读到未回补的空副本（B5 failover 实证）
@@ -355,6 +358,7 @@ async fn async_main(cfg: Config) {
                 share_group::set_share_sink(etx.clone());
                 let events = group_sync::replay_share(part_tx.clone()).await;
                 share_group::install_replay(events);
+                share_group::set_share_state_fresh(fp);
                 group_sync::spawn_share_sink_ext(
                     erx,
                     part_tx,

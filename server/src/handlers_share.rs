@@ -5,7 +5,7 @@
 //! 仅按 SubscribedTopicNames 轮转分配；HW 变更/CurrentLeader 不回填。
 
 use basalt_protocol::value::{s, Value};
-use bytes::Bytes;
+use bytes::{Bytes, BytesMut};
 use tokio::sync::oneshot;
 
 const HEARTBEAT_INTERVAL_MS: i32 = 1000;
@@ -111,6 +111,10 @@ pub async fn share_fetch(req: &basalt_protocol::value::Struct, ctx: &crate::hand
     }
 
     tracing::debug!(group = %group, %member_id, session_epoch, "share_fetch: enter");
+    // 状态新鲜度门（B5 failover）：拓扑变化后重放完成前拒绝（retriable 6，
+    // 客户端重试）——否则以陈旧游标服务 = accepted 记录重投
+    let fp = crate::share_group::routes_fingerprint(&ctx.routes());
+    let fresh = crate::share_group::share_state_fresh(fp);
     let mut responses: Vec<Value> = Vec::new();
     if session_epoch != -1 {
         // 会话结算：服务集 = 会话注册分区（增量请求仅带变化分区）
@@ -157,6 +161,16 @@ pub async fn share_fetch(req: &basalt_protocol::value::Struct, ctx: &crate::hand
         // 需删除注册项，spike 面暂由全量 fetch（epoch 0）重建覆盖）
         let mut by_topic: BTreeMap<u128, Vec<Value>> = BTreeMap::new();
         for (tid, index, pmax) in serve_set {
+            if !fresh {
+                by_topic.entry(tid).or_default().push(s([
+                    ("PartitionIndex", Value::I32(index)),
+                    ("ErrorCode", Value::I16(6)), // NOT_LEADER_OR_FOLLOWER（retriable）
+                    ("ErrorMessage", Value::str("share state replaying after failover")),
+                    ("AcknowledgeErrorCode", Value::I16(0)),
+                    ("Records", Value::Null),
+                ]));
+                continue;
+            }
             // 分配面过滤（会话注册面 ≠ 分配面：成员集变化后，会话中旧分区
             // 不再服务——分配由 rotation 权威决定）
             // 分配过滤已移除（B5 多节点）：客户端按协调器分配向各分区
@@ -183,7 +197,7 @@ pub async fn share_fetch(req: &basalt_protocol::value::Struct, ctx: &crate::hand
             by_topic.entry(tid).or_default().push(entry);
         }
         for (tid, parts) in by_topic {
-            tracing::info!(group = %group, %member_id, responses = parts.len(), "share_fetch: served");
+            tracing::debug!(group = %group, %member_id, responses = parts.len(), "share_fetch: served");
             responses.push(s([
                 ("TopicId", Value::Uuid(tid)),
                 ("Partitions", Value::Array(parts)),
@@ -227,7 +241,7 @@ async fn serve_share_partition(
         ]);
     }
     let from = crate::share_group::deliverable_from(group, member, topic_id, index);
-    tracing::info!(group, member, topic = %topic_name, index, from, "share fetch serving");
+    tracing::debug!(group, member, topic = %topic_name, index, from, "share fetch serving");
     // 路由 + 读（与普通 fetch 同面；isolation 恒 RU——KIP-932 不支持事务读取）
     // routes guard 不跨 await：先取 leader/tx 克隆再发命令
     let (tx, leader, epoch) = {
@@ -255,6 +269,13 @@ async fn serve_share_partition(
     }
     let out = rx.await.unwrap_or_else(|_| crate::partition::FetchOutcome::err(
         basalt_storage::error::StorageError::Other("share fetch dropped".into()), -1));
+    tracing::debug!(
+        group, member, topic = %topic_name, index, from,
+        hw = out.result.as_ref().map(|r| r.high_watermark).unwrap_or(-1),
+        bytes = out.result.as_ref().map(|r| r.data.len()).unwrap_or(0),
+        error = out.error.as_ref().map(|e| e.to_string()).unwrap_or_default(),
+        "share fetch: read done"
+    );
     if let Some(e) = &out.error {
         tracing::warn!(group, member, topic = %topic_name, index, error = %e, "share fetch read error");
         let code = crate::handlers::storage_error_code(e);
@@ -272,17 +293,17 @@ async fn serve_share_partition(
     let Some(r) = out.result else {
         return empty_part(index, 1); // OFFSET_OUT_OF_RANGE
     };
-    tracing::info!(group, member, topic = %topic_name, index, from, hw = r.high_watermark, bytes = r.data.len(), "share fetch read");
+    tracing::debug!(group, member, topic = %topic_name, index, from, hw = r.high_watermark, bytes = r.data.len(), "share fetch read");
     let data = r.data;
     if data.is_empty() {
         return empty_part(index, 0);
     }
-    // 批边界解析 → 逐批 acquire + AcquiredRecords；归档批次整批剔除
-    // （REJECT-cursor 连续性：归档区间可能落在游标之后、同页 read 的
-    // 返回流中——整批剔除后交付面不暴露已拒记录）
+    // 批边界解析 → 逐批切片交付（B5）：仅交付 ≥ 游标且未归档的记录
+    // （服务端切片——整批透传会把 accepted 前缀重新暴露，failover e2e 实证）
     let archived = crate::share_group::archived_ranges(group, topic_id, index);
-    let is_archived = |f: i64, l: i64| archived.iter().any(|(af, al)| *af <= f && l <= *al);
+    let is_archived_range = |f: i64, l: i64| archived.iter().any(|(af, al)| *af <= f && l <= *al);
     let mut acquired: Vec<Value> = Vec::new();
+    let mut out_records = BytesMut::new();
     {
         let mut pos = 0usize;
         while let Some(h) = basalt_record::BatchHeader::parse(&data[pos..]) {
@@ -290,16 +311,26 @@ async fn serve_share_partition(
             if total == 0 || pos + total > data.len() { break; }
             let b_first = h.base_offset;
             let b_last = h.base_offset + h.record_count as i64 - 1;
-            if !is_archived(b_first, b_last) {
-                let count = crate::share_group::acquire(group, member, topic_id, index, b_first, b_last);
-                acquired.push(s([
-                    ("FirstOffset", Value::I64(b_first)),
-                    ("LastOffset", Value::I64(b_last)),
-                    ("DeliveryCount", Value::I16(count)),
-                ]));
+            if !is_archived_range(b_first, b_last + 1) {
+                let (sliced, runs) = slice_share_batch(
+                    &data[pos..pos + total], b_first, b_last, from, &archived,
+                );
+                for (f, l) in &runs {
+                    let count = crate::share_group::acquire(group, member, topic_id, index, *f, *l);
+                    acquired.push(s([
+                        ("FirstOffset", Value::I64(*f)),
+                        ("LastOffset", Value::I64(*l)),
+                        ("DeliveryCount", Value::I16(count)),
+                    ]));
+                }
+                out_records.extend_from_slice(&sliced);
             }
             pos += total;
         }
+    }
+    let out_data = out_records.freeze();
+    if out_data.is_empty() {
+        return empty_part(index, 0);
     }
     s([
         ("PartitionIndex", Value::I32(index)),
@@ -308,9 +339,75 @@ async fn serve_share_partition(
         ("AcknowledgeErrorCode", Value::I16(0)),
         ("AcknowledgeErrorMessage", Value::Null),
         ("CurrentLeader", s([("LeaderId", Value::I32(leader)), ("LeaderEpoch", Value::I32(epoch))])),
-        ("Records", Value::Bytes(data)),
+        ("Records", Value::Bytes(out_data)),
         ("AcquiredRecords", Value::Array(acquired)),
     ])
+}
+
+
+/// 批切片交付（B5）：解码 → 过滤（< 游标、已归档）→ 连续段重编码。
+/// 返回 (重编码批字节, 交付区间列表)。KIP-932 交付由 broker 控制——
+/// 普通 fetch 的「整批返回客户端过滤」契约不适用（failover e2e 实证：
+/// 整批透传把 accepted 前缀重新暴露 = 游标回退假象）。压缩批不可解码，
+/// 整批透传并整段 acquire（v1 限制）。
+fn slice_share_batch(
+    batch: &[u8],
+    b_first: i64,
+    b_last: i64,
+    from: i64,
+    archived: &[(i64, i64)],
+) -> (Bytes, Vec<(i64, i64)>) {
+    let mut out = BytesMut::new();
+    let archived_off = |o: i64| archived.iter().any(|(af, al)| *af <= o && o < *al);
+    let Some(recs) = basalt_record::decode_records(batch) else {
+        tracing::warn!(
+            b_first, b_last, from,
+            compression = ?basalt_record::BatchHeader::parse(batch).map(|h| h.compression()),
+            records = basalt_record::BatchHeader::parse(batch).map(|h| h.record_count),
+            "share slice: batch undecodable; passthrough"
+        );
+        out.extend_from_slice(batch);
+        return (out.freeze(), vec![(b_first, b_last)]);
+    };
+    // 交付记录收集（>= from 且未归档），按 offset 连续段分组
+    let mut runs: Vec<Vec<basalt_record::Rec>> = Vec::new();
+    let mut run_bounds: Vec<(i64, i64)> = Vec::new();
+    let mut cur: Vec<basalt_record::Rec> = Vec::new();
+    let mut cur_first: i64 = -1;
+    let mut expect: i64 = -1;
+    for (i, rec) in recs.iter().enumerate() {
+        let o = b_first + i as i64;
+        if o < from || archived_off(o) {
+            if !cur.is_empty() {
+                runs.push(std::mem::take(&mut cur));
+                run_bounds.push((cur_first, expect));
+            }
+            continue;
+        }
+        if !cur.is_empty() && o != expect {
+            runs.push(std::mem::take(&mut cur));
+            run_bounds.push((cur_first, expect));
+        }
+        if cur.is_empty() {
+            cur_first = o;
+        }
+        expect = o;
+        cur.push(basalt_record::Rec {
+            timestamp_delta: rec.timestamp_delta,
+            key: rec.key.clone(),
+            value: rec.value.clone(),
+            headers: rec.headers.clone(),
+        });
+    }
+    if !cur.is_empty() {
+        runs.push(std::mem::take(&mut cur));
+        run_bounds.push((cur_first, expect));
+    }
+    for (run, (first, last)) in runs.iter().zip(run_bounds.iter()) {
+        basalt_record::encode_batch(*first, 0, 0, 0, -1, -1, -1, run, &mut out);
+    }
+    let pairs: Vec<(i64, i64)> = run_bounds.iter().map(|(f, l)| (*f, *l)).collect();
+    (out.freeze(), pairs)
 }
 
 fn empty_part(index: i32, code: i16) -> Value {

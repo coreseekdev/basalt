@@ -118,6 +118,46 @@ pub fn sink_channel() -> Option<tokio::sync::mpsc::Sender<ShareEvent>> {
 /// 数据 leader 侧成员机会性注册（B5 多节点）：fetch 到达时成员未知即本地
 /// 登记（会话/锁面需要成员存在）。成员权威仍在组协调器（heartbeat/join/
 /// assignment）；数据 leader 的视图是机会性副本，不做 rotation 过滤门。
+// ---- 状态新鲜度门（B5 failover）----
+// failover 后新数据 leader 在重放完成前不得服务（否则以陈旧游标重投
+// accepted 记录——B5 failover e2e 实证：游标 10/0 震荡，accepted 前缀重投）。
+// fp = 全集群 (topic,partition,leader,epoch) fingerprint：任一变化即视为
+// 陈旧，监督任务重放完成后刷新。
+static BOUND_FP: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+static STATE_FRESH: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// 监督任务：检测到 fp 漂移即置陈旧（先于 settle+replay 窗口）
+pub fn mark_share_state_stale() {
+    STATE_FRESH.store(false, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// 监督任务：重放完成后刷新绑定 fingerprint
+pub fn set_share_state_fresh(fp: u64) {
+    BOUND_FP.store(fp, std::sync::atomic::Ordering::Relaxed);
+    STATE_FRESH.store(true, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// 数据面（fetch/ack）服务前置检查：fp 与本节点已绑定一致才可服务
+/// （不一致 = 集群拓扑变化后尚未完成重放——调用方回 retriable 错误）
+pub fn share_state_fresh(fp: u64) -> bool {
+    STATE_FRESH.load(std::sync::atomic::Ordering::Relaxed)
+        && BOUND_FP.load(std::sync::atomic::Ordering::Relaxed) == fp
+}
+
+/// RoutingTable → fp（与 main 监督任务同一算法：和序折叠，遍历序无关）
+pub fn routes_fingerprint(table: &crate::meta::RoutingTable) -> u64 {
+    table
+        .iter_entries()
+        .map(|(t, p, l, e)| {
+            let mut h = t.len() as u64;
+            for b in t.bytes() {
+                h = h.wrapping_mul(31).wrapping_add(b as u64);
+            }
+            h ^ ((p as u64) << 32) ^ ((l as u64) << 16) ^ (e as u64 & 0xffff)
+        })
+        .fold(0u64, |a, x| a.wrapping_add(x))
+}
+
 pub fn ensure_member_local(group: &str, member_id: &str) {
     let mut g = groups();
     let sg = group_mut(&mut g, group);
@@ -136,8 +176,14 @@ pub fn install_replay(events: Vec<ShareEvent>) {
             applied += 1;
         }
     }
+    let mut snapshot = Vec::new();
+    for (gname, sg) in g.iter().flat_map(|m| m.iter()) {
+        for ((tid, part), p) in &sg.parts {
+            snapshot.push(format!("group={gname} tid={tid:x} part={part} cursor={}", p.cursor));
+        }
+    }
     drop(g);
-    tracing::info!(events = applied, "share state replayed from internal topic");
+    tracing::info!(events = applied, state = ?snapshot, "DBG install_replay done");
 }
 
 
@@ -303,6 +349,7 @@ pub fn deliverable_from(group: &str, member: &str, tid: u128, partition: i32) ->
     let mut g = groups();
     let Some(sg) = g.as_mut().and_then(|m| m.get_mut(group)) else { return 0 };
     let Some(p) = sg.parts.get_mut(&(tid, partition)) else { return 0 };
+
     let now = Instant::now();
     let lock = lock_duration();
     p.acquired.retain(|a| now.duration_since(a.at) < lock);
@@ -333,12 +380,16 @@ pub fn deliverable_from(group: &str, member: &str, tid: u128, partition: i32) ->
 
 /// member 当前分配的分区集（serve 端过滤——会话注册面 ≠ 分配面）
 pub fn assigned_partitions(group: &str, member: &str, tid: u128) -> Vec<i32> {
+    assigned_partitions_opt(group, member, tid).unwrap_or_default()
+}
+
+/// 分配面查询（B5 多节点）：None = 本节点无该成员的 rotation 视图（数据
+/// leader 侧影子成员——成员权威在组协调器）→ 调用方以会话注册集为服务面；
+/// Some(v) = coordinator 视角，按 rotation 分配过滤。
+pub fn assigned_partitions_opt(group: &str, member: &str, tid: u128) -> Option<Vec<i32>> {
     let g = groups();
-    let Some(sg) = g.as_ref().and_then(|m| m.get(group)) else { return vec![] };
-    sg.rotation
-        .get(member)
-        .and_then(|a| a.get(&tid).cloned())
-        .unwrap_or_default()
+    let sg = g.as_ref().and_then(|m| m.get(group))?;
+    sg.rotation.get(member).and_then(|a| a.get(&tid).cloned())
 }
 
 /// 归档区间（serve 端过滤 REJECT 已拒记录）
